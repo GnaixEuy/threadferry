@@ -16,6 +16,9 @@ import test from "node:test";
 
 const project = fileURLToPath(new URL("../..", import.meta.url));
 const cli = fileURLToPath(new URL("../src/cli.js", import.meta.url));
+const packageMetadata = JSON.parse(
+  readFileSync(fileURLToPath(new URL("../../package.json", import.meta.url)), "utf8"),
+) as { scripts?: Record<string, string>; version: string };
 
 test("installer dry-run is non-destructive and points to onboarding", () => {
   const result = spawnSync("bash", ["install.sh", "--dry-run", "--no-onboard"], {
@@ -23,7 +26,8 @@ test("installer dry-run is non-destructive and points to onboarding", () => {
     encoding: "utf8",
   });
   assert.equal(result.status, 0, result.stderr);
-  assert.match(result.stdout, /npm ci/);
+  assert.match(result.stdout, /releases\/latest\/download\/threadferry\.tgz/);
+  assert.doesNotMatch(result.stdout, /npm (ci|run build)/);
   assert.match(result.stdout, /threadferry onboard/);
   assert.doesNotMatch(result.stdout, /sudo/);
 });
@@ -37,8 +41,22 @@ test("installer supports curl-pipe execution", () => {
   });
   assert.equal(result.status, 0, result.stderr);
   assert.doesNotMatch(result.stderr, /BASH_SOURCE/);
-  assert.match(result.stdout, /git\+https:\/\/github\.com\/GnaixEuy\/threadferry\.git/);
+  assert.match(result.stdout, /releases\/latest\/download\/threadferry\.tgz/);
+  assert.doesNotMatch(result.stdout, /git\+https:|npm (ci|run build)/);
   assert.match(result.stdout, /threadferry onboard/);
+});
+
+test("release package contains the compiled CLI without a consumer build hook", () => {
+  assert.equal(packageMetadata.scripts?.prepare, undefined);
+
+  const packed = spawnSync("npm", ["pack", "--dry-run", "--json", "--ignore-scripts"], {
+    cwd: project,
+    encoding: "utf8",
+  });
+  assert.equal(packed.status, 0, packed.stderr);
+  const [{ files }] = JSON.parse(packed.stdout) as [{ files: Array<{ path: string }> }];
+  assert.ok(files.some(({ path }) => path === "dist/src/cli.js"));
+  assert.ok(files.every(({ path }) => !path.startsWith("src/")));
 });
 
 test("remote installer replaces an existing linked development install", () => {
@@ -91,7 +109,7 @@ fi
 test("CLI exposes package version and rejects non-interactive onboarding", () => {
   const version = spawnSync(process.execPath, [cli, "--version"], { encoding: "utf8" });
   assert.equal(version.status, 0, version.stderr);
-  assert.equal(version.stdout.trim(), "0.9.0");
+  assert.equal(version.stdout.trim(), packageMetadata.version);
 
   const onboard = spawnSync(process.execPath, [cli, "onboard"], { encoding: "utf8" });
   assert.equal(onboard.status, 1);

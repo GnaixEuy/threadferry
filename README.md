@@ -37,6 +37,8 @@ codex login
 curl -fsSL https://raw.githubusercontent.com/GnaixEuy/threadferry/main/install.sh | bash
 ```
 
+安装器直接使用 [GitHub Releases](https://github.com/GnaixEuy/threadferry/releases/latest) 中已经编译和测试的安装包，不会在本机拉取源码、安装开发依赖或运行 TypeScript 编译。
+
 终端可交互时会自动进入向导。也可以手动运行：
 
 ```sh
@@ -52,7 +54,7 @@ threadferry onboard
 
 第一次配对者会成为 Owner，后续可以私聊机器人管理群、Agent 和可使用成员。
 
-从源码安装或只检查安装动作：
+只安装而不进入向导，或检查安装动作：
 
 ```sh
 ./install.sh
@@ -171,9 +173,11 @@ threadferry doctor
 ## 开发
 
 ```sh
-npm ci
+npm ci --ignore-scripts
 npm run typecheck
 npm test
 ```
+
+推送与 `package.json` 版本一致的 `v*.*.*` 标签后，GitHub Actions 会执行检查、生成预编译包和 SHA-256 校验文件，并创建 GitHub Release。
 
 真实企业微信验收步骤见 [POC.md](./POC.md)，提交规范见 [CONTRIBUTING.md](./CONTRIBUTING.md)。

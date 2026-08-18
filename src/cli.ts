@@ -17,7 +17,7 @@ import { runPi } from "./runtimes/pi.js";
 import { acquireHostLock, defaultStatePath, newErrorId, ThreadFerryState } from "./state.js";
 import type { GroupMessage, IncomingMention, RuntimeName, ThreadFerryConfig } from "./types.js";
 
-const VERSION = "0.9.0";
+const VERSION = "0.10.0";
 const USAGE = `ThreadFerry ${VERSION}
 
 Usage:

@@ -1,0 +1,71 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Verify release version
+        shell: bash
+        run: |
+          package_version="$(node -p "require('./package.json').version")"
+          if [[ "$GITHUB_REF_NAME" != "v${package_version}" ]]; then
+            printf 'Tag %s does not match package version %s.\n' "$GITHUB_REF_NAME" "$package_version" >&2
+            exit 1
+          fi
+          printf 'PACKAGE_VERSION=%s\n' "$package_version" >> "$GITHUB_ENV"
+
+      - name: Install development dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Test
+        run: npm test
+
+      - name: Build release package
+        shell: bash
+        run: |
+          mkdir release
+          package_file="$(npm pack --ignore-scripts --json --pack-destination release | node -e '
+            let input = "";
+            process.stdin.on("data", (chunk) => input += chunk);
+            process.stdin.on("end", () => process.stdout.write(JSON.parse(input)[0].filename));
+          ')"
+          mv "release/${package_file}" release/threadferry.tgz
+          (cd release && sha256sum threadferry.tgz > SHA256SUMS)
+
+      - name: Verify packaged CLI
+        shell: bash
+        run: |
+          install_prefix="$RUNNER_TEMP/threadferry-install"
+          npm install --global --ignore-scripts --prefix "$install_prefix" ./release/threadferry.tgz
+          test "$("$install_prefix/bin/threadferry" --version)" = "$PACKAGE_VERSION"
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh release create "$GITHUB_REF_NAME"
+          release/threadferry.tgz
+          release/SHA256SUMS
+          --verify-tag
+          --generate-notes
+          --title "ThreadFerry $GITHUB_REF_NAME"
