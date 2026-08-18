@@ -4,15 +4,18 @@ ThreadFerry 的每个 GitHub Release 都使用这里对应版本的内容，不�
 
 ## Unreleased
 
-## 0.12.2
+## 0.12.3
 
-本次补丁优化 Owner 配对后的操作引导，让用户先完成当前步骤，再按清晰顺序接入群聊。
+本次版本完善企业微信权限诊断和首次接入引导，并为主分支补齐自动构建验证。
 
 ### 主要变化
 
-- 配对成功后明确提示用户返回电脑终端继续启动，不再提前抛出当时尚不可执行的群绑定命令。
-- 启动后的私聊入口改为引导用户发送 `threadferry help`，避免首次使用时直接填写未知的群 ID 和 Agent 名。
-- `threadferry help` 按实际顺序说明数据访问权限、添加机器人、查询群和 Agent、完成绑定四个步骤。
+- 修复 `threadferry doctor` 误报缺少 wecom-cli 加密凭据，并真实检查群消息历史权限。
+- 企业未授权机器人数据访问时直接提示 `errcode 853006` 和管理员审批动作，不再只返回错误编号。
+- 配对成功后引导用户返回终端继续启动；`threadferry help` 按权限、加群、查群、查 Agent、绑定的顺序说明群聊接入。
+- 新增 `Build` 工作流，每次推送到 `main` 自动安装锁定依赖、运行类型检查、完整测试和 TypeScript 构建。
+- 构建工作流仅授予仓库内容读取权限，不创建标签或发布版本。
+- 保留 `Release` 工作流；推送 `v*.*.*` 标签时独立执行打包、校验和 GitHub Release 发布。
 
 ### 安装与升级
 
@@ -20,7 +23,7 @@ ThreadFerry 的每个 GitHub Release 都使用这里对应版本的内容，不�
 curl -fsSL https://raw.githubusercontent.com/GnaixEuy/threadferry/main/install.sh | bash
 ```
 
-升级后重新运行 `threadferry onboard` 可看到新的配对提示；已经完成配对的 Owner 可直接私聊发送 `threadferry help`。
+本次变更不需要迁移配置。升级后运行 `threadferry doctor`；若显示 `errcode 853006`，需要企业管理员批准机器人的数据访问权限。重新运行 `threadferry onboard` 可体验新的配对引导。
 
 ### 发布资产
 
@@ -34,39 +37,7 @@ curl -fsSL https://raw.githubusercontent.com/GnaixEuy/threadferry/main/install.s
 - 企业微信官方 `wecom-cli 1.1.0+`
 - Codex CLI `0.138.0+` 或 Pi CLI `0.84.2+`
 
-[查看 v0.12.1...v0.12.2 的完整变更](https://github.com/GnaixEuy/threadferry/compare/v0.12.1...v0.12.2)
-
-## 0.12.1
-
-本次补丁完善企业微信运行诊断，避免把权限问题误判为凭据缺失或只返回无法定位的错误编号。
-
-### 主要变化
-
-- 修复 `threadferry doctor` 误报缺少已由 wecom-cli 加密保存的机器人凭据。
-- 新增群消息历史权限实检；企业未授权机器人数据访问时直接提示 `errcode 853006` 和管理员审批动作。
-- 保留官方 CLI 在非零退出时返回的结构化错误，方便定位真实的企业权限问题。
-
-### 安装与升级
-
-```sh
-curl -fsSL https://raw.githubusercontent.com/GnaixEuy/threadferry/main/install.sh | bash
-```
-
-升级后运行 `threadferry doctor`。若显示 `errcode 853006`，需要企业管理员批准机器人的数据访问权限后再重试群聊。
-
-### 发布资产
-
-- `threadferry.tgz`：包含已经编译的 CLI，可直接由 npm 全局安装。
-- `SHA256SUMS`：用于校验发布包完整性。
-
-### 运行要求
-
-- macOS 或 Linux
-- Node.js 22+
-- 企业微信官方 `wecom-cli 1.1.0+`
-- Codex CLI `0.138.0+` 或 Pi CLI `0.84.2+`
-
-[查看 v0.12.0...v0.12.1 的完整变更](https://github.com/GnaixEuy/threadferry/compare/v0.12.0...v0.12.1)
+[查看 v0.12.0...v0.12.3 的完整变更](https://github.com/GnaixEuy/threadferry/compare/v0.12.0...v0.12.3)
 
 ## 0.12.0
 

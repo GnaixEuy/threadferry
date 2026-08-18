@@ -148,6 +148,15 @@ test("release workflow publishes curated changelog notes", () => {
   assert.match(notes.stdout, /## 安装与升级/);
 });
 
+test("main pushes trigger build verification", () => {
+  const workflow = readFileSync(join(project, ".github", "workflows", "build.yml"), "utf8");
+  assert.match(workflow, /push:\s*\n\s*branches:\s*\n\s*- main/);
+  assert.match(workflow, /npm ci --ignore-scripts/);
+  assert.match(workflow, /npm run typecheck/);
+  assert.match(workflow, /npm test/);
+  assert.doesNotMatch(workflow, /gh release create/);
+});
+
 test("remote installer replaces an existing linked development install", () => {
   const temporary = mkdtempSync(join(tmpdir(), "threadferry-installer-"));
   try {
