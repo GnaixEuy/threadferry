@@ -53,7 +53,7 @@ The wizard guides you through:
 1. Checking and installing the official `wecom-cli`.
 2. Initializing `wecom-cli` by QR code or manual Bot ID/Secret entry when it is not authorized.
 3. Setting the agent name, runtime, model, and workspace. Agent names may contain Chinese characters and spaces. The workspace defaults to the directory where you run the wizard.
-4. Entering the Bot ID and masked Bot Secret used by ThreadFerry's WebSocket connection.
+4. Detecting saved `wecom-cli` credentials and asking whether to reuse them. If you decline or the credentials cannot be read, you can enter the Bot ID and masked Bot Secret manually.
 5. Sending a one-time pairing command in the target group.
 6. Checking dependencies and starting ThreadFerry.
 
@@ -158,7 +158,7 @@ threadferry start --admin-port 18080
 - State: `~/.threadferry/state-v3.json`
 - Configuration example: [threadferry.example.yaml](./threadferry.example.yaml)
 
-Normal use does not require manually configuring environment variables. `wecom-cli auth init` stores its credentials using the official encrypted mechanism. `threadferry onboard` and `threadferry start` prompt for the Bot ID and mask the Bot Secret as you type; ThreadFerry never writes them to configuration, logs, or state files.
+Normal use does not require manually configuring environment variables. `wecom-cli auth init` stores its credentials using the official encrypted mechanism. With your confirmation, `threadferry onboard` and `threadferry start` can decrypt and reuse those local credentials in memory. If reuse is unavailable or declined, ThreadFerry prompts for the Bot ID and masks the Bot Secret as you type. ThreadFerry never writes the credentials to configuration, logs, or state files.
 
 ## Security Boundaries
 

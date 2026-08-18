@@ -18,6 +18,7 @@ import { runPi } from "./runtimes/pi.js";
 import { acquireHostLock, defaultStatePath, newErrorId, ThreadFerryState } from "./state.js";
 import type { GroupMessage, IncomingMention, RuntimeName, ThreadFerryConfig } from "./types.js";
 import { findUpdate, installUpdate } from "./update.js";
+import { loadWecomCliCredentials } from "./wecom-credentials.js";
 
 const VERSION = "0.10.1";
 const UPDATE_INTERVAL_MS = 6 * 60 * 60 * 1_000;
@@ -156,6 +157,34 @@ async function botCredentials(): Promise<{ botId: string; secret: string }> {
     throw new Error("缺少 THREADFERRY_WECOM_BOT_ID 或 THREADFERRY_WECOM_BOT_SECRET；交互式终端可安全输入，非交互启动必须设置环境变量");
   }
   console.log("机器人凭据仅用于当前进程，不写入配置或日志。");
+  if (!botId && !secret) {
+    let configuredBotId: string | undefined;
+    try {
+      const { stdout } = await runCommand("wecom-cli", ["auth", "show"], { timeoutMs: 10_000 });
+      const value = stdout.match(/^Bot ID:\s*(.+)$/m)?.[1];
+      if (value) configuredBotId = validateCredential(value, "Bot ID");
+    } catch {
+      // Missing or unauthorized wecom-cli falls through to manual entry.
+    }
+    if (configuredBotId) {
+      const prompt = createInterface({ input: process.stdin, output: process.stdout });
+      try {
+        const answer = (await prompt.question(`检测到 wecom-cli 已配置 Bot ID ${configuredBotId}，是否直接读取并使用？[Y/n]: `)).trim().toLowerCase();
+        if (answer === "" || answer === "y" || answer === "yes") {
+          const saved = await loadWecomCliCredentials();
+          if (saved?.botId === configuredBotId) {
+            botId = saved.botId;
+            secret = saved.secret;
+            console.log("已复用 wecom-cli 凭据。");
+          } else {
+            console.log("无法读取 wecom-cli 保存的 Secret，请手动输入。");
+          }
+        }
+      } finally {
+        prompt.close();
+      }
+    }
+  }
   if (!botId) {
     const prompt = createInterface({ input: process.stdin, output: process.stdout });
     try {

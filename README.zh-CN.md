@@ -53,7 +53,7 @@ threadferry onboard
 1. 检查并安装官方 `wecom-cli`。
 2. `wecom-cli` 未授权时，通过扫码或手动输入 Bot ID/Secret 完成官方初始化。
 3. 设置 Agent 名、Runtime、模型和 Workspace。Agent 名支持中文和空格；Workspace 默认使用运行向导时的当前目录。
-4. 输入 ThreadFerry WebSocket 使用的 Bot ID 和隐藏显示的 Bot Secret。
+4. 检测 `wecom-cli` 已保存的凭据，并询问是否直接读取复用；拒绝复用或读取失败时，可以手动输入 Bot ID 和隐藏显示的 Bot Secret。
 5. 在目标群发送一次性配对命令。
 6. 检查依赖并启动 ThreadFerry。
 
@@ -158,7 +158,7 @@ threadferry start --admin-port 18080
 - 状态：`~/.threadferry/state-v3.json`
 - 配置示例：[threadferry.example.yaml](./threadferry.example.yaml)
 
-正常使用不需要手工配置环境变量。`wecom-cli auth init` 按官方机制加密保存自身凭据；`threadferry onboard` 和 `threadferry start` 会引导输入 Bot ID，并隐藏输入 Bot Secret，ThreadFerry 不会把凭据写入配置、日志或状态文件。
+正常使用不需要手工配置环境变量。`wecom-cli auth init` 按官方机制加密保存自身凭据；经用户确认后，`threadferry onboard` 和 `threadferry start` 可以在内存中解密并复用这份本地凭据。无法读取或拒绝复用时，ThreadFerry 会引导输入 Bot ID，并隐藏输入 Bot Secret。ThreadFerry 不会把凭据写入配置、日志或状态文件。
 
 ## 安全边界
 
