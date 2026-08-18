@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { existsSync } from "node:fs";
 import { mkdir, rename, rm, writeFile } from "node:fs/promises";
@@ -9,15 +10,17 @@ import { createInterface } from "node:readline/promises";
 import { createApp } from "./app.js";
 import { startAdminServer, type ConfigUpdater } from "./admin.js";
 import { listWecomGroups, searchWecomUsers, sendWecomReply, startWecomChannel } from "./channels/wecom.js";
-import { addAgent, loadConfig, resolveWorkspace, saveConfig, setupConfig } from "./config.js";
+import { addAgent, loadConfig, onboardingDefaults, resolveWorkspace, saveConfig, setupConfig } from "./config.js";
 import { fetchWecomHistory } from "./history/wecom-cli.js";
 import { runCommand } from "./process.js";
 import { runCodex } from "./runtimes/codex.js";
 import { runPi } from "./runtimes/pi.js";
 import { acquireHostLock, defaultStatePath, newErrorId, ThreadFerryState } from "./state.js";
 import type { GroupMessage, IncomingMention, RuntimeName, ThreadFerryConfig } from "./types.js";
+import { findUpdate, installUpdate } from "./update.js";
 
 const VERSION = "0.10.1";
+const UPDATE_INTERVAL_MS = 6 * 60 * 60 * 1_000;
 const USAGE = `ThreadFerry ${VERSION}
 
 Usage:
@@ -27,6 +30,7 @@ Usage:
   threadferry agent list [--config <path>]
   threadferry doctor [--config <path>]
   threadferry status [--config <path>]
+  threadferry update
   threadferry session reset --group <group-id> [--config <path>]
   threadferry start [--config <path>] [--admin-port <port>] [--mock]
 `;
@@ -51,6 +55,50 @@ function atLeast(output: string, minimum: [number, number, number]): boolean {
     if (version[index] !== minimum[index]) return (version[index] ?? 0) > minimum[index]!;
   }
   return true;
+}
+
+async function applyUpdate(): Promise<string | undefined> {
+  const release = await findUpdate(VERSION);
+  if (!release) return undefined;
+  console.log(`[update] 发现 ThreadFerry ${release.version}，正在升级...`);
+  const binary = await installUpdate(release);
+  console.log(`[update] 已升级到 ThreadFerry ${release.version}。`);
+  return binary;
+}
+
+async function autoUpdate(): Promise<string | undefined> {
+  try {
+    return await applyUpdate();
+  } catch (error) {
+    console.error(`[update] 自动更新失败，将继续运行当前版本：${error instanceof Error ? error.message : String(error)}`);
+    return undefined;
+  }
+}
+
+async function runUpdated(binary: string, args: string[]): Promise<void> {
+  console.log("[update] 正在使用新版本重新启动...");
+  await new Promise<void>((done, reject) => {
+    const child = spawn(binary, args, { env: process.env, stdio: "inherit" });
+    const forward = (signal: NodeJS.Signals) => child.kill(signal);
+    const onInterrupt = () => forward("SIGINT");
+    const onTerminate = () => forward("SIGTERM");
+    const cleanup = () => {
+      process.off("SIGINT", onInterrupt);
+      process.off("SIGTERM", onTerminate);
+    };
+    process.on("SIGINT", onInterrupt);
+    process.on("SIGTERM", onTerminate);
+    child.once("error", (error) => {
+      cleanup();
+      reject(error);
+    });
+    child.once("close", (code, signal) => {
+      cleanup();
+      if (signal) reject(new Error(`新版本被 ${signal} 终止`));
+      else if (code !== 0) reject(new Error(`新版本退出码为 ${code ?? "unknown"}`));
+      else done();
+    });
+  });
 }
 
 function validateCredential(value: string, name: string): string {
@@ -242,7 +290,7 @@ async function onboard(configOption?: string): Promise<void> {
   }
   const configPath = resolve(configOption ?? defaultConfigPath());
   const current = existsSync(configPath) ? await loadConfig(configPath) : undefined;
-  const initial = current ? Object.entries(current.agents)[0] : undefined;
+  const defaults = onboardingDefaults(current, process.cwd());
   const prompt = createInterface({ input: process.stdin, output: process.stdout });
   let agentId: string;
   let runtime: RuntimeName;
@@ -255,11 +303,11 @@ async function onboard(configOption?: string): Promise<void> {
       const answer = (await prompt.question(`${label} [${fallback}]: `)).trim();
       return answer || fallback;
     };
-    agentId = await ask("Agent 名", initial?.[0] ?? "default");
-    runtime = runtimeName((await ask("Runtime (codex/pi)", initial?.[1].runtime ?? "codex")).toLowerCase());
-    workspace = await ask("Workspace 绝对路径", initial?.[1].workspace ?? process.cwd());
-    const modelAnswer = (await prompt.question(`模型 ID（留空使用 Runtime 默认）${initial?.[1].model ? ` [${initial[1].model}]` : ""}: `)).trim();
-    model = modelAnswer || initial?.[1].model;
+    agentId = await ask("Agent 名", defaults.agentId);
+    runtime = runtimeName((await ask("Runtime (codex/pi)", defaults.runtime)).toLowerCase());
+    workspace = await ask("Workspace 绝对路径", defaults.workspace);
+    const modelAnswer = (await prompt.question(`模型 ID（留空使用 Runtime 默认）${defaults.model ? ` [${defaults.model}]` : ""}: `)).trim();
+    model = modelAnswer || defaults.model;
   } finally {
     prompt.close();
   }
@@ -280,7 +328,10 @@ async function onboard(configOption?: string): Promise<void> {
   } finally {
     confirmation.close();
   }
-  if (shouldStart) await start(configPath, false, 17_638);
+  if (shouldStart) {
+    const updatedBinary = await start(configPath, false, 17_638);
+    if (updatedBinary) await runUpdated(updatedBinary, ["start", "--config", configPath]);
+  }
   else console.log(`配置完成。稍后运行: threadferry start --config ${configPath}`);
 }
 
@@ -436,12 +487,16 @@ async function resetSession(configPath: string | undefined, groupId: string): Pr
   }
 }
 
-async function start(configPath: string, mock: boolean, port: number): Promise<void> {
+async function start(configPath: string, mock: boolean, port: number): Promise<string | undefined> {
   const configFile = resolve(configPath);
   const config = await loadConfig(configFile);
-  if (mock) return runMock(config);
+  if (mock) {
+    await runMock(config);
+    return undefined;
+  }
   const credentials = await preflightReal(config);
   const lock = await acquireHostLock();
+  let restartBinary: string | undefined;
   try {
     let configTail = Promise.resolve();
     const updateConfig: ConfigUpdater = (change) => {
@@ -523,15 +578,29 @@ async function start(configPath: string, mock: boolean, port: number): Promise<v
 
       await new Promise<void>((done) => {
         let stopping = false;
-        const stop = () => {
+        let updateCheck: Promise<void> | undefined;
+        let updateTimer: NodeJS.Timeout;
+        const stop = (cancel: boolean) => {
           if (stopping) return;
           stopping = true;
+          clearInterval(updateTimer);
           client.disconnect();
           void admin.close();
-          void Promise.all([app.shutdown(), recovery]).finally(done);
+          void Promise.all([app.shutdown(cancel), recovery, updateCheck]).finally(done);
         };
-        process.once("SIGINT", stop);
-        process.once("SIGTERM", stop);
+        updateTimer = setInterval(() => {
+          if (stopping || updateCheck) return;
+          updateCheck = autoUpdate()
+            .then((binary) => {
+              if (!binary) return;
+              restartBinary = binary;
+              stop(false);
+            })
+            .finally(() => { updateCheck = undefined; });
+        }, UPDATE_INTERVAL_MS);
+        updateTimer.unref();
+        process.once("SIGINT", () => stop(true));
+        process.once("SIGTERM", () => stop(true));
       });
     } finally {
       await admin.close();
@@ -539,6 +608,7 @@ async function start(configPath: string, mock: boolean, port: number): Promise<v
   } finally {
     await lock.release();
   }
+  return restartBinary;
 }
 
 async function main(): Promise<void> {
@@ -561,6 +631,10 @@ async function main(): Promise<void> {
   }
   if (command === "status") {
     await status(option(args, "--config"));
+    return;
+  }
+  if (command === "update") {
+    if (!(await applyUpdate())) console.log(`ThreadFerry ${VERSION} 已是最新版本。`);
     return;
   }
   if (command === "session") {
@@ -608,7 +682,14 @@ async function main(): Promise<void> {
   }
   if (command === "start") {
     const configPath = option(args, "--config") ?? defaultConfigPath();
-    await start(configPath, args.includes("--mock"), adminPort(option(args, "--admin-port")));
+    const mock = args.includes("--mock");
+    const binary = mock ? undefined : await autoUpdate();
+    if (binary) {
+      await runUpdated(binary, [command, ...args]);
+      return;
+    }
+    const restartBinary = await start(configPath, mock, adminPort(option(args, "--admin-port")));
+    if (restartBinary) await runUpdated(restartBinary, [command, ...args]);
     return;
   }
   throw new Error(`未知命令: ${command}\n${USAGE}`);

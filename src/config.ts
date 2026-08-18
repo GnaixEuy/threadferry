@@ -5,7 +5,6 @@ import { parse, stringify } from "yaml";
 import type { AgentConfig, GroupConfig, RuntimeName, ThreadFerryConfig } from "./types.js";
 
 const USER_ID = /^[A-Za-z0-9_@.-]{1,512}$/;
-const AGENT_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
 const RUNTIMES = new Set<RuntimeName>(["codex", "pi"]);
 
 function object(value: unknown, name: string): Record<string, unknown> {
@@ -35,11 +34,29 @@ export async function resolveWorkspace(input: string): Promise<string> {
 }
 
 function validateAgent(agentId: string, agent: AgentConfig): void {
-  if (!AGENT_ID.test(agentId)) throw new Error("Agent 名只能包含字母、数字、下划线和连字符，最长 64 个字符");
+  const length = [...agentId].length;
+  if (length < 1 || length > 64 || agentId !== agentId.trim() || /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u.test(agentId)) {
+    throw new Error("Agent 名必须是 1-64 个字符，不能以空格开头或结尾，也不能包含控制字符");
+  }
   if (!RUNTIMES.has(agent.runtime)) throw new Error(`Agent ${agentId} 的 runtime 仅支持 codex 或 pi`);
   if (agent.model !== undefined && (!agent.model.trim() || agent.model.length > 256 || /[\r\n]/.test(agent.model))) {
     throw new Error(`Agent ${agentId} 的 model 无效`);
   }
+}
+
+export function onboardingDefaults(current: ThreadFerryConfig | undefined, cwd: string): {
+  agentId: string;
+  runtime: RuntimeName;
+  workspace: string;
+  model: string | undefined;
+} {
+  const initial = current ? Object.entries(current.agents)[0] : undefined;
+  return {
+    agentId: initial?.[0] ?? "default",
+    runtime: initial?.[1].runtime ?? "codex",
+    workspace: cwd,
+    model: initial?.[1].model,
+  };
 }
 
 export function setupConfig(
