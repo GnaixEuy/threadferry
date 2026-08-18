@@ -56,9 +56,14 @@ if ! command -v npm >/dev/null 2>&1; then
   exit 1
 fi
 
-SCRIPT_DIRECTORY="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd -P)"
+SCRIPT_DIRECTORY=""
+SCRIPT_SOURCE="${BASH_SOURCE[0]-}"
+if [[ -n "$SCRIPT_SOURCE" ]]; then
+  SCRIPT_DIRECTORY="$(cd -- "$(dirname -- "$SCRIPT_SOURCE")" >/dev/null 2>&1 && pwd -P)"
+fi
+
 printf 'Installing ThreadFerry...\n'
-if [[ -f "$SCRIPT_DIRECTORY/package.json" && -f "$SCRIPT_DIRECTORY/src/cli.ts" ]]; then
+if [[ -n "$SCRIPT_DIRECTORY" && -f "$SCRIPT_DIRECTORY/package.json" && -f "$SCRIPT_DIRECTORY/src/cli.ts" ]]; then
   run npm ci --ignore-scripts --prefix "$SCRIPT_DIRECTORY"
   run npm run build --prefix "$SCRIPT_DIRECTORY"
   run npm install --global --ignore-scripts "$SCRIPT_DIRECTORY"
@@ -67,6 +72,17 @@ else
     printf 'Git is required for remote installation: https://git-scm.com/downloads\n' >&2
     exit 1
   fi
+
+  GLOBAL_PACKAGE_PATH="$(npm root --global)/threadferry"
+  GLOBAL_BIN_PATH="$(npm prefix --global)/bin/threadferry"
+  if [[ -L "$GLOBAL_PACKAGE_PATH" ]]; then
+    printf 'Replacing linked ThreadFerry development install...\n'
+    if [[ -L "$GLOBAL_BIN_PATH" && "$(readlink "$GLOBAL_BIN_PATH")" == *"node_modules/threadferry/"* ]]; then
+      run unlink "$GLOBAL_BIN_PATH"
+    fi
+    run unlink "$GLOBAL_PACKAGE_PATH"
+  fi
+
   run npm install --global "$REPOSITORY"
 fi
 

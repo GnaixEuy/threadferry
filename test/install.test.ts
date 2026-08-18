@@ -1,5 +1,16 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import {
+  chmodSync,
+  mkdtempSync,
+  mkdirSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 
@@ -15,6 +26,66 @@ test("installer dry-run is non-destructive and points to onboarding", () => {
   assert.match(result.stdout, /npm ci/);
   assert.match(result.stdout, /threadferry onboard/);
   assert.doesNotMatch(result.stdout, /sudo/);
+});
+
+test("installer supports curl-pipe execution", () => {
+  const script = readFileSync(fileURLToPath(new URL("../../install.sh", import.meta.url)), "utf8");
+  const result = spawnSync("bash", ["-s", "--", "--dry-run", "--no-onboard"], {
+    cwd: project,
+    encoding: "utf8",
+    input: script,
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.doesNotMatch(result.stderr, /BASH_SOURCE/);
+  assert.match(result.stdout, /git\+https:\/\/github\.com\/GnaixEuy\/threadferry\.git/);
+  assert.match(result.stdout, /threadferry onboard/);
+});
+
+test("remote installer replaces an existing linked development install", () => {
+  const temporary = mkdtempSync(join(tmpdir(), "threadferry-installer-"));
+  try {
+    const commandDirectory = join(temporary, "commands");
+    const prefix = join(temporary, "prefix");
+    const globalRoot = join(prefix, "lib", "node_modules");
+    mkdirSync(commandDirectory, { recursive: true });
+    mkdirSync(globalRoot, { recursive: true });
+    mkdirSync(join(prefix, "bin"), { recursive: true });
+    symlinkSync(project, join(globalRoot, "threadferry"));
+    symlinkSync("../lib/node_modules/threadferry/dist/src/cli.js", join(prefix, "bin", "threadferry"));
+
+    const fakeNpm = join(commandDirectory, "npm");
+    writeFileSync(
+      fakeNpm,
+      `#!/usr/bin/env bash
+if [[ "$1 $2" == "root --global" ]]; then
+  printf '%s\\n' "$THREADFERRY_TEST_NPM_ROOT"
+elif [[ "$1 $2" == "prefix --global" ]]; then
+  printf '%s\\n' "$THREADFERRY_TEST_NPM_PREFIX"
+else
+  exit 99
+fi
+`,
+    );
+    chmodSync(fakeNpm, 0o755);
+
+    const script = readFileSync(fileURLToPath(new URL("../../install.sh", import.meta.url)), "utf8");
+    const result = spawnSync("bash", ["-s", "--", "--dry-run", "--no-onboard"], {
+      cwd: project,
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        PATH: `${commandDirectory}:${process.env.PATH ?? ""}`,
+        THREADFERRY_TEST_NPM_PREFIX: prefix,
+        THREADFERRY_TEST_NPM_ROOT: globalRoot,
+      },
+      input: script,
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, new RegExp(`unlink ${join(prefix, "bin", "threadferry")}`));
+    assert.match(result.stdout, new RegExp(`unlink ${join(globalRoot, "threadferry")}`));
+  } finally {
+    rmSync(temporary, { force: true, recursive: true });
+  }
 });
 
 test("CLI exposes package version and rejects non-interactive onboarding", () => {
