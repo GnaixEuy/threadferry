@@ -4,6 +4,10 @@ ThreadFerry 的每个 GitHub Release 都使用这里对应版本的内容，不�
 
 ## Unreleased
 
+## 0.11.0
+
+本次版本完善了 ThreadFerry 的安装、企业微信初始化和持续升级流程，让用户可以更快完成首次配置，并自动获得后续缺陷修复。
+
 ### 主要变化
 
 - Agent 名支持中文、空格和常见符号，不再要求使用纯英文标识符。
@@ -14,6 +18,35 @@ ThreadFerry 的每个 GitHub Release 都使用这里对应版本的内容，不�
 - `wecom-cli` 已配置时，ThreadFerry 会询问是否直接读取并复用其加密凭据；读取失败或用户拒绝时仍可手动输入。
 - 新增群绑定改为由本机生成的一次性配对码授权，不再因同一用户的企业微信回调 ID 形式不同而误判为非 Owner；现有 Owner 保持不变。
 - Release Notes 改为从本文件提取经过整理的中文说明；缺少对应版本内容时发布流程会直接失败。
+
+### 安装与升级
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/GnaixEuy/threadferry/main/install.sh | bash
+```
+
+安装器会下载本 Release 的预编译包，并检查或安装 `wecom-cli 1.1.0+`。升级完成后运行：
+
+```sh
+threadferry --version
+threadferry doctor
+```
+
+现有 `~/.threadferry/threadferry.yaml`、Owner、群绑定和本地状态会保留，不需要重新配置。
+
+### 发布资产
+
+- `threadferry.tgz`：包含已经编译的 CLI，可直接由 npm 全局安装。
+- `SHA256SUMS`：用于校验发布包完整性。
+
+### 运行要求
+
+- macOS 或 Linux
+- Node.js 22+
+- 企业微信官方 `wecom-cli 1.1.0+`
+- Codex CLI `0.138.0+` 或 Pi CLI `0.84.2+`
+
+[查看 v0.10.1...v0.11.0 的完整变更](https://github.com/GnaixEuy/threadferry/compare/v0.10.1...v0.11.0)
 
 ## 0.10.1
 
