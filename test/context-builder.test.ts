@@ -27,7 +27,8 @@ test("context contains recent history as untrusted data and preserves the curren
   ];
 
   const prompt = buildContext(history, current, { lookbackHours: 6, maxMessages: 80 });
-  for (const expected of ["张三", "10:00:00", "这个接口有问题", "李四", "可能是 Redis", "王五", "线上出现三次"]) {
+  const firstMessageLocalTime = history[0].time.toTimeString().slice(0, 8);
+  for (const expected of ["张三", firstMessageLocalTime, "这个接口有问题", "李四", "可能是 Redis", "王五", "线上出现三次"]) {
     assert.match(prompt, new RegExp(expected));
   }
   assert.match(prompt, /不可信背景数据/);
