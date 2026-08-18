@@ -2,8 +2,8 @@ import { createHash, randomBytes } from "node:crypto";
 import { authorize } from "./authorization.js";
 import { buildContext } from "./context-builder.js";
 import { resolveDirectoryUser } from "./directory.js";
-import { newErrorId, WardenState, type FailurePhase } from "./state.js";
-import type { DirectoryUser, GroupMessage, IncomingDirectMessage, IncomingMention, Reply, RuntimeRequest, RuntimeResult, WardenConfig } from "./types.js";
+import { newErrorId, ThreadFerryState, type FailurePhase } from "./state.js";
+import type { DirectoryUser, GroupMessage, IncomingDirectMessage, IncomingMention, Reply, RuntimeRequest, RuntimeResult, ThreadFerryConfig } from "./types.js";
 
 export type HandleResult = "handled" | "stale" | "failed" | "command" | "delivery_pending" | "duplicate" | "unauthorized_group" | "missing_mention" | "unauthorized_user";
 
@@ -21,7 +21,7 @@ type ManagementCommand = "help" | "whoami" | "groups" | "agents" | "users" | "in
 const USER_ID = /^[A-Za-z0-9_@.-]{1,512}$/;
 
 function managementCommand(text: string): { name: ManagementCommand; arguments: string[] } | undefined {
-  const match = text.match(/(?:^|[\s@])warden\s+(help|whoami|groups|agents|users|invite|join|add|remove|use)(?:\s+(.+?))?\s*$/i);
+  const match = text.match(/(?:^|[\s@])threadferry\s+(help|whoami|groups|agents|users|invite|join|add|remove|use)(?:\s+(.+?))?\s*$/i);
   if (!match) return undefined;
   return { name: match[1]!.toLowerCase() as ManagementCommand, arguments: match[2]?.trim().split(/\s+/) ?? [] };
 }
@@ -55,7 +55,7 @@ function historyFingerprint(history: GroupMessage[], current: IncomingMention): 
   return createHash("sha256").update(JSON.stringify(normalized)).digest("hex");
 }
 
-export function createApp(config: WardenConfig, dependencies: AppDependencies, state = new WardenState()) {
+export function createApp(config: ThreadFerryConfig, dependencies: AppDependencies, state = new ThreadFerryState()) {
   const groupTails = new Map<string, Promise<void>>();
   const controllers = new Map<string, AbortController>();
   const invites = new Map<string, { groupId: string; expiresAt: number }>();
@@ -69,7 +69,7 @@ export function createApp(config: WardenConfig, dependencies: AppDependencies, s
       if (!group || !dependencies.updateAllowUsers) throw new Error("当前启动方式不支持用户管理");
       const users = [...new Set(change(group.allowUsers))];
       if (!users.every((user) => USER_ID.test(user))) throw new Error("userid 无效");
-      if (!users.includes(config.ownerUser)) throw new Error("不能移除 Warden Owner");
+      if (!users.includes(config.ownerUser)) throw new Error("不能移除 ThreadFerry Owner");
       if (users.length > 256) throw new Error("可使用用户已达到 256 人上限");
       await dependencies.updateAllowUsers(groupId, users);
       group.allowUsers = users;
@@ -83,7 +83,7 @@ export function createApp(config: WardenConfig, dependencies: AppDependencies, s
     const operation = accessTail.then(async () => {
       const group = config.groups[groupId];
       if (!group || !dependencies.updateGroupAgent) throw new Error("当前启动方式不支持 Agent 管理");
-      if (!config.agents[agentId]) throw new Error(`Agent \`${agentId}\` 不存在。请先发送 \`warden agents\`。`);
+      if (!config.agents[agentId]) throw new Error(`Agent \`${agentId}\` 不存在。请先发送 \`threadferry agents\`。`);
       await dependencies.updateGroupAgent(groupId, agentId);
       group.agent = agentId;
     });
@@ -110,7 +110,7 @@ export function createApp(config: WardenConfig, dependencies: AppDependencies, s
 
   async function resolveGroup(reference: string): Promise<{ id: string; name?: string }> {
     if (config.groups[reference]) return { id: reference };
-    if (!reference) throw new Error("缺少群名。请先发送 `warden groups` 查看可管理群。");
+    if (!reference) throw new Error("缺少群名。请先发送 `threadferry groups` 查看可管理群。");
     const sessions = await groupSessions();
     const matches = sessions.filter((session) => session.name === reference);
     const configured = matches.filter((session) => config.groups[session.id]);
@@ -118,8 +118,8 @@ export function createApp(config: WardenConfig, dependencies: AppDependencies, s
     if (configured.length > 1) {
       throw new Error(`有多个同名群“${reference}”，请改用群 ID：\n${configured.map((group) => `- \`${group.id}\``).join("\n")}`);
     }
-    if (matches.length > 0) throw new Error(`群“${reference}”尚未配置 Agent，请先运行 warden setup。`);
-    throw new Error(`没有找到已配置群“${reference}”。请先发送 \`warden groups\`。`);
+    if (matches.length > 0) throw new Error(`群“${reference}”尚未配置 Agent，请先运行 threadferry setup。`);
+    throw new Error(`没有找到已配置群“${reference}”。请先发送 \`threadferry groups\`。`);
   }
 
   async function resolveGroupAndValue(arguments_: string[], label: string): Promise<{ group: { id: string; name?: string }; value: string }> {
@@ -131,13 +131,13 @@ export function createApp(config: WardenConfig, dependencies: AppDependencies, s
     const sessions = (await groupSessions())
       .filter((session) => session.name && input.startsWith(`${session.name} `))
       .sort((left, right) => right.name!.length - left.name!.length);
-    if (sessions.length === 0) throw new Error("没有识别出群名。请先发送 `warden groups`，也可以改用群 ID。");
+    if (sessions.length === 0) throw new Error("没有识别出群名。请先发送 `threadferry groups`，也可以改用群 ID。");
     const longest = sessions[0]!.name!;
     const matches = sessions.filter((session) => session.name === longest && config.groups[session.id]);
     if (matches.length > 1) {
       throw new Error(`有多个同名群“${longest}”，请改用群 ID：\n${matches.map((group) => `- \`${group.id}\``).join("\n")}`);
     }
-    if (matches.length === 0) throw new Error(`群“${longest}”尚未配置 Agent，请先运行 warden setup。`);
+    if (matches.length === 0) throw new Error(`群“${longest}”尚未配置 Agent，请先运行 threadferry setup。`);
     return { group: matches[0]!, value: input.slice(longest.length).trim() };
   }
 
@@ -213,7 +213,7 @@ export function createApp(config: WardenConfig, dependencies: AppDependencies, s
     invites.delete(code);
     try {
       await updateUsers(invite.groupId, (users) => [...users, senderId]);
-      return respond(reply, `授权成功。你现在可以在群 \`${invite.groupId}\` 使用 Warden。`);
+      return respond(reply, `授权成功。你现在可以在群 \`${invite.groupId}\` 使用 ThreadFerry。`);
     } catch {
       const errorId = newErrorId();
       dependencies.onError?.({ errorId, phase: "host" });
@@ -224,12 +224,12 @@ export function createApp(config: WardenConfig, dependencies: AppDependencies, s
   async function handleDirect(message: IncomingDirectMessage, reply: Reply): Promise<HandleResult> {
     if (!(await state.claimCommand(message.msgId, `direct:${message.senderId}`))) return "duplicate";
     const command = managementCommand(message.text);
-    if (!command) return respond(reply, "Warden 私聊仅用于机器人管理。发送 `warden help` 查看命令。");
-    if (command.name === "whoami") return respond(reply, `你的 Warden userid：\`${message.senderId}\``);
+    if (!command) return respond(reply, "ThreadFerry 私聊仅用于机器人管理。发送 `threadferry help` 查看命令。");
+    if (command.name === "whoami") return respond(reply, `你的 ThreadFerry userid：\`${message.senderId}\``);
     if (command.name === "join") return join(message.senderId, command.arguments[0], reply);
-    if (message.senderId !== config.ownerUser) return respond(reply, "只有机器人创建者（Warden Owner）可以在私聊中管理群权限。");
+    if (message.senderId !== config.ownerUser) return respond(reply, "只有机器人创建者（ThreadFerry Owner）可以在私聊中管理群权限。");
     if (command.name === "help") {
-      return respond(reply, "Warden 私聊管理命令：\n- `warden groups` 查看群与当前 Agent\n- `warden agents` 查看可用 Agent\n- `warden use <群名> <Agent名>` 切换群 Agent\n- `warden users <群名>` 查看可使用用户\n- `warden invite <群名>` 生成一次性邀请码\n- `warden add <群名> <姓名>` 直接授权\n- `warden remove <群名> <姓名>` 移除授权\n- `warden whoami` 查看自己的 userid\n\n群或成员重名时，按机器人返回的 ID 重新发送即可。");
+      return respond(reply, "ThreadFerry 私聊管理命令：\n- `threadferry groups` 查看群与当前 Agent\n- `threadferry agents` 查看可用 Agent\n- `threadferry use <群名> <Agent名>` 切换群 Agent\n- `threadferry users <群名>` 查看可使用用户\n- `threadferry invite <群名>` 生成一次性邀请码\n- `threadferry add <群名> <姓名>` 直接授权\n- `threadferry remove <群名> <姓名>` 移除授权\n- `threadferry whoami` 查看自己的 userid\n\n群或成员重名时，按机器人返回的 ID 重新发送即可。");
     }
     if (command.name === "agents") {
       const lines = Object.entries(config.agents).map(([id, agent]) => `- \`${id}\`：${agent.runtime}${agent.model ? ` / ${agent.model}` : ""}\n  ${agent.workspace}`);
@@ -274,7 +274,7 @@ export function createApp(config: WardenConfig, dependencies: AppDependencies, s
       for (const [code, item] of invites) if (item.groupId === group.id) invites.delete(code);
       const code = randomBytes(6).toString("hex").toUpperCase();
       invites.set(code, { groupId: group.id, expiresAt: Date.now() + 10 * 60_000 });
-      return respond(reply, `群“${groupLabel}”的一次性邀请码：\`${code}\`\n\n目标用户可私聊机器人发送 \`warden join ${code}\`，或在该群发送 \`@机器人 warden join ${code}\`。10 分钟内有效。`);
+      return respond(reply, `群“${groupLabel}”的一次性邀请码：\`${code}\`\n\n目标用户可私聊机器人发送 \`threadferry join ${code}\`，或在该群发送 \`@机器人 threadferry join ${code}\`。10 分钟内有效。`);
     }
     if (command.name === "use") {
       try {
@@ -299,7 +299,7 @@ export function createApp(config: WardenConfig, dependencies: AppDependencies, s
         // Owner 的原始回调 userid 仍受下面的精确比较保护。
       }
       if (user.id === config.ownerUser || user.id === ownerDirectoryId) {
-        return respond(reply, "不能移除机器人 Warden Owner。");
+        return respond(reply, "不能移除机器人 ThreadFerry Owner。");
       }
     }
     try {
@@ -313,16 +313,16 @@ export function createApp(config: WardenConfig, dependencies: AppDependencies, s
     } catch {
       const errorId = newErrorId();
       dependencies.onError?.({ errorId, phase: "host" });
-      return respond(reply, `权限更新失败（错误编号 ${errorId}）。请执行 \`warden status\`。`);
+      return respond(reply, `权限更新失败（错误编号 ${errorId}）。请执行 \`threadferry status\`。`);
     }
   }
 
   async function handleGroupCommand(message: IncomingMention, reply: Reply, command: { name: ManagementCommand; arguments: string[] }): Promise<HandleResult> {
     if (!config.groups[message.groupId]) return "unauthorized_group";
     if (!(await state.claimCommand(message.msgId, message.groupId))) return "duplicate";
-    if (command.name === "whoami") return respond(reply, `你的 Warden userid：\`${message.senderId}\``);
+    if (command.name === "whoami") return respond(reply, `你的 ThreadFerry userid：\`${message.senderId}\``);
     if (command.name === "join") return join(message.senderId, command.arguments[0], reply, message.groupId);
-    return respond(reply, "机器人权限管理请私聊 Warden，并发送 `warden help` 查看命令。");
+    return respond(reply, "机器人权限管理请私聊 ThreadFerry，并发送 `threadferry help` 查看命令。");
   }
 
   function serial<T>(groupId: string, operation: () => Promise<T>): Promise<T> {
@@ -358,7 +358,7 @@ export function createApp(config: WardenConfig, dependencies: AppDependencies, s
   async function fail(message: IncomingMention, reply: Reply, phase: FailurePhase): Promise<HandleResult> {
     const errorId = newErrorId();
     dependencies.onError?.({ errorId, phase });
-    const content = "Warden 处理失败（错误编号 " + errorId + "）。请在运行 Warden 的机器上执行 `warden status` 和 `warden doctor`。";
+    const content = "ThreadFerry 处理失败（错误编号 " + errorId + "）。请在运行 ThreadFerry 的机器上执行 `threadferry status` 和 `threadferry doctor`。";
     try {
       return await complete(message, reply, "failed", content, { errorId, phase });
     } catch {
@@ -371,7 +371,7 @@ export function createApp(config: WardenConfig, dependencies: AppDependencies, s
   async function process(message: IncomingMention, reply: Reply, agentId: string, context: { lookbackHours: number; maxMessages: number }): Promise<HandleResult> {
     let phase: FailurePhase = "history";
     try {
-      if (shuttingDown) throw new Error("Warden 正在停止");
+      if (shuttingDown) throw new Error("ThreadFerry 正在停止");
       await state.markRunning(message.msgId);
       const history = await dependencies.history(message.groupId, { ...context, endTime: message.time });
       const fingerprint = historyFingerprint(history, message);
@@ -436,7 +436,7 @@ export function createApp(config: WardenConfig, dependencies: AppDependencies, s
 
       const queued = groupTails.has(message.groupId);
       try {
-        await reply(queued ? "Warden 已收到，当前群有任务处理中，已排队。" : "Warden 已收到，正在分析。", false);
+        await reply(queued ? "ThreadFerry 已收到，当前群有任务处理中，已排队。" : "ThreadFerry 已收到，正在分析。", false);
       } catch {
         return fail(message, reply, "ack");
       }

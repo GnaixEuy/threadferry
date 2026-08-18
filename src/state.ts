@@ -65,7 +65,7 @@ const MAX_REPLY_BYTES = 12_000;
 const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const DIGEST = /^[a-f0-9]{64}$/;
 const SESSION_ID = /^[A-Za-z0-9_-]{1,160}$/;
-const ERROR_ID = /^W-[A-F0-9]{8}$/;
+const ERROR_ID = /^TF-[A-F0-9]{8}$/;
 const STATUSES = new Set<TurnStatus>(["queued", "running", "handled", "stale", "failed"]);
 const PHASES = new Set<FailurePhase>(["ack", "history", "runtime", "freshness", "reply", "host"]);
 const STATE_FIELDS = new Set(["version", "turns", "sessions", "inbox", "outbox"]);
@@ -124,12 +124,12 @@ function validMention(value: unknown): value is StoredMention {
 }
 
 function validateState(value: unknown): StateDocument {
-  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Warden 状态文件结构无效");
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("ThreadFerry 状态文件结构无效");
   const state = value as Partial<StateDocument>;
   if (Object.keys(value).some((field) => !STATE_FIELDS.has(field))
     || state.version !== 3 || !Array.isArray(state.turns) || !Array.isArray(state.sessions)
     || !Array.isArray(state.inbox) || !Array.isArray(state.outbox)) {
-    throw new Error("Warden 状态文件版本或结构无效");
+    throw new Error("ThreadFerry 状态文件版本或结构无效");
   }
   if (state.turns.length > MAX_TURNS || state.turns.some((turn) => !turn || typeof turn !== "object" || Array.isArray(turn)
     || Object.keys(turn).some((field) => !TURN_FIELDS.has(field))
@@ -138,17 +138,17 @@ function validateState(value: unknown): StateDocument {
     || !validDate((turn as TurnRecord).updatedAt)
     || ((turn as TurnRecord).errorId !== undefined && !ERROR_ID.test(String((turn as TurnRecord).errorId)))
     || ((turn as TurnRecord).failurePhase !== undefined && !PHASES.has((turn as TurnRecord).failurePhase!)))) {
-    throw new Error("Warden 执行状态记录无效");
+    throw new Error("ThreadFerry 执行状态记录无效");
   }
   if (state.sessions.some((session) => !session || typeof session !== "object" || Array.isArray(session)
     || Object.keys(session).some((field) => !SESSION_FIELDS.has(field))
     || !DIGEST.test(String((session as SessionRecord).group)) || !DIGEST.test(String((session as SessionRecord).workspace))
     || !SESSION_ID.test(String((session as SessionRecord).sessionId))
     || !validDate((session as SessionRecord).updatedAt))) {
-    throw new Error("Warden Session 状态记录无效");
+    throw new Error("ThreadFerry Session 状态记录无效");
   }
   if (state.inbox.length > MAX_PENDING || state.inbox.some((message) => !validMention(message))) {
-    throw new Error("Warden 待处理消息记录无效");
+    throw new Error("ThreadFerry 待处理消息记录无效");
   }
   if (state.outbox.length > MAX_PENDING || state.outbox.some((delivery) => !delivery || typeof delivery !== "object" || Array.isArray(delivery)
     || Object.keys(delivery).some((field) => !OUTBOX_FIELDS.has(field))
@@ -159,7 +159,7 @@ function validateState(value: unknown): StateDocument {
     || !Number.isInteger((delivery as PendingDelivery).attempts) || (delivery as PendingDelivery).attempts < 0
     || !validDate((delivery as PendingDelivery).createdAt) || !validDate((delivery as PendingDelivery).updatedAt)
     || ((delivery as PendingDelivery).errorId !== undefined && !ERROR_ID.test(String((delivery as PendingDelivery).errorId))))) {
-    throw new Error("Warden 待发送回复记录无效");
+    throw new Error("ThreadFerry 待发送回复记录无效");
   }
   return state as StateDocument;
 }
@@ -175,21 +175,21 @@ function restoreMention(message: StoredMention): IncomingMention {
 }
 
 export function defaultStatePath(): string {
-  return join(homedir(), ".warden", "state-v3.json");
+  return join(homedir(), ".threadferry", "state-v3.json");
 }
 
 export function defaultLockPath(): string {
-  return join(homedir(), ".warden", "host.lock");
+  return join(homedir(), ".threadferry", "host.lock");
 }
 
 export function newErrorId(): string {
-  return `W-${randomBytes(4).toString("hex").toUpperCase()}`;
+  return `TF-${randomBytes(4).toString("hex").toUpperCase()}`;
 }
 
 export async function acquireHostLock(path = defaultLockPath()): Promise<{ release: () => Promise<void> }> {
   const directory = dirname(path);
   try {
-    if ((await lstat(directory)).isSymbolicLink()) throw new Error("Warden 状态目录不能是符号链接");
+    if ((await lstat(directory)).isSymbolicLink()) throw new Error("ThreadFerry 状态目录不能是符号链接");
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
   }
@@ -221,21 +221,21 @@ export async function acquireHostLock(path = defaultLockPath()): Promise<{ relea
         if (!Number.isInteger(current.pid) || Number(current.pid) <= 0) throw new Error("PID 无效");
         pid = Number(current.pid);
       } catch {
-        throw new Error(`Warden 锁文件无效；确认没有 Warden 进程后删除 ${path}`);
+        throw new Error(`ThreadFerry 锁文件无效；确认没有 ThreadFerry 进程后删除 ${path}`);
       }
       try {
         process.kill(pid, 0);
-        throw new Error(`Warden 已在运行（PID ${pid}）`);
+        throw new Error(`ThreadFerry 已在运行（PID ${pid}）`);
       } catch (probe) {
         if ((probe as NodeJS.ErrnoException).code !== "ESRCH") throw probe;
       }
       await rm(path);
     }
   }
-  throw new Error("无法获取 Warden 单实例锁");
+  throw new Error("无法获取 ThreadFerry 单实例锁");
 }
 
-export class WardenState {
+export class ThreadFerryState {
   private data = emptyState();
   private loaded = false;
   private pending = Promise.resolve();
@@ -256,8 +256,8 @@ export class WardenState {
     }
     try {
       const info = await lstat(this.path);
-      if (info.isSymbolicLink()) throw new Error("Warden 状态文件不能是符号链接");
-      if (info.size > MAX_STATE_BYTES) throw new Error("Warden 状态文件超过安全上限");
+      if (info.isSymbolicLink()) throw new Error("ThreadFerry 状态文件不能是符号链接");
+      if (info.size > MAX_STATE_BYTES) throw new Error("ThreadFerry 状态文件超过安全上限");
       this.data = validateState(JSON.parse(await readFile(this.path, "utf8")));
       await chmod(this.path, 0o600);
       this.loaded = true;
@@ -271,14 +271,14 @@ export class WardenState {
     if (!this.path) return;
     const directory = dirname(this.path);
     try {
-      if ((await lstat(directory)).isSymbolicLink()) throw new Error("Warden 状态目录不能是符号链接");
+      if ((await lstat(directory)).isSymbolicLink()) throw new Error("ThreadFerry 状态目录不能是符号链接");
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
     }
     await mkdir(directory, { recursive: true, mode: 0o700 });
     await chmod(directory, 0o700);
     const content = `${JSON.stringify(this.data)}\n`;
-    if (Buffer.byteLength(content) > MAX_STATE_BYTES) throw new Error("Warden 状态文件超过安全上限");
+    if (Buffer.byteLength(content) > MAX_STATE_BYTES) throw new Error("ThreadFerry 状态文件超过安全上限");
     const temporary = join(directory, `.${basename(this.path)}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`);
     try {
       await writeFile(temporary, content, { flag: "wx", mode: 0o600 });
@@ -295,11 +295,11 @@ export class WardenState {
       await this.load();
       const id = key(message.msgId);
       if (this.data.turns.some((turn) => turn.id === id)) return false;
-      if (this.data.inbox.length >= MAX_PENDING) throw new Error("Warden 待处理队列已满");
-      if (this.data.outbox.length >= MAX_PENDING) throw new Error("Warden 待发送队列已满，请先恢复消息投递");
+      if (this.data.inbox.length >= MAX_PENDING) throw new Error("ThreadFerry 待处理队列已满");
+      if (this.data.outbox.length >= MAX_PENDING) throw new Error("ThreadFerry 待发送队列已满，请先恢复消息投递");
       while (this.data.turns.length >= MAX_TURNS) {
         const removable = this.data.turns.findIndex((turn) => turn.status !== "queued" && turn.status !== "running");
-        if (removable === -1) throw new Error("Warden 执行队列已满");
+        if (removable === -1) throw new Error("ThreadFerry 执行队列已满");
         this.data.turns.splice(removable, 1);
       }
       const now = new Date().toISOString();
@@ -318,7 +318,7 @@ export class WardenState {
       if (this.data.turns.some((turn) => turn.id === id)) return false;
       while (this.data.turns.length >= MAX_TURNS) {
         const removable = this.data.turns.findIndex((turn) => turn.status !== "queued" && turn.status !== "running");
-        if (removable === -1) throw new Error("Warden 执行队列已满");
+        if (removable === -1) throw new Error("ThreadFerry 执行队列已满");
         this.data.turns.splice(removable, 1);
       }
       const now = new Date().toISOString();
@@ -332,7 +332,7 @@ export class WardenState {
     await this.exclusive(async () => {
       await this.load();
       const turn = this.data.turns.find((candidate) => candidate.id === key(msgId));
-      if (!turn) throw new Error("Warden 状态缺少当前消息");
+      if (!turn) throw new Error("ThreadFerry 状态缺少当前消息");
       turn.status = "running";
       turn.updatedAt = new Date().toISOString();
       await this.save();
@@ -344,7 +344,7 @@ export class WardenState {
       await this.load();
       const id = key(msgId);
       const turn = this.data.turns.find((candidate) => candidate.id === id);
-      if (!turn) throw new Error("Warden 状态缺少当前消息");
+      if (!turn) throw new Error("ThreadFerry 状态缺少当前消息");
       turn.status = status;
       turn.updatedAt = new Date().toISOString();
       turn.errorId = failure.errorId;
@@ -368,9 +368,9 @@ export class WardenState {
       await this.load();
       const id = key(msgId);
       const turn = this.data.turns.find((candidate) => candidate.id === id);
-      if (!turn || turn.group !== key(groupId)) throw new Error("Warden 状态缺少当前消息");
+      if (!turn || turn.group !== key(groupId)) throw new Error("ThreadFerry 状态缺少当前消息");
       if (!this.data.outbox.some((delivery) => delivery.id === id) && this.data.outbox.length >= MAX_PENDING) {
-        throw new Error("Warden 待发送队列已满");
+        throw new Error("ThreadFerry 待发送队列已满");
       }
       const now = new Date().toISOString();
       turn.status = status;

@@ -11,10 +11,10 @@ import { CommandExecutionError, runCommand } from "../src/process.js";
 import { runCodex } from "../src/runtimes/codex.js";
 import { allowedReadPath } from "../src/runtimes/pi-readonly-extension.js";
 import { runPi } from "../src/runtimes/pi.js";
-import { WardenState } from "../src/state.js";
-import type { CommandRunner, GroupMessage, IncomingMention, WardenConfig } from "../src/types.js";
+import { ThreadFerryState } from "../src/state.js";
+import type { CommandRunner, GroupMessage, IncomingMention, ThreadFerryConfig } from "../src/types.js";
 
-function testConfig(workspace = "/workspace", ownerUser = "user", groupId = "group"): WardenConfig {
+function testConfig(workspace = "/workspace", ownerUser = "user", groupId = "group"): ThreadFerryConfig {
   return {
     version: 5,
     ownerUser,
@@ -25,7 +25,7 @@ function testConfig(workspace = "/workspace", ownerUser = "user", groupId = "gro
 }
 
 test("mock WeCom -> history -> context -> Codex -> reply vertical slice", async (t) => {
-  const root = await mkdtemp(join(tmpdir(), "warden-test-"));
+  const root = await mkdtemp(join(tmpdir(), "threadferry-test-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   const workspace = await realpath(root);
   const config = testConfig(workspace, "user_allowed", "group_allowed");
@@ -45,15 +45,15 @@ test("mock WeCom -> history -> context -> Codex -> reply vertical slice", async 
     assert.equal(command, "codex");
     assert.equal(options?.cwd, workspace);
     assert.equal(args[args.indexOf("-C") + 1], workspace);
-    assert.match(args.find((arg) => arg.startsWith("permissions.warden-read-only.filesystem=")) ?? "", /":workspace_roots"=\{"\."="read"/);
-    assert.ok(args.includes("permissions.warden-read-only.network.enabled=false"));
+    assert.match(args.find((arg) => arg.startsWith("permissions.threadferry-read-only.filesystem=")) ?? "", /":workspace_roots"=\{"\."="read"/);
+    assert.ok(args.includes("permissions.threadferry-read-only.network.enabled=false"));
     assert.ok(!args.includes("workspace-write"));
     assert.ok(args.indexOf("-a") < args.indexOf("exec"));
     assert.ok(args.includes("never"));
     assert.ok(args.includes("--json"));
     assert.ok(args.includes("--ignore-user-config"));
     assert.ok(!args.includes("--ephemeral"));
-    assert.equal(options?.env?.WARDEN_WECOM_BOT_SECRET, undefined);
+    assert.equal(options?.env?.THREADFERRY_WECOM_BOT_SECRET, undefined);
     return {
       stdout: `${JSON.stringify({ type: "thread.started", thread_id: "session-1" })}\n${JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: "只读分析结果" } })}\n`,
       stderr: "",
@@ -71,21 +71,21 @@ test("mock WeCom -> history -> context -> Codex -> reply vertical slice", async 
     senderId: "user_allowed",
     senderName: "用户",
     time: currentTime,
-    text: "@Warden 帮忙分析",
+    text: "@ThreadFerry 帮忙分析",
     mentioned: true,
   };
 
   assert.equal(await app.handle(message, reply), "handled");
   assert.equal(runtimeCalls, 1);
   assert.deepEqual(replies, [
-    { content: "Warden 已收到，正在分析。", finish: false },
+    { content: "ThreadFerry 已收到，正在分析。", finish: false },
     { content: "只读分析结果", finish: true },
   ]);
-  for (const expected of ["张三", "这个接口有问题", "李四", "可能是 Redis", "王五", "线上出现三次", "@Warden 帮忙分析"]) {
+  for (const expected of ["张三", "这个接口有问题", "李四", "可能是 Redis", "王五", "线上出现三次", "@ThreadFerry 帮忙分析"]) {
     assert.match(receivedPrompt, new RegExp(expected));
   }
 
-  assert.equal(await app.handle({ ...message, msgId: "msg-5", time: new Date(currentTime.getTime() + 60_000), text: "@Warden 继续分析" }, reply), "handled");
+  assert.equal(await app.handle({ ...message, msgId: "msg-5", time: new Date(currentTime.getTime() + 60_000), text: "@ThreadFerry 继续分析" }, reply), "handled");
   assert.deepEqual(runtimeArgs[1]?.slice(-3), ["resume", "session-1", "-"]);
   assert.equal(await app.handle(message, reply), "duplicate");
   assert.equal(await app.handle({ ...message, msgId: "bad-group", groupId: "group_other" }, reply), "unauthorized_group");
@@ -145,54 +145,54 @@ test("robot owner manages per-group users in direct chat", async () => {
     mentioned: true,
   }, async (content) => { replies.push(content); });
 
-  assert.equal(await direct("new-user", "warden groups"), "command");
+  assert.equal(await direct("new-user", "threadferry groups"), "command");
   assert.match(replies.at(-1) ?? "", /只有.*Owner/);
-  assert.equal(await direct("new-user", "warden use AI Coding reviewer"), "command");
+  assert.equal(await direct("new-user", "threadferry use AI Coding reviewer"), "command");
   assert.equal(persistedAgents.length, 0);
-  assert.equal(await direct("owner", "warden groups"), "command");
+  assert.equal(await direct("owner", "threadferry groups"), "command");
   assert.match(replies.at(-1) ?? "", /AI Coding/);
   assert.match(replies.at(-1) ?? "", /\[default\].*\[未配置 Agent\]/s);
-  assert.equal(await direct("owner", "warden agents"), "command");
+  assert.equal(await direct("owner", "threadferry agents"), "command");
   assert.match(replies.at(-1) ?? "", /reviewer.*pi.*provider\/reviewer/s);
   assert.equal(await group("owner", "@机器人 先用默认 Agent 分析"), "handled");
   assert.equal(runtimeAgents[0], "default:codex:/workspace");
-  assert.equal(await direct("owner", "warden use AI Coding reviewer"), "command");
+  assert.equal(await direct("owner", "threadferry use AI Coding reviewer"), "command");
   assert.deepEqual(persistedAgents, [{ groupId: "group", agentId: "reviewer" }]);
-  assert.equal(await direct("owner", "warden invite AI Coding"), "command");
+  assert.equal(await direct("owner", "threadferry invite AI Coding"), "command");
   const code = replies.at(-1)?.match(/邀请码：`([A-F0-9]{12})`/)?.[1];
   assert.ok(code);
-  assert.equal(await group("new-user", `@机器人 warden join ${code}`), "command");
+  assert.equal(await group("new-user", `@机器人 threadferry join ${code}`), "command");
   assert.deepEqual(persisted, [{ groupId: "group", users: ["owner", "new-user"] }]);
 
   assert.equal(await group("new-user", "@机器人 分析"), "handled");
   assert.equal(runtimeCalls, 2);
   assert.equal(runtimeAgents[1], "reviewer:pi:/review-workspace");
   assert.deepEqual(runtimeSessions.slice(0, 2), [undefined, undefined]);
-  assert.equal(await direct("owner", "warden users AI Coding"), "command");
+  assert.equal(await direct("owner", "threadferry users AI Coding"), "command");
   assert.match(replies.at(-1) ?? "", /新用户/);
-  assert.equal(await direct("owner", "warden add AI Coding 李四"), "command");
+  assert.equal(await direct("owner", "threadferry add AI Coding 李四"), "command");
   assert.deepEqual(persisted.at(-1), { groupId: "group", users: ["owner", "new-user", "lisi"] });
   assert.match(replies.at(-1) ?? "", /授权 李四/);
   assert.equal(await group("lisi-callback", "@机器人 分析李四的问题"), "handled");
   assert.equal(runtimeCalls, 3);
   assert.equal(runtimeSessions[2], "reviewer-session");
   const beforeAmbiguous = persisted.length;
-  assert.equal(await direct("owner", "warden add AI Coding 张三"), "command");
+  assert.equal(await direct("owner", "threadferry add AI Coding 张三"), "command");
   assert.equal(persisted.length, beforeAmbiguous);
   assert.match(replies.at(-1) ?? "", /多个.*id:zhangsan-1.*id:zhangsan-2/s);
-  assert.equal(await direct("owner", "warden add AI Coding id:zhangsan-2"), "command");
+  assert.equal(await direct("owner", "threadferry add AI Coding id:zhangsan-2"), "command");
   assert.deepEqual(persisted.at(-1), { groupId: "group", users: ["owner", "new-user", "lisi", "zhangsan-2"] });
-  assert.equal(await direct("owner", "warden remove AI Coding 新用户"), "command");
+  assert.equal(await direct("owner", "threadferry remove AI Coding 新用户"), "command");
   assert.deepEqual(persisted.at(-1), { groupId: "group", users: ["owner", "lisi", "zhangsan-2"] });
   assert.equal(await group("new-user", "@机器人 再分析"), "unauthorized_user");
-  assert.equal(await group("owner", "@机器人 warden users group"), "command");
+  assert.equal(await group("owner", "@机器人 threadferry users group"), "command");
   assert.match(replies.at(-1) ?? "", /请私聊/);
-  assert.equal(await direct("new-user", "warden whoami"), "command");
+  assert.equal(await direct("new-user", "threadferry whoami"), "command");
   assert.match(replies.at(-1) ?? "", /new-user/);
-  assert.equal(await direct("owner", "warden remove AI Coding 创建者"), "command");
+  assert.equal(await direct("owner", "threadferry remove AI Coding 创建者"), "command");
   assert.match(replies.at(-1) ?? "", /不能移除/);
-  assert.equal(await direct("owner", "warden groups", "duplicate-direct"), "command");
-  assert.equal(await direct("owner", "warden groups", "duplicate-direct"), "duplicate");
+  assert.equal(await direct("owner", "threadferry groups", "duplicate-direct"), "command");
+  assert.equal(await direct("owner", "threadferry groups", "duplicate-direct"), "duplicate");
   assert.equal(runtimeCalls, 3);
 });
 
@@ -234,7 +234,7 @@ test("wecom contact search uses names without shell interpolation", async () => 
 });
 
 test("workspace paths cannot be relative or escape through a symlink", async (t) => {
-  const root = await mkdtemp(join(tmpdir(), "warden-path-test-"));
+  const root = await mkdtemp(join(tmpdir(), "threadferry-path-test-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   const link = `${root}-link`;
   t.after(() => rm(link, { force: true }));
@@ -269,7 +269,7 @@ test("workspace paths cannot be relative or escape through a symlink", async (t)
 });
 
 test("legacy and extra configuration fields are rejected", async (t) => {
-  const root = await mkdtemp(join(tmpdir(), "warden-config-test-"));
+  const root = await mkdtemp(join(tmpdir(), "threadferry-config-test-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   const legacyPath = join(root, "legacy.yaml");
   await writeFile(legacyPath, "version: 1\nchannels: {}\n");
@@ -290,12 +290,12 @@ test("a newer group message makes the completed analysis stale", async () => {
   });
   const replies: Array<{ content: string; finish: boolean }> = [];
   const status = await app.handle({
-    msgId: "freshness", groupId: "group", senderId: "user", time: now, text: "@Warden 分析", mentioned: true,
+    msgId: "freshness", groupId: "group", senderId: "user", time: now, text: "@ThreadFerry 分析", mentioned: true,
   }, async (content, finish = true) => { replies.push({ content, finish }); });
 
   assert.equal(status, "stale");
   assert.deepEqual(replies, [
-    { content: "Warden 已收到，正在分析。", finish: false },
+    { content: "ThreadFerry 已收到，正在分析。", finish: false },
     { content: "分析期间群里出现了新消息。为避免发送过期结论，请重新 @机器人。", finish: true },
   ]);
 });
@@ -319,7 +319,7 @@ test("same-group turns run serially and queued users get immediate feedback", as
     },
   });
   const message = (msgId: string): IncomingMention => ({
-    msgId, groupId: "group", senderId: "user", time: new Date(), text: "@Warden 分析", mentioned: true,
+    msgId, groupId: "group", senderId: "user", time: new Date(), text: "@ThreadFerry 分析", mentioned: true,
   });
   const firstReplies: string[] = [];
   const secondReplies: string[] = [];
@@ -329,7 +329,7 @@ test("same-group turns run serially and queued users get immediate feedback", as
   await new Promise<void>((resolve) => setImmediate(resolve));
 
   assert.equal(calls, 1);
-  assert.equal(secondReplies[0], "Warden 已收到，当前群有任务处理中，已排队。");
+  assert.equal(secondReplies[0], "ThreadFerry 已收到，当前群有任务处理中，已排队。");
   releaseFirst();
   assert.deepEqual(await Promise.all([first, second]), ["handled", "handled"]);
   assert.equal(maxActive, 1);
@@ -339,7 +339,7 @@ test("same-group turns run serially and queued users get immediate feedback", as
 
 test("runtime failures return and persist a redacted error id", async () => {
   const config = testConfig();
-  const state = new WardenState();
+  const state = new ThreadFerryState();
   const errors: Array<{ errorId: string; phase: string }> = [];
   const app = createApp(config, {
     history: async () => [],
@@ -348,11 +348,11 @@ test("runtime failures return and persist a redacted error id", async () => {
   }, state);
   const replies: string[] = [];
   const result = await app.handle({
-    msgId: "failure", groupId: "group", senderId: "user", time: new Date(), text: "@Warden 分析", mentioned: true,
+    msgId: "failure", groupId: "group", senderId: "user", time: new Date(), text: "@ThreadFerry 分析", mentioned: true,
   }, async (content) => { replies.push(content); });
 
   assert.equal(result, "failed");
-  assert.match(replies.at(-1) ?? "", /错误编号 W-[A-F0-9]{8}/);
+  assert.match(replies.at(-1) ?? "", /错误编号 TF-[A-F0-9]{8}/);
   assert.doesNotMatch(replies.join("\n"), /secret detail/);
   assert.equal(errors[0]?.phase, "runtime");
   assert.equal((await state.snapshot()).turns[0]?.errorId, errors[0]?.errorId);
@@ -398,23 +398,23 @@ test("same-second history changes are detected by fingerprint", async () => {
     runtime: async () => ({ text: "已经过期的分析" }),
   });
   const status = await app.handle({
-    msgId: "same-second", groupId: "group", senderId: "user", time: now, text: "@Warden 分析", mentioned: true,
+    msgId: "same-second", groupId: "group", senderId: "user", time: now, text: "@ThreadFerry 分析", mentioned: true,
   }, async () => undefined);
   assert.equal(status, "stale");
 });
 
 test("an interrupted inbox is replayed after restart and final content is removed", async (t) => {
-  const root = await mkdtemp(join(tmpdir(), "warden-replay-test-"));
+  const root = await mkdtemp(join(tmpdir(), "threadferry-replay-test-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   const statePath = join(root, "state-v3.json");
-  const state = new WardenState(statePath);
+  const state = new ThreadFerryState(statePath);
   const message: IncomingMention = {
-    msgId: "replay-1", groupId: "group", senderId: "user", time: new Date(), text: "@Warden 恢复", mentioned: true,
+    msgId: "replay-1", groupId: "group", senderId: "user", time: new Date(), text: "@ThreadFerry 恢复", mentioned: true,
   };
   await state.enqueue(message);
   await state.markRunning(message.msgId);
 
-  const restarted = new WardenState(statePath);
+  const restarted = new ThreadFerryState(statePath);
   const [pending] = await restarted.recoverPending();
   assert.ok(pending);
   const config = testConfig();
@@ -428,15 +428,15 @@ test("an interrupted inbox is replayed after restart and final content is remove
   const snapshot = await restarted.snapshot();
   assert.equal(snapshot.inbox.length, 0);
   assert.equal(snapshot.outbox.length, 0);
-  assert.doesNotMatch(JSON.stringify(snapshot), /恢复后的结果|@Warden/);
+  assert.doesNotMatch(JSON.stringify(snapshot), /恢复后的结果|@ThreadFerry/);
 });
 
 test("a failed callback delivery remains in the durable outbox", async () => {
   const config = testConfig();
-  const state = new WardenState();
+  const state = new ThreadFerryState();
   const app = createApp(config, { history: async () => [], runtime: async () => ({ text: "待补发结果" }) }, state);
   const result = await app.handle({
-    msgId: "delivery-1", groupId: "group", senderId: "user", time: new Date(), text: "@Warden 分析", mentioned: true,
+    msgId: "delivery-1", groupId: "group", senderId: "user", time: new Date(), text: "@ThreadFerry 分析", mentioned: true,
   }, async (_content, finish = true) => {
     if (finish) throw new Error("connection closed");
   });
@@ -463,7 +463,7 @@ test("active WeCom reply uses message.aibot.send with a JSON argument", async ()
 });
 
 test("Codex starts a fresh session only when a saved session is definitely missing", async (t) => {
-  const root = await mkdtemp(join(tmpdir(), "warden-codex-resume-test-"));
+  const root = await mkdtemp(join(tmpdir(), "threadferry-codex-resume-test-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   const workspace = await realpath(root);
   const calls: string[][] = [];
@@ -484,12 +484,12 @@ test("Codex starts a fresh session only when a saved session is definitely missi
 });
 
 test("Pi uses only guarded read tools and parses its machine-readable result", async (t) => {
-  const root = await mkdtemp(join(tmpdir(), "warden-pi-test-"));
+  const root = await mkdtemp(join(tmpdir(), "threadferry-pi-test-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   const workspace = await realpath(root);
   let received: { command: string; args: string[]; cwd?: string; input?: string; secret?: string } | undefined;
   const runner: CommandRunner = async (command, args, options) => {
-    received = { command, args, cwd: options?.cwd, input: options?.input, secret: options?.env?.WARDEN_WECOM_BOT_SECRET };
+    received = { command, args, cwd: options?.cwd, input: options?.input, secret: options?.env?.THREADFERRY_WECOM_BOT_SECRET };
     return {
       stdout: `${JSON.stringify({ type: "session", id: "pi-session" })}\n${JSON.stringify({
         type: "message_end",
@@ -512,8 +512,8 @@ test("Pi uses only guarded read tools and parses its machine-readable result", a
 });
 
 test("Pi read guard rejects workspace escapes, symlinks, and sensitive files", async (t) => {
-  const root = await mkdtemp(join(tmpdir(), "warden-pi-guard-"));
-  const outside = await mkdtemp(join(tmpdir(), "warden-pi-outside-"));
+  const root = await mkdtemp(join(tmpdir(), "threadferry-pi-guard-"));
+  const outside = await mkdtemp(join(tmpdir(), "threadferry-pi-outside-"));
   t.after(() => Promise.all([rm(root, { recursive: true, force: true }), rm(outside, { recursive: true, force: true })]));
   await writeFile(join(root, "source.ts"), "export {};\n");
   await writeFile(join(root, ".env"), "SECRET=hidden\n");
@@ -541,7 +541,7 @@ test("running Codex work can be cancelled during shutdown", async () => {
     }),
   });
   const result = app.handle({
-    msgId: "cancel-1", groupId: "group", senderId: "user", time: new Date(), text: "@Warden 分析", mentioned: true,
+    msgId: "cancel-1", groupId: "group", senderId: "user", time: new Date(), text: "@ThreadFerry 分析", mentioned: true,
   }, async () => undefined);
   await running;
   await app.shutdown();

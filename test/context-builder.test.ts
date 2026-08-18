@@ -10,7 +10,7 @@ test("context contains recent history as untrusted data and preserves the curren
     senderId: "user-4",
     senderName: "用户",
     time: new Date("2026-08-18T10:05:00+08:00"),
-    text: "@Warden 帮忙分析（原文）",
+    text: "@ThreadFerry 帮忙分析（原文）",
     mentioned: true,
   };
   const history: GroupMessage[] = [
@@ -32,7 +32,7 @@ test("context contains recent history as untrusted data and preserves the curren
   }
   assert.match(prompt, /不可信背景数据/);
   assert.match(prompt, /CURRENT_USER_INSTRUCTION/);
-  assert.match(prompt, /@Warden 帮忙分析（原文）/);
+  assert.match(prompt, /@ThreadFerry 帮忙分析（原文）/);
   assert.match(prompt, /trace\.log/);
 });
 

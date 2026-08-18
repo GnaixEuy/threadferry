@@ -3,9 +3,9 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import type { AddressInfo } from "node:net";
 import { addAgent, resolveWorkspace } from "./config.js";
 import { resolveDirectoryUser } from "./directory.js";
-import type { DirectoryUser, RuntimeName, WardenConfig } from "./types.js";
+import type { DirectoryUser, RuntimeName, ThreadFerryConfig } from "./types.js";
 
-export type ConfigUpdater = (change: (latest: WardenConfig) => void | Promise<void>) => Promise<void>;
+export type ConfigUpdater = (change: (latest: ThreadFerryConfig) => void | Promise<void>) => Promise<void>;
 
 export interface AdminDependencies {
   updateConfig: ConfigUpdater;
@@ -70,11 +70,11 @@ function required(input: URLSearchParams, name: string): string {
   return value;
 }
 
-function agentOptions(config: WardenConfig, selected?: string): string {
+function agentOptions(config: ThreadFerryConfig, selected?: string): string {
   return Object.keys(config.agents).map((id) => `<option value="${html(id)}"${id === selected ? " selected" : ""}>${html(id)}</option>`).join("");
 }
 
-async function page(config: WardenConfig, dependencies: AdminDependencies, token: string, url: URL): Promise<string> {
+async function page(config: ThreadFerryConfig, dependencies: AdminDependencies, token: string, url: URL): Promise<string> {
   let sessions: Array<{ id: string; name?: string }> = [];
   try {
     sessions = await dependencies.listGroups();
@@ -130,9 +130,9 @@ async function page(config: WardenConfig, dependencies: AdminDependencies, token
   const notice = url.searchParams.get("ok");
   const error = url.searchParams.get("error");
   return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>Warden 管理台</title><style>
+  <title>ThreadFerry 管理台</title><style>
   :root{color-scheme:dark;font:15px/1.5 ui-sans-serif,system-ui,-apple-system;color:#e7e9ee;background:#0c0e13}*{box-sizing:border-box}body{margin:0}main{width:min(1080px,calc(100% - 32px));margin:40px auto 80px}header{display:flex;justify-content:space-between;align-items:end;margin-bottom:28px}h1{font-size:34px;margin:0}h2{margin:34px 0 14px}h3,h4,p{margin:0 0 10px}.sub,.muted{color:#9ca3af}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:14px}.card{background:#151821;border:1px solid #272b36;border-radius:14px;padding:18px}.card.group{grid-column:span 1}.row{display:flex;justify-content:space-between;gap:16px;align-items:start}.badge,.owner{font-size:12px;border-radius:999px;padding:3px 9px;background:#2b3140}.badge.ok{color:#7ee787}.badge.warning{color:#f2cc60}.owner{color:#8cb4ff;margin-left:8px}code{font-family:ui-monospace,SFMono-Regular,Menlo;overflow-wrap:anywhere;color:#b8c2d9}form{display:flex;gap:8px;align-items:end;margin-top:14px;flex-wrap:wrap}label{color:#9ca3af}input,select,button{font:inherit;border-radius:9px;border:1px solid #343a49;background:#0f1218;color:#eef1f6;padding:9px 11px}input{min-width:190px;flex:1}button{cursor:pointer;background:#2f67d8;border-color:#3975eb;font-weight:650}button.danger{background:transparent;border-color:#7f3340;color:#ff9aa7;padding:4px 8px}ul{list-style:none;padding:0;margin:8px 0}li{display:flex;align-items:center;justify-content:space-between;border-top:1px solid #272b36;padding:9px 0}li form{margin:0}.notice{padding:11px 14px;border-radius:10px;margin:0 0 16px;background:#143321;color:#8de6a9}.notice.error{background:#3b171d;color:#ffabb4}.agent-form{display:grid;grid-template-columns:1fr 140px 1.6fr 1fr auto;align-items:end}.agent-form label{display:flex;flex-direction:column;gap:5px}.agent-form input{min-width:0;width:100%}@media(max-width:760px){header{align-items:start;flex-direction:column}.agent-form{display:flex}.card.group{grid-column:auto}}
-  </style></head><body><main><header><div><h1>Warden</h1><div class="sub">本机管理台 · 仅监听 127.0.0.1</div></div><code>Owner: ${html(config.ownerUser)}</code></header>
+  </style></head><body><main><header><div><h1>ThreadFerry</h1><div class="sub">本机管理台 · 仅监听 127.0.0.1</div></div><code>Owner: ${html(config.ownerUser)}</code></header>
   ${notice ? `<div class="notice">${html(notice)}</div>` : ""}${error ? `<div class="notice error">${html(error)}</div>` : ""}
   <h2>Agents</h2><div class="grid">${agents}</div>
   <article class="card"><h3>添加 Agent</h3><form class="agent-form" method="post" action="/agents/add">${field}
@@ -145,7 +145,7 @@ async function page(config: WardenConfig, dependencies: AdminDependencies, token
 }
 
 export async function startAdminServer(
-  config: WardenConfig,
+  config: ThreadFerryConfig,
   dependencies: AdminDependencies,
   port = 17_638,
 ): Promise<{ url: string; close: () => Promise<void> }> {
@@ -157,7 +157,7 @@ export async function startAdminServer(
       try {
         return send(response, 200, await page(config, dependencies, token, url));
       } catch {
-        return send(response, 500, "Warden 管理台暂时无法读取配置");
+        return send(response, 500, "ThreadFerry 管理台暂时无法读取配置");
       }
     }
     if (request.method !== "POST") return send(response, 404, "Not found");
@@ -212,7 +212,7 @@ export async function startAdminServer(
         await dependencies.updateConfig((latest) => {
           const group = latest.groups[groupId];
           if (!group) throw new Error("群不存在");
-          if (userId === latest.ownerUser) throw new Error("不能移除 Warden Owner");
+          if (userId === latest.ownerUser) throw new Error("不能移除 ThreadFerry Owner");
           group.allowUsers = group.allowUsers.filter((id) => id !== userId);
         });
       } else {

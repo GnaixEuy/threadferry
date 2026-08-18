@@ -28,14 +28,14 @@ export async function runCodex(
   runner: CommandRunner = runCommand,
 ): Promise<RuntimeResult> {
   const workspace = await resolveWorkspace(request.workspace);
-  const profile = "warden-read-only";
+  const profile = "threadferry-read-only";
   const filesystemPolicy = `{":minimal"="read",glob_scan_max_depth=8,":workspace_roots"={"."="read",".env"="deny",".env.*"="deny","**/.env"="deny","**/.env.*"="deny",".npmrc"="deny","**/.npmrc"="deny",".git-credentials"="deny","**/.git-credentials"="deny","*.pem"="deny","**/*.pem"="deny","*.key"="deny","**/*.key"="deny","*.p12"="deny","**/*.p12"="deny","id_rsa*"="deny","**/id_rsa*"="deny","id_ed25519*"="deny","**/id_ed25519*"="deny"}}`;
   const baseArgs = [
     "-a", "never",
     "-C", workspace,
     "--strict-config",
     "-c", `default_permissions=${JSON.stringify(profile)}`,
-    "-c", `permissions.${profile}.description="Warden workspace-only read access"`,
+    "-c", `permissions.${profile}.description="ThreadFerry workspace-only read access"`,
     "-c", `permissions.${profile}.filesystem=${filesystemPolicy}`,
     "-c", `permissions.${profile}.network.enabled=false`,
     "-c", `projects.${JSON.stringify(workspace)}.trust_level="untrusted"`,

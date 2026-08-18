@@ -1,8 +1,8 @@
-# Warden
+# ThreadFerry
 
-Warden 让企业微信群可以调用本机 Codex 或 Pi 做只读分析。一个 Warden 可以配置多个 Agent，每个 Agent 独立选择 Runtime、模型和 Workspace，再按群绑定。
+ThreadFerry 让企业微信群可以调用本机 Codex 或 Pi 做只读分析。一个 ThreadFerry 可以配置多个 Agent，每个 Agent 独立选择 Runtime、模型和 Workspace，再按群绑定。
 
-群里有人讨论问题时，不需要复制聊天记录。最后一个人 `@机器人` 提问，Warden 会补齐最近的群消息，交给该群绑定的 Agent 分析，再把结果发回原群。
+群里有人讨论问题时，不需要复制聊天记录。最后一个人 `@机器人` 提问，ThreadFerry 会补齐最近的群消息，交给该群绑定的 Agent 分析，再把结果发回原群。
 
 ```text
 10:00 张三：这个接口有问题
@@ -16,12 +16,12 @@ Warden 让企业微信群可以调用本机 Codex 或 Pi 做只读分析。一�
 ## 它怎么工作
 
 1. 企业微信智能机器人通过 WebSocket 收到群内 `@机器人` 消息。
-2. Warden 使用官方 `wecom-cli` 拉取该群最近六小时的消息，最多 80 条。
+2. ThreadFerry 使用官方 `wecom-cli` 拉取该群最近六小时的消息，最多 80 条。
 3. 群历史、引用和附件元数据被标记为不可信背景，只有当前 `@机器人` 的消息是用户指令。
 4. 当前群绑定的 Agent 在自己的 Workspace 中完成只读分析。
-5. Warden 把结果回复到原群。
+5. ThreadFerry 把结果回复到原群。
 
-普通群消息不会实时回调给机器人。Warden 在收到 `@机器人` 后才补拉前文。
+普通群消息不会实时回调给机器人。ThreadFerry 在收到 `@机器人` 后才补拉前文。
 
 ## 环境要求
 
@@ -43,10 +43,10 @@ codex login
 ## 一行安装
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/GnaixEuy/warden/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/GnaixEuy/threadferry/main/install.sh | bash
 ```
 
-脚本会检查 Node.js、安装 `warden` 命令，并在终端可交互时打开配置向导。它不会使用 `sudo`，也不会代替你安装或登录企业微信、Codex、Pi。
+脚本会检查 Node.js、安装 `threadferry` 命令，并在终端可交互时打开配置向导。它不会使用 `sudo`，也不会代替你安装或登录企业微信、Codex、Pi。
 
 从源码目录安装时直接运行：
 
@@ -66,7 +66,7 @@ curl -fsSL https://raw.githubusercontent.com/GnaixEuy/warden/main/install.sh | b
 安装脚本会自动进入向导，也可以随时手动运行：
 
 ```sh
-warden onboard
+threadferry onboard
 ```
 
 向导会依次完成：
@@ -74,32 +74,32 @@ warden onboard
 1. 选择 Agent 名、Codex/Pi Runtime、模型和绝对路径 Workspace。
 2. 安全读取 Bot ID 与 Bot Secret，并检查 `wecom-cli` 和 Runtime 是否就绪。
 3. 显示一次性群配对命令，等待机器人创建者在目标群发送。
-4. 运行 `warden doctor`，通过后询问是否立即启动。
+4. 运行 `threadferry doctor`，通过后询问是否立即启动。
 
-Bot Secret 输入时不会回显，只保留在当前 Warden 进程中，不写入 YAML、日志或状态文件。默认配置保存在 `~/.warden/warden.yaml`，权限为 `0600`；已有其他位置的配置继续使用 `--config <path>` 指定。非交互式启动仍必须通过环境变量传入凭据：
+Bot Secret 输入时不会回显，只保留在当前 ThreadFerry 进程中，不写入 YAML、日志或状态文件。默认配置保存在 `~/.threadferry/threadferry.yaml`，权限为 `0600`；已有其他位置的配置继续使用 `--config <path>` 指定。非交互式启动仍必须通过环境变量传入凭据：
 
 ```sh
-export WARDEN_WECOM_BOT_ID='<Bot ID>'
-export WARDEN_WECOM_BOT_SECRET='<Bot Secret>'
+export THREADFERRY_WECOM_BOT_ID='<Bot ID>'
+export THREADFERRY_WECOM_BOT_SECRET='<Bot Secret>'
 ```
 
-向导显示配对命令后，回到目标企业微信群，用企业微信的 `@` 选择器选中机器人并发送完整命令。不要手工输入字面量 `@Warden`；机器人叫什么，就选择什么。
+向导显示配对命令后，回到目标企业微信群，用企业微信的 `@` 选择器选中机器人并发送完整命令。不要手工输入字面量 `@ThreadFerry`；机器人叫什么，就选择什么。
 
-第一次配对应由机器人创建者完成。Warden 会把第一次配对者记录为 Owner，后续群绑定和用户管理都由这个 Owner 操作。
+第一次配对应由机器人创建者完成。ThreadFerry 会把第一次配对者记录为 Owner，后续群绑定和用户管理都由这个 Owner 操作。
 
 ## 启动和管理台
 
 向导没有立即启动时，运行：
 
 ```sh
-warden start
+threadferry start
 ```
 
 交互式启动缺少凭据时会安全提示输入。看到下面的日志后保持终端运行：
 
 ```text
-Warden 管理台: http://127.0.0.1:17638
-Warden 已启动，监听 1 个已配置企业微信群。
+ThreadFerry 管理台: http://127.0.0.1:17638
+ThreadFerry 已启动，监听 1 个已配置企业微信群。
 ```
 
 浏览器打开 [http://127.0.0.1:17638](http://127.0.0.1:17638) 即可使用本机管理台：
@@ -113,7 +113,7 @@ Warden 已启动，监听 1 个已配置企业微信群。
 修改会写回配置并立即生效，不需要重启。管理台只监听本机回环地址，不对局域网或公网开放。需要修改端口时：
 
 ```sh
-warden start --admin-port 18080
+threadferry start --admin-port 18080
 ```
 
 现在可以在群里提问：
@@ -122,7 +122,7 @@ warden start --admin-port 18080
 @叶翔（测试中） 帮忙分析刚才讨论的问题
 ```
 
-Warden 会先回复“正在分析”。同一个群已有任务时，新请求会排队。
+ThreadFerry 会先回复“正在分析”。同一个群已有任务时，新请求会排队。
 
 按 `Ctrl+C` 停止。
 
@@ -131,13 +131,13 @@ Warden 会先回复“正在分析”。同一个群已有任务时，新请求�
 首次配对会同时创建 `default` Agent。继续添加 Agent：
 
 ```sh
-warden agent add \
+threadferry agent add \
   --name reviewer \
   --runtime pi \
   --workspace /absolute/path/to/another-project \
   --model provider/model
 
-warden agent list
+threadferry agent list
 ```
 
 `--model` 可省略，省略时使用对应 CLI 的默认模型。Agent 名只能使用字母、数字、下划线和连字符。
@@ -147,7 +147,7 @@ warden agent list
 Owner 不需要手改 YAML。直接私聊机器人：
 
 ```text
-warden groups
+threadferry groups
 ```
 
 该命令会列出机器人最近所在的群，并显示每个群当前绑定的 Agent。
@@ -155,35 +155,35 @@ warden groups
 查看 Agent，并切换某个群：
 
 ```text
-warden agents
-warden use 月相工作室 reviewer
+threadferry agents
+threadferry use 月相工作室 reviewer
 ```
 
 切换从下一条 `@机器人` 消息生效；不同 Agent 的 Runtime Session 相互隔离。
 
-查看某个群当前可以使用 Warden 的成员：
+查看某个群当前可以使用 ThreadFerry 的成员：
 
 ```text
-warden users 月相工作室
+threadferry users 月相工作室
 ```
 
 按姓名添加或移除成员：
 
 ```text
-warden add 月相工作室 张三
-warden remove 月相工作室 张三
+threadferry add 月相工作室 张三
+threadferry remove 月相工作室 张三
 ```
 
-Warden 使用企业微信官方通讯录解析姓名和别名。只有唯一匹配时才会修改权限。同名成员会列出部门和候选 ID，例如：
+ThreadFerry 使用企业微信官方通讯录解析姓名和别名。只有唯一匹配时才会修改权限。同名成员会列出部门和候选 ID，例如：
 
 ```text
-warden add 月相工作室 id:zhangsan-2
+threadferry add 月相工作室 id:zhangsan-2
 ```
 
 群名可以包含空格：
 
 ```text
-warden add AI Coding 张三
+threadferry add AI Coding 张三
 ```
 
 同名群需要改用群 ID。
@@ -193,28 +193,28 @@ warden add AI Coding 张三
 Owner 也可以生成一次性邀请码：
 
 ```text
-warden invite 月相工作室
+threadferry invite 月相工作室
 ```
 
 目标用户在十分钟内私聊机器人：
 
 ```text
-warden join <邀请码>
+threadferry join <邀请码>
 ```
 
 也可以在对应群发送：
 
 ```text
-@机器人 warden join <邀请码>
+@机器人 threadferry join <邀请码>
 ```
 
-邀请码只能使用一次。任何用户都可以私聊发送 `warden whoami` 查看自己的回调 userid。
+邀请码只能使用一次。任何用户都可以私聊发送 `threadferry whoami` 查看自己的回调 userid。
 
 群内不接受 `users`、`invite`、`add` 或 `remove`。管理命令只能在 Owner 与机器人的私聊中执行。
 
 ## 配置文件
 
-默认配置位于 `~/.warden/warden.yaml`，通常由 `warden onboard`、管理台和私聊管理命令维护：
+默认配置位于 `~/.threadferry/threadferry.yaml`，通常由 `threadferry onboard`、管理台和私聊管理命令维护：
 
 ```yaml
 version: 5
@@ -248,22 +248,22 @@ groups:
 
 ```sh
 # 检查依赖和授权
-warden doctor
+threadferry doctor
 
 # 启动服务
-warden start --admin-port 17638
+threadferry start --admin-port 17638
 
 # 查看执行状态和最近失败
-warden status
+threadferry status
 
 # 清除某个群保存的所有 Runtime Session
-warden session reset --group '<群 ID>'
+threadferry session reset --group '<群 ID>'
 
 # 运行不依赖企业微信和真实 Runtime 的 Mock 链路
-warden start --mock
+threadferry start --mock
 ```
 
-Warden 异常退出后，使用同一份配置重新启动即可。未完成任务和待发送回复会从本地状态中恢复。不要同时运行两个 `warden start` 进程。
+ThreadFerry 异常退出后，使用同一份配置重新启动即可。未完成任务和待发送回复会从本地状态中恢复。不要同时运行两个 `threadferry start` 进程。
 
 ## 常见问题
 
@@ -272,20 +272,20 @@ Warden 异常退出后，使用同一份配置重新启动即可。未完成任�
 当前成员还没有该群的使用权限。让 Owner 私聊机器人添加姓名：
 
 ```text
-warden add <群名> <姓名>
+threadferry add <群名> <姓名>
 ```
 
 ### `unauthorized_group`
 
-机器人所在群还没有绑定 Agent。为该群重新运行 `warden setup`，并发送新的配对命令。
+机器人所在群还没有绑定 Agent。为该群重新运行 `threadferry setup`，并发送新的配对命令。
 
-### 机器人回复“Warden 处理失败”
+### 机器人回复“ThreadFerry 处理失败”
 
 先查看状态和环境：
 
 ```sh
-warden status
-warden doctor
+threadferry status
+threadferry doctor
 ```
 
 如果 `wecom-cli` 登录失效：
@@ -295,7 +295,7 @@ wecom-cli auth init
 wecom-cli identity whoami --json '{}'
 ```
 
-然后重启 Warden。
+然后重启 ThreadFerry。
 
 ### 终端出现 `quote>`
 
@@ -303,7 +303,7 @@ wecom-cli identity whoami --json '{}'
 
 ### 群已绑定其他 Agent
 
-Owner 私聊机器人发送 `warden use <群名> <Agent名>` 切换。新的本机 Agent 先用 `warden agent add` 添加。
+Owner 私聊机器人发送 `threadferry use <群名> <Agent名>` 切换。新的本机 Agent 先用 `threadferry agent add` 添加。
 
 ## 安全边界
 
@@ -316,7 +316,7 @@ Owner 私聊机器人发送 `warden use <群名> <Agent名>` 切换。新的本�
 - 管理台固定监听 `127.0.0.1`，校验 Host 和 CSRF；能够访问本机用户会话的人视为本机管理员。
 - 回复最多 12 KB。附件只读取元数据，不下载内容，也不做 OCR。
 
-本地运行状态保存在 `~/.warden/state-v3.json`，目录权限为 `0700`，文件权限为 `0600`。未完成请求和待发送回复会短暂保留，处理完成后删除正文，只留下哈希执行记录。
+本地运行状态保存在 `~/.threadferry/state-v3.json`，目录权限为 `0700`，文件权限为 `0600`。未完成请求和待发送回复会短暂保留，处理完成后删除正文，只留下哈希执行记录。
 
 ## 开发
 
@@ -328,4 +328,4 @@ npm run build
 
 Mock 和真实企业微信验收步骤见 [POC.md](./POC.md)。提交代码前请阅读 [CONTRIBUTING.md](./CONTRIBUTING.md)。
 
-Warden 的配对、Session 和消息新鲜度设计参考了 [Larkin](https://github.com/eddiearc/larkin)，没有复制其源代码。
+ThreadFerry 的配对、Session 和消息新鲜度设计参考了 [Larkin](https://github.com/eddiearc/larkin)，没有复制其源代码。

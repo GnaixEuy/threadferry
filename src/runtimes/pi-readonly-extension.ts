@@ -25,12 +25,12 @@ interface PiExtensionApi {
 export default function workspaceReadOnly(pi: PiExtensionApi): void {
   pi.on("tool_call", (event, context) => {
     if (event.toolName !== "read" && event.toolName !== "ls") {
-      return { block: true, reason: "Warden V0.1 仅允许只读工具", terminate: true };
+      return { block: true, reason: "ThreadFerry V0.1 仅允许只读工具", terminate: true };
     }
     const input = event.input as { path?: unknown };
     const path = input?.path ?? ".";
     if (typeof path !== "string" || !allowedReadPath(context.cwd, path)) {
-      return { block: true, reason: "Warden 禁止读取 Workspace 外或敏感文件", terminate: true };
+      return { block: true, reason: "ThreadFerry 禁止读取 Workspace 外或敏感文件", terminate: true };
     }
     return undefined;
   });

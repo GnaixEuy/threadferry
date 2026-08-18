@@ -1,10 +1,10 @@
 {
-  "name": "warden",
-  "version": "0.8.0",
-  "description": "Route authorized WeCom group mentions to read-only local coding agents.",
+  "name": "threadferry",
+  "version": "0.9.0",
+  "description": "Safely ferry enterprise chat context to read-only local AI agents.",
   "type": "module",
   "bin": {
-    "warden": "dist/src/cli.js"
+    "threadferry": "dist/src/cli.js"
   },
   "files": [
     "dist/src",
@@ -12,7 +12,7 @@
     "POC.md",
     "LICENSE",
     "install.sh",
-    "warden.example.yaml"
+    "threadferry.example.yaml"
   ],
   "engines": {
     "node": ">=22"

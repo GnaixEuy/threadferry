@@ -5,13 +5,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { startAdminServer } from "../src/admin.js";
-import type { WardenConfig } from "../src/types.js";
+import type { ThreadFerryConfig } from "../src/types.js";
 
 test("localhost admin manages agents, groups, and users with CSRF protection", async (t) => {
-  const root = await mkdtemp(join(tmpdir(), "warden-admin-"));
+  const root = await mkdtemp(join(tmpdir(), "threadferry-admin-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   const workspace = await realpath(root);
-  const config: WardenConfig = {
+  const config: ThreadFerryConfig = {
     version: 5,
     ownerUser: "owner",
     agents: { default: { runtime: "codex", workspace } },
@@ -31,7 +31,7 @@ test("localhost admin manages agents, groups, and users with CSRF protection", a
   const page = await first.text();
   assert.equal(first.status, 200);
   assert.match(first.headers.get("content-security-policy") ?? "", /default-src 'none'/);
-  assert.match(page, /Warden 管理台.*AI Coding.*未绑定/s);
+  assert.match(page, /ThreadFerry 管理台.*AI Coding.*未绑定/s);
   const hostileStatus = await new Promise<number | undefined>((resolve, reject) => {
     const target = new URL(admin.url);
     const request = httpRequest({ hostname: target.hostname, port: target.port, headers: { host: "evil.example" } }, (response) => resolve(response.statusCode));

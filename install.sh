@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPOSITORY="git+https://github.com/GnaixEuy/warden.git"
+REPOSITORY="git+https://github.com/GnaixEuy/threadferry.git"
 NO_ONBOARD=0
 DRY_RUN=0
 
 usage() {
   cat <<'EOF'
-Warden installer
+ThreadFerry installer
 
 Usage:
   bash install.sh [--no-onboard] [--dry-run]
@@ -34,13 +34,13 @@ for argument in "$@"; do
     --no-onboard) NO_ONBOARD=1 ;;
     --dry-run) DRY_RUN=1 ;;
     -h|--help) usage; exit 0 ;;
-    *) printf 'Warden installer: unknown option: %s\n' "$argument" >&2; usage >&2; exit 2 ;;
+    *) printf 'ThreadFerry installer: unknown option: %s\n' "$argument" >&2; usage >&2; exit 2 ;;
   esac
 done
 
 case "$(uname -s)" in
   Darwin|Linux) ;;
-  *) printf 'Warden currently supports macOS and Linux.\n' >&2; exit 1 ;;
+  *) printf 'ThreadFerry currently supports macOS and Linux.\n' >&2; exit 1 ;;
 esac
 
 if ! command -v node >/dev/null 2>&1; then
@@ -57,7 +57,7 @@ if ! command -v npm >/dev/null 2>&1; then
 fi
 
 SCRIPT_DIRECTORY="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd -P)"
-printf 'Installing Warden...\n'
+printf 'Installing ThreadFerry...\n'
 if [[ -f "$SCRIPT_DIRECTORY/package.json" && -f "$SCRIPT_DIRECTORY/src/cli.ts" ]]; then
   run npm ci --ignore-scripts --prefix "$SCRIPT_DIRECTORY"
   run npm run build --prefix "$SCRIPT_DIRECTORY"
@@ -71,22 +71,22 @@ else
 fi
 
 if [[ "$DRY_RUN" == "1" ]]; then
-  printf 'Dry run complete. Next: warden onboard\n'
+  printf 'Dry run complete. Next: threadferry onboard\n'
   exit 0
 fi
-if ! command -v warden >/dev/null 2>&1; then
-  printf 'Warden was installed, but its npm global bin directory is not in PATH.\n' >&2
-  printf 'Add the npm global bin directory to PATH, then run: warden onboard\n' >&2
+if ! command -v threadferry >/dev/null 2>&1; then
+  printf 'ThreadFerry was installed, but its npm global bin directory is not in PATH.\n' >&2
+  printf 'Add the npm global bin directory to PATH, then run: threadferry onboard\n' >&2
   exit 1
 fi
 
-printf 'Installed Warden %s.\n' "$(warden --version)"
+printf 'Installed ThreadFerry %s.\n' "$(threadferry --version)"
 if [[ "$NO_ONBOARD" == "1" ]]; then
-  printf 'Next: warden onboard\n'
+  printf 'Next: threadferry onboard\n'
 elif [[ -t 0 && -t 1 ]]; then
-  exec warden onboard
+  exec threadferry onboard
 elif [[ -t 1 && -r /dev/tty && -w /dev/tty ]]; then
-  exec warden onboard </dev/tty >/dev/tty 2>/dev/tty
+  exec threadferry onboard </dev/tty >/dev/tty 2>/dev/tty
 else
-  printf 'No interactive terminal detected. Next: warden onboard\n'
+  printf 'No interactive terminal detected. Next: threadferry onboard\n'
 fi

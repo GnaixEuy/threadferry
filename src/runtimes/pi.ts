@@ -29,7 +29,7 @@ function assistantText(message: unknown): string | undefined {
 export async function runPi(
   request: Omit<RuntimeRequest, "runtime">,
   runner: CommandRunner = runCommand,
-  sessionRootInput = join(homedir(), ".warden", "pi-sessions"),
+  sessionRootInput = join(homedir(), ".threadferry", "pi-sessions"),
 ): Promise<RuntimeResult> {
   const workspace = await resolveWorkspace(request.workspace);
   const sessionRoot = resolve(sessionRootInput);

@@ -1,6 +1,6 @@
 node_modules/
 dist/
 .env
-warden.yaml
+threadferry.yaml
 *.log
 tmp/

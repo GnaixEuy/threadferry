@@ -1,4 +1,4 @@
-# Contributing to Warden
+# Contributing to ThreadFerry
 
 ## Commit message
 
@@ -42,6 +42,6 @@
 - 一个提交只处理一个目的；功能、重构和无关格式化不要混在一起。
 - 提交前运行与变更相关的检查。代码变更至少运行 `npm run typecheck` 和 `npm test`。
 - 需要解释原因、风险或迁移方式时写 commit body；标题仍只写结果。
-- 不提交 `warden.yaml`、Secret、Token、`.env`、本地状态、日志、`dist`
+- 不提交 `threadferry.yaml`、Secret、Token、`.env`、本地状态、日志、`dist`
   或 `node_modules`。
 - 不兼容变更必须使用 `!`，并在 commit body 中说明迁移方式。

@@ -144,11 +144,11 @@ export function startWecomChannel(
   client.on("message.text", (frame) => {
     const event = standardize(frame);
     if (!event) return;
-    const streamId = generateReqId("warden");
+    const streamId = generateReqId("threadferry");
     const reply: Reply = (content, finish = true) => client.replyStream(frame, streamId, content, finish).then(() => undefined);
     void handle(event, reply).catch(async () => {
       try {
-        await reply("Warden 处理失败。请在运行 Warden 的机器上执行 `warden doctor` 检查依赖和授权。");
+        await reply("ThreadFerry 处理失败。请在运行 ThreadFerry 的机器上执行 `threadferry doctor` 检查依赖和授权。");
       } catch {
         // SDK 会负责连接错误与重连；不把凭据或原始帧写入日志。
       }

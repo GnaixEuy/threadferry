@@ -2,7 +2,7 @@ import { randomBytes } from "node:crypto";
 import { chmod, lstat, mkdir, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { parse, stringify } from "yaml";
-import type { AgentConfig, GroupConfig, RuntimeName, WardenConfig } from "./types.js";
+import type { AgentConfig, GroupConfig, RuntimeName, ThreadFerryConfig } from "./types.js";
 
 const USER_ID = /^[A-Za-z0-9_@.-]{1,512}$/;
 const AGENT_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
@@ -47,7 +47,7 @@ export function setupConfig(
   agentId: string,
   agent: AgentConfig,
   userId: string,
-  current?: WardenConfig,
+  current?: ThreadFerryConfig,
 ): string {
   if (!USER_ID.test(userId)) throw new Error("企业微信回调 userid 无效");
   validateAgent(agentId, agent);
@@ -55,11 +55,11 @@ export function setupConfig(
   if (existing && existing.agent !== agentId) {
     throw new Error("该群已绑定其他 Agent；请通过 Owner 私聊命令切换，不会自动改写");
   }
-  if (current && current.ownerUser !== userId) throw new Error("只有机器人 Warden Owner 可以新增群绑定");
+  if (current && current.ownerUser !== userId) throw new Error("只有机器人 ThreadFerry Owner 可以新增群绑定");
   const configuredAgent = current?.agents[agentId];
   if (configuredAgent && (configuredAgent.workspace !== agent.workspace
     || configuredAgent.runtime !== agent.runtime || configuredAgent.model !== agent.model)) {
-    throw new Error(`Agent ${agentId} 已存在且配置不同；请使用 warden agent add 新名称`);
+    throw new Error(`Agent ${agentId} 已存在且配置不同；请使用 threadferry agent add 新名称`);
   }
   const agents = { ...(current?.agents ?? {}), [agentId]: agent };
   const groups = Object.fromEntries(Object.entries(current?.groups ?? {}).map(([id, group]) => [id, {
@@ -73,7 +73,7 @@ export function setupConfig(
   return stringify({ version: 5, owner_user: current?.ownerUser ?? userId, agents, groups });
 }
 
-export function configText(config: WardenConfig): string {
+export function configText(config: ThreadFerryConfig): string {
   const agents = Object.fromEntries(Object.entries(config.agents).map(([id, agent]) => [id, {
     runtime: agent.runtime,
     workspace: agent.workspace,
@@ -86,22 +86,22 @@ export function configText(config: WardenConfig): string {
   return stringify({ version: 5, owner_user: config.ownerUser, agents, groups });
 }
 
-export function addAgent(config: WardenConfig, agentId: string, agent: AgentConfig): WardenConfig {
+export function addAgent(config: ThreadFerryConfig, agentId: string, agent: AgentConfig): ThreadFerryConfig {
   validateAgent(agentId, agent);
   if (config.agents[agentId]) throw new Error(`Agent ${agentId} 已存在`);
   return { ...config, agents: { ...config.agents, [agentId]: agent } };
 }
 
-export async function saveConfig(path: string, config: WardenConfig): Promise<void> {
+export async function saveConfig(path: string, config: ThreadFerryConfig): Promise<void> {
   const target = resolve(path);
   const directory = dirname(target);
   try {
-    if ((await lstat(target)).isSymbolicLink()) throw new Error("Warden 配置文件不能是符号链接");
+    if ((await lstat(target)).isSymbolicLink()) throw new Error("ThreadFerry 配置文件不能是符号链接");
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
   }
   try {
-    if ((await lstat(directory)).isSymbolicLink()) throw new Error("Warden 配置目录不能是符号链接");
+    if ((await lstat(directory)).isSymbolicLink()) throw new Error("ThreadFerry 配置目录不能是符号链接");
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
   }
@@ -116,7 +116,7 @@ export async function saveConfig(path: string, config: WardenConfig): Promise<vo
   }
 }
 
-export async function loadConfig(path: string): Promise<WardenConfig> {
+export async function loadConfig(path: string): Promise<ThreadFerryConfig> {
   let document: unknown;
   try {
     document = parse(await readFile(path, "utf8"));
@@ -125,7 +125,7 @@ export async function loadConfig(path: string): Promise<WardenConfig> {
   }
 
   const root = object(document, "配置");
-  if (root.version !== 5) throw new Error("配置 version 必须为 5；旧版配置不再兼容，请重新运行 warden setup");
+  if (root.version !== 5) throw new Error("配置 version 必须为 5；旧版配置不再兼容，请重新运行 threadferry setup");
   const unsupportedRootKeys = Object.keys(root).filter((key) => !["version", "owner_user", "agents", "groups"].includes(key));
   if (unsupportedRootKeys.length > 0) throw new Error(`配置包含不支持字段: ${unsupportedRootKeys.join(", ")}`);
   if (typeof root.owner_user !== "string" || !USER_ID.test(root.owner_user)) throw new Error("配置缺少有效的 owner_user");

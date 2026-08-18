@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { authorize } from "../src/authorization.js";
-import type { IncomingMention, WardenConfig } from "../src/types.js";
+import type { IncomingMention, ThreadFerryConfig } from "../src/types.js";
 
-const config: WardenConfig = {
+const config: ThreadFerryConfig = {
   version: 5,
   ownerUser: "user_allowed",
   agents: { default: { workspace: process.cwd(), runtime: "codex" } },
@@ -22,7 +22,7 @@ const message: IncomingMention = {
   groupId: "group_allowed",
   senderId: "user_allowed",
   time: new Date(),
-  text: "@Warden 分析",
+  text: "@ThreadFerry 分析",
   mentioned: true,
 };
 

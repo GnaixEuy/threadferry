@@ -59,7 +59,7 @@ export interface GroupConfig {
   };
 }
 
-export interface WardenConfig {
+export interface ThreadFerryConfig {
   version: 5;
   ownerUser: string;
   agents: Record<string, AgentConfig>;

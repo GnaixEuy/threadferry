@@ -14,25 +14,25 @@ import { fetchWecomHistory } from "./history/wecom-cli.js";
 import { runCommand } from "./process.js";
 import { runCodex } from "./runtimes/codex.js";
 import { runPi } from "./runtimes/pi.js";
-import { acquireHostLock, defaultStatePath, newErrorId, WardenState } from "./state.js";
-import type { GroupMessage, IncomingMention, RuntimeName, WardenConfig } from "./types.js";
+import { acquireHostLock, defaultStatePath, newErrorId, ThreadFerryState } from "./state.js";
+import type { GroupMessage, IncomingMention, RuntimeName, ThreadFerryConfig } from "./types.js";
 
-const VERSION = "0.8.0";
-const USAGE = `Warden ${VERSION}
+const VERSION = "0.9.0";
+const USAGE = `ThreadFerry ${VERSION}
 
 Usage:
-  warden onboard [--config <path>]
-  warden setup --workspace <absolute-path> [--agent <name>] [--runtime codex|pi] [--model <id>] [--config <path>]
-  warden agent add --name <name> --runtime codex|pi --workspace <absolute-path> [--model <id>] [--config <path>]
-  warden agent list [--config <path>]
-  warden doctor [--config <path>]
-  warden status [--config <path>]
-  warden session reset --group <group-id> [--config <path>]
-  warden start [--config <path>] [--admin-port <port>] [--mock]
+  threadferry onboard [--config <path>]
+  threadferry setup --workspace <absolute-path> [--agent <name>] [--runtime codex|pi] [--model <id>] [--config <path>]
+  threadferry agent add --name <name> --runtime codex|pi --workspace <absolute-path> [--model <id>] [--config <path>]
+  threadferry agent list [--config <path>]
+  threadferry doctor [--config <path>]
+  threadferry status [--config <path>]
+  threadferry session reset --group <group-id> [--config <path>]
+  threadferry start [--config <path>] [--admin-port <port>] [--mock]
 `;
 
 function defaultConfigPath(): string {
-  return join(homedir(), ".warden", "warden.yaml");
+  return join(homedir(), ".threadferry", "threadferry.yaml");
 }
 
 function option(args: string[], name: string): string | undefined {
@@ -101,11 +101,11 @@ async function hiddenQuestion(prompt: string): Promise<string> {
 }
 
 async function botCredentials(): Promise<{ botId: string; secret: string }> {
-  let botId = process.env.WARDEN_WECOM_BOT_ID;
-  let secret = process.env.WARDEN_WECOM_BOT_SECRET;
+  let botId = process.env.THREADFERRY_WECOM_BOT_ID;
+  let secret = process.env.THREADFERRY_WECOM_BOT_SECRET;
   if (botId && secret) return { botId, secret };
   if (!process.stdin.isTTY || !process.stdout.isTTY) {
-    throw new Error("缺少 WARDEN_WECOM_BOT_ID 或 WARDEN_WECOM_BOT_SECRET；交互式终端可安全输入，非交互启动必须设置环境变量");
+    throw new Error("缺少 THREADFERRY_WECOM_BOT_ID 或 THREADFERRY_WECOM_BOT_SECRET；交互式终端可安全输入，非交互启动必须设置环境变量");
   }
   console.log("机器人凭据仅用于当前进程，不写入配置或日志。");
   if (!botId) {
@@ -117,8 +117,8 @@ async function botCredentials(): Promise<{ botId: string; secret: string }> {
     }
   }
   if (!secret) secret = validateCredential(await hiddenQuestion("企业微信 Bot Secret: "), "Bot Secret");
-  process.env.WARDEN_WECOM_BOT_ID = botId;
-  process.env.WARDEN_WECOM_BOT_SECRET = secret;
+  process.env.THREADFERRY_WECOM_BOT_ID = botId;
+  process.env.THREADFERRY_WECOM_BOT_SECRET = secret;
   return { botId, secret };
 }
 
@@ -142,7 +142,7 @@ async function preflightDependencies(runtimes: Set<RuntimeName>): Promise<void> 
   } catch {
     throw new Error("找不到企业微信官方 wecom-cli 1.1.0+；请安装并加入 PATH");
   }
-  if (!atLeast(wecomVersion, [1, 1, 0])) throw new Error("Warden 要求 wecom-cli 1.1.0+");
+  if (!atLeast(wecomVersion, [1, 1, 0])) throw new Error("ThreadFerry 要求 wecom-cli 1.1.0+");
   try {
     await runCommand("wecom-cli", ["identity", "whoami", "--json", "{}"], { timeoutMs: 30_000 });
   } catch {
@@ -155,7 +155,7 @@ async function preflightDependencies(runtimes: Set<RuntimeName>): Promise<void> 
     } catch {
       throw new Error("找不到 Codex CLI 0.138.0+；请安装并运行 codex login");
     }
-    if (!atLeast(version, [0, 138, 0])) throw new Error("Warden 要求 codex-cli 0.138.0+");
+    if (!atLeast(version, [0, 138, 0])) throw new Error("ThreadFerry 要求 codex-cli 0.138.0+");
     try {
       await runCommand("codex", ["login", "status"], { timeoutMs: 10_000 });
     } catch {
@@ -169,11 +169,11 @@ async function preflightDependencies(runtimes: Set<RuntimeName>): Promise<void> 
     } catch {
       throw new Error("找不到 Pi CLI 0.84.2+；请安装 @earendil-works/pi-coding-agent 并完成模型授权");
     }
-    if (!atLeast(version, [0, 84, 2])) throw new Error("Warden 要求 pi 0.84.2+");
+    if (!atLeast(version, [0, 84, 2])) throw new Error("ThreadFerry 要求 pi 0.84.2+");
   }
 }
 
-async function preflightReal(config: WardenConfig): Promise<{ botId: string; secret: string }> {
+async function preflightReal(config: ThreadFerryConfig): Promise<{ botId: string; secret: string }> {
   const credentials = await botCredentials();
   await preflightDependencies(new Set(Object.values(config.agents).map((agent) => agent.runtime)));
   return credentials;
@@ -186,7 +186,7 @@ async function setup(configPath: string, workspaceInput: string, agentId: string
   const credentials = await botCredentials();
   await preflightDependencies(new Set([runtime]));
   const code = randomBytes(4).toString("hex");
-  console.log(`请在目标企业微信群发送：@机器人 warden setup ${code}`);
+  console.log(`请在目标企业微信群发送：@机器人 threadferry setup ${code}`);
   console.log("等待配对消息；配置不会保存机器人凭据。");
 
   await new Promise<void>((done, reject) => {
@@ -203,11 +203,11 @@ async function setup(configPath: string, workspaceInput: string, agentId: string
     };
     client = startWecomChannel(credentials, async (event, reply) => {
       if (event.chatType !== "group") {
-        await reply("Warden 群配对必须在目标企业微信群中完成。", true).catch(() => undefined);
+        await reply("ThreadFerry 群配对必须在目标企业微信群中完成。", true).catch(() => undefined);
         return;
       }
       const message = event.message;
-      if (!message.text.includes(`warden setup ${code}`)) {
+      if (!message.text.includes(`threadferry setup ${code}`)) {
         console.log("[setup] 收到群内 @，但配对码不匹配");
         return;
       }
@@ -223,7 +223,7 @@ async function setup(configPath: string, workspaceInput: string, agentId: string
         } finally {
           await rm(temporary, { force: true });
         }
-        await reply("Warden 配对完成。请在运行 Warden 的机器上执行 `warden doctor`。").catch(() => undefined);
+        await reply("ThreadFerry 配对完成。请在运行 ThreadFerry 的机器上执行 `threadferry doctor`。").catch(() => undefined);
         console.log(`配置已更新: ${target}`);
         finish();
       } catch (error) {
@@ -238,7 +238,7 @@ async function setup(configPath: string, workspaceInput: string, agentId: string
 
 async function onboard(configOption?: string): Promise<void> {
   if (!process.stdin.isTTY || !process.stdout.isTTY) {
-    throw new Error("warden onboard 需要交互式终端；无人值守环境请使用 setup/start 参数和环境变量");
+    throw new Error("threadferry onboard 需要交互式终端；无人值守环境请使用 setup/start 参数和环境变量");
   }
   const configPath = resolve(configOption ?? defaultConfigPath());
   const current = existsSync(configPath) ? await loadConfig(configPath) : undefined;
@@ -248,7 +248,7 @@ async function onboard(configOption?: string): Promise<void> {
   let runtime: RuntimeName;
   let workspace: string;
   let model: string | undefined;
-  console.log(`Warden 引导配置（配置文件: ${configPath}）`);
+  console.log(`ThreadFerry 引导配置（配置文件: ${configPath}）`);
   console.log("[1/4] 选择 Agent 和 Workspace");
   try {
     const ask = async (label: string, fallback: string) => {
@@ -268,10 +268,10 @@ async function onboard(configOption?: string): Promise<void> {
   await setup(configPath, workspace, agentId, runtime, model);
   console.log("[3/4] 运行环境诊断");
   if (!(await doctor(configPath))) {
-    throw new Error(`环境诊断未通过；修复后运行 warden doctor --config ${configPath}`);
+    throw new Error(`环境诊断未通过；修复后运行 threadferry doctor --config ${configPath}`);
   }
 
-  console.log("[4/4] 启动 Warden");
+  console.log("[4/4] 启动 ThreadFerry");
   const confirmation = createInterface({ input: process.stdin, output: process.stdout });
   let shouldStart: boolean;
   try {
@@ -281,7 +281,7 @@ async function onboard(configOption?: string): Promise<void> {
     confirmation.close();
   }
   if (shouldStart) await start(configPath, false, 17_638);
-  else console.log(`配置完成。稍后运行: warden start --config ${configPath}`);
+  else console.log(`配置完成。稍后运行: threadferry start --config ${configPath}`);
 }
 
 async function doctor(configPath?: string): Promise<boolean> {
@@ -293,7 +293,7 @@ async function doctor(configPath?: string): Promise<boolean> {
 
   const chosenConfig = resolve(configPath ?? defaultConfigPath());
   if (!existsSync(chosenConfig)) {
-    checks.push({ ok: false, message: `配置不存在: ${chosenConfig}；请先运行 warden onboard` });
+    checks.push({ ok: false, message: `配置不存在: ${chosenConfig}；请先运行 threadferry onboard` });
   } else {
     try {
       const loaded = await loadConfig(chosenConfig);
@@ -306,23 +306,23 @@ async function doctor(configPath?: string): Promise<boolean> {
   }
 
   try {
-    const snapshot = await new WardenState(defaultStatePath()).snapshot();
+    const snapshot = await new ThreadFerryState(defaultStatePath()).snapshot();
     checks.push({ ok: true, message: `本地状态存储有效（${snapshot.turns.length} 条执行记录，${snapshot.sessions.length} 个 Session）` });
   } catch {
-    checks.push({ ok: false, message: "本地状态存储无效；请检查 ~/.warden 的权限和 state-v3.json 格式" });
+    checks.push({ ok: false, message: "本地状态存储无效；请检查 ~/.threadferry 的权限和 state-v3.json 格式" });
   }
 
   checks.push({
-    ok: Boolean(process.env.WARDEN_WECOM_BOT_ID && process.env.WARDEN_WECOM_BOT_SECRET),
-    message: process.env.WARDEN_WECOM_BOT_ID && process.env.WARDEN_WECOM_BOT_SECRET
+    ok: Boolean(process.env.THREADFERRY_WECOM_BOT_ID && process.env.THREADFERRY_WECOM_BOT_SECRET),
+    message: process.env.THREADFERRY_WECOM_BOT_ID && process.env.THREADFERRY_WECOM_BOT_SECRET
       ? "企业微信机器人环境变量已设置（值未显示）"
-      : "缺少 WARDEN_WECOM_BOT_ID/WARDEN_WECOM_BOT_SECRET；请通过环境变量设置",
+      : "缺少 THREADFERRY_WECOM_BOT_ID/THREADFERRY_WECOM_BOT_SECRET；请通过环境变量设置",
   });
 
   try {
     const { stdout } = await runCommand("wecom-cli", ["--version"], { timeoutMs: 10_000 });
     const supported = atLeast(stdout, [1, 1, 0]);
-    checks.push({ ok: supported, message: supported ? stdout.trim() : `${stdout.trim()}；Warden 要求 1.1.0+` });
+    checks.push({ ok: supported, message: supported ? stdout.trim() : `${stdout.trim()}；ThreadFerry 要求 1.1.0+` });
     try {
       await runCommand("wecom-cli", ["identity", "whoami", "--json", "{}"], { timeoutMs: 30_000 });
       checks.push({ ok: true, message: "wecom-cli 身份授权有效（详情未显示）" });
@@ -334,7 +334,7 @@ async function doctor(configPath?: string): Promise<boolean> {
             ok: mapped,
             message: mapped
               ? "企业微信通讯录姓名解析与回调身份映射有效（详情未显示）"
-              : "企业微信通讯录无法映射 Warden Owner；请检查机器人通讯录可见范围",
+              : "企业微信通讯录无法映射 ThreadFerry Owner；请检查机器人通讯录可见范围",
           });
         } catch {
           checks.push({ ok: false, message: "企业微信通讯录查询失败；请检查 wecom-cli 授权和机器人通讯录可见范围" });
@@ -351,7 +351,7 @@ async function doctor(configPath?: string): Promise<boolean> {
     try {
       const { stdout } = await runCommand("codex", ["--version"], { timeoutMs: 10_000 });
       const supported = atLeast(stdout, [0, 138, 0]);
-      checks.push({ ok: supported, message: supported ? stdout.trim() : `${stdout.trim()}；Warden 要求 0.138.0+` });
+      checks.push({ ok: supported, message: supported ? stdout.trim() : `${stdout.trim()}；ThreadFerry 要求 0.138.0+` });
       try {
         await runCommand("codex", ["login", "status"], { timeoutMs: 10_000 });
         checks.push({ ok: true, message: "Codex CLI 登录有效（详情未显示）" });
@@ -366,7 +366,7 @@ async function doctor(configPath?: string): Promise<boolean> {
     try {
       const { stdout } = await runCommand("pi", ["--version"], { timeoutMs: 10_000 });
       const supported = atLeast(stdout, [0, 84, 2]);
-      checks.push({ ok: supported, message: supported ? `pi ${stdout.trim()}` : `${stdout.trim()}；Warden 要求 pi 0.84.2+` });
+      checks.push({ ok: supported, message: supported ? `pi ${stdout.trim()}` : `${stdout.trim()}；ThreadFerry 要求 pi 0.84.2+` });
     } catch {
       checks.push({ ok: false, message: "找不到 Pi CLI；请安装 @earendil-works/pi-coding-agent 并完成模型授权" });
     }
@@ -376,7 +376,7 @@ async function doctor(configPath?: string): Promise<boolean> {
   return checks.every((check) => check.ok);
 }
 
-async function runMock(config: WardenConfig): Promise<void> {
+async function runMock(config: ThreadFerryConfig): Promise<void> {
   const [groupId, group] = Object.entries(config.groups)[0]!;
   const agent = config.agents[group.agent]!;
   const currentTime = new Date();
@@ -392,7 +392,7 @@ async function runMock(config: WardenConfig): Promise<void> {
     senderId: group.allowUsers[0]!,
     senderName: "用户",
     time: currentTime,
-    text: "@Warden 帮忙分析",
+    text: "@ThreadFerry 帮忙分析",
     mentioned: true,
   };
   const app = createApp(config, {
@@ -412,12 +412,12 @@ async function runMock(config: WardenConfig): Promise<void> {
 
 async function status(configPath?: string): Promise<void> {
   const config = await loadConfig(resolve(configPath ?? defaultConfigPath()));
-  const snapshot = await new WardenState(defaultStatePath()).snapshot();
+  const snapshot = await new ThreadFerryState(defaultStatePath()).snapshot();
   const counts = new Map<string, number>();
   for (const turn of snapshot.turns) counts.set(turn.status, (counts.get(turn.status) ?? 0) + 1);
   const active = (counts.get("queued") ?? 0) + (counts.get("running") ?? 0);
   const lastFailure = snapshot.turns.slice().reverse().find((turn) => turn.status === "failed");
-  console.log(`Warden: ${active > 0 ? `${active} 个任务处理中或排队` : "空闲"}`);
+  console.log(`ThreadFerry: ${active > 0 ? `${active} 个任务处理中或排队` : "空闲"}`);
   console.log(`配置 Agent: ${Object.keys(config.agents).length}；群: ${Object.keys(config.groups).length}；Session: ${snapshot.sessions.length}；执行记录: ${snapshot.turns.length}`);
   console.log(`可靠性队列: inbox=${snapshot.inbox.length}, outbox=${snapshot.outbox.length}`);
   console.log(`结果: handled=${counts.get("handled") ?? 0}, stale=${counts.get("stale") ?? 0}, failed=${counts.get("failed") ?? 0}`);
@@ -429,7 +429,7 @@ async function resetSession(configPath: string | undefined, groupId: string): Pr
   try {
     const config = await loadConfig(resolve(configPath ?? defaultConfigPath()));
     if (!config.groups[groupId]) throw new Error("指定群未配置");
-    const removed = await new WardenState(defaultStatePath()).clearSession(groupId);
+    const removed = await new ThreadFerryState(defaultStatePath()).clearSession(groupId);
     console.log(removed ? "该群 Runtime Session 已重置。" : "该群当前没有已保存的 Runtime Session。");
   } finally {
     await lock.release();
@@ -456,7 +456,7 @@ async function start(configPath: string, mock: boolean, port: number): Promise<v
       configTail = operation.then(() => undefined, () => undefined);
       return operation;
     };
-    const state = new WardenState(defaultStatePath());
+    const state = new ThreadFerryState(defaultStatePath());
     const app = createApp(config, {
       history: (groupId, options) => fetchWecomHistory(groupId, options),
       runtime: (request) => request.runtime === "codex" ? runCodex(request) : runPi(request),
@@ -479,7 +479,7 @@ async function start(configPath: string, mock: boolean, port: number): Promise<v
       listGroups: () => listWecomGroups(),
       searchUsers: (keywords) => searchWecomUsers(keywords),
     }, port);
-    console.log(`Warden 管理台: ${admin.url}`);
+    console.log(`ThreadFerry 管理台: ${admin.url}`);
     try {
       const client = startWecomChannel(credentials, async (event, reply) => {
         const status = event.chatType === "single"
@@ -487,7 +487,7 @@ async function start(configPath: string, mock: boolean, port: number): Promise<v
           : await app.handle(event.message, reply);
         console.log(`[wecom] 收到${event.chatType === "single" ? "单聊" : "群内 @"}消息，处理状态: ${status}`);
       });
-      console.log(`Warden 已启动，监听 ${Object.keys(config.groups).length} 个已配置企业微信群。`);
+      console.log(`ThreadFerry 已启动，监听 ${Object.keys(config.groups).length} 个已配置企业微信群。`);
 
       const recovery = (async () => {
         const deliveries = await state.pendingDeliveries();
@@ -564,15 +564,15 @@ async function main(): Promise<void> {
     return;
   }
   if (command === "session") {
-    if (args[0] !== "reset") throw new Error("warden session 仅支持 reset");
+    if (args[0] !== "reset") throw new Error("threadferry session 仅支持 reset");
     const groupId = option(args, "--group");
-    if (!groupId) throw new Error("warden session reset 必须提供 --group <group-id>");
+    if (!groupId) throw new Error("threadferry session reset 必须提供 --group <group-id>");
     await resetSession(option(args, "--config"), groupId);
     return;
   }
   if (command === "setup") {
     const workspace = option(args, "--workspace");
-    if (!workspace) throw new Error("warden setup 必须提供 --workspace <absolute-path>");
+    if (!workspace) throw new Error("threadferry setup 必须提供 --workspace <absolute-path>");
     await setup(
       option(args, "--config") ?? defaultConfigPath(),
       workspace,
@@ -592,10 +592,10 @@ async function main(): Promise<void> {
       }
       return;
     }
-    if (action !== "add") throw new Error("warden agent 仅支持 add 或 list");
+    if (action !== "add") throw new Error("threadferry agent 仅支持 add 或 list");
     const name = option(args, "--name");
     const workspaceInput = option(args, "--workspace");
-    if (!name || !workspaceInput) throw new Error("warden agent add 必须提供 --name 和 --workspace");
+    if (!name || !workspaceInput) throw new Error("threadferry agent add 必须提供 --name 和 --workspace");
     const workspace = await resolveWorkspace(workspaceInput);
     const next = addAgent(config, name, {
       workspace,
@@ -615,6 +615,6 @@ async function main(): Promise<void> {
 }
 
 void main().catch((error) => {
-  console.error(`Warden: ${error instanceof Error ? error.message : String(error)}`);
+  console.error(`ThreadFerry: ${error instanceof Error ? error.message : String(error)}`);
   process.exitCode = 1;
 });
