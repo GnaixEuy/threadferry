@@ -72,7 +72,6 @@ export function setupConfig(
   if (existing && existing.agent !== agentId) {
     throw new Error("该群已绑定其他 Agent；请通过 Owner 私聊命令切换，不会自动改写");
   }
-  if (current && current.ownerUser !== userId) throw new Error("只有机器人 ThreadFerry Owner 可以新增群绑定");
   const configuredAgent = current?.agents[agentId];
   if (configuredAgent && (configuredAgent.workspace !== agent.workspace
     || configuredAgent.runtime !== agent.runtime || configuredAgent.model !== agent.model)) {
