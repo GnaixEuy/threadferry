@@ -2,25 +2,38 @@
 import { randomBytes } from "node:crypto";
 import { existsSync } from "node:fs";
 import { mkdir, rename, rm, writeFile } from "node:fs/promises";
+import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
+import { emitKeypressEvents, type Key } from "node:readline";
+import { createInterface } from "node:readline/promises";
 import { createApp } from "./app.js";
+import { startAdminServer, type ConfigUpdater } from "./admin.js";
 import { listWecomGroups, searchWecomUsers, sendWecomReply, startWecomChannel } from "./channels/wecom.js";
-import { loadConfig, resolveWorkspace, saveConfig, setupConfig } from "./config.js";
+import { addAgent, loadConfig, resolveWorkspace, saveConfig, setupConfig } from "./config.js";
 import { fetchWecomHistory } from "./history/wecom-cli.js";
 import { runCommand } from "./process.js";
 import { runCodex } from "./runtimes/codex.js";
+import { runPi } from "./runtimes/pi.js";
 import { acquireHostLock, defaultStatePath, newErrorId, WardenState } from "./state.js";
-import type { GroupMessage, IncomingMention, WardenConfig } from "./types.js";
+import type { GroupMessage, IncomingMention, RuntimeName, WardenConfig } from "./types.js";
 
-const USAGE = `Warden 0.5
+const VERSION = "0.8.0";
+const USAGE = `Warden ${VERSION}
 
 Usage:
-  warden setup --workspace <absolute-path> [--config <path>]
+  warden onboard [--config <path>]
+  warden setup --workspace <absolute-path> [--agent <name>] [--runtime codex|pi] [--model <id>] [--config <path>]
+  warden agent add --name <name> --runtime codex|pi --workspace <absolute-path> [--model <id>] [--config <path>]
+  warden agent list [--config <path>]
   warden doctor [--config <path>]
   warden status [--config <path>]
   warden session reset --group <group-id> [--config <path>]
-  warden start [--config <path>] [--mock]
+  warden start [--config <path>] [--admin-port <port>] [--mock]
 `;
+
+function defaultConfigPath(): string {
+  return join(homedir(), ".warden", "warden.yaml");
+}
 
 function option(args: string[], name: string): string | undefined {
   const index = args.indexOf(name);
@@ -40,30 +53,138 @@ function atLeast(output: string, minimum: [number, number, number]): boolean {
   return true;
 }
 
-function botCredentials(): { botId: string; secret: string } {
-  const botId = process.env.WARDEN_WECOM_BOT_ID;
-  const secret = process.env.WARDEN_WECOM_BOT_SECRET;
-  if (!botId || !secret) {
-    throw new Error("缺少 WARDEN_WECOM_BOT_ID 或 WARDEN_WECOM_BOT_SECRET；请只通过环境变量设置凭据");
+function validateCredential(value: string, name: string): string {
+  const normalized = value.trim();
+  if (!normalized || normalized.length > 1024 || /[\u0000-\u001f\u007f]/.test(normalized)) {
+    throw new Error(`${name} 无效`);
   }
+  return normalized;
+}
+
+async function hiddenQuestion(prompt: string): Promise<string> {
+  if (!process.stdin.isTTY || !process.stdout.isTTY || !process.stdin.setRawMode) {
+    throw new Error("当前终端不支持安全隐藏输入");
+  }
+  process.stdout.write(prompt);
+  emitKeypressEvents(process.stdin);
+  const wasRaw = process.stdin.isRaw;
+  const wasPaused = process.stdin.isPaused();
+  process.stdin.setRawMode(true);
+  process.stdin.resume();
+  let answer = "";
+  return new Promise<string>((resolveAnswer, reject) => {
+    const finish = (error?: Error) => {
+      process.stdin.off("keypress", onKeypress);
+      process.stdin.setRawMode(Boolean(wasRaw));
+      if (wasPaused) process.stdin.pause();
+      process.stdout.write("\n");
+      if (error) reject(error);
+      else resolveAnswer(answer);
+    };
+    const onKeypress = (text: string, key: Key) => {
+      if (key.ctrl && key.name === "c") {
+        finish(new Error("凭据输入已取消"));
+      } else if (key.name === "return" || key.name === "enter") {
+        finish();
+      } else if (key.name === "backspace" || key.name === "delete") {
+        if (answer.length > 0) {
+          answer = answer.slice(0, -1);
+          process.stdout.write("\b \b");
+        }
+      } else if (!key.ctrl && !key.meta && text && !/[\r\n]/.test(text) && answer.length < 1024) {
+        answer += text;
+        process.stdout.write("*");
+      }
+    };
+    process.stdin.on("keypress", onKeypress);
+  });
+}
+
+async function botCredentials(): Promise<{ botId: string; secret: string }> {
+  let botId = process.env.WARDEN_WECOM_BOT_ID;
+  let secret = process.env.WARDEN_WECOM_BOT_SECRET;
+  if (botId && secret) return { botId, secret };
+  if (!process.stdin.isTTY || !process.stdout.isTTY) {
+    throw new Error("缺少 WARDEN_WECOM_BOT_ID 或 WARDEN_WECOM_BOT_SECRET；交互式终端可安全输入，非交互启动必须设置环境变量");
+  }
+  console.log("机器人凭据仅用于当前进程，不写入配置或日志。");
+  if (!botId) {
+    const prompt = createInterface({ input: process.stdin, output: process.stdout });
+    try {
+      botId = validateCredential(await prompt.question("企业微信 Bot ID: "), "Bot ID");
+    } finally {
+      prompt.close();
+    }
+  }
+  if (!secret) secret = validateCredential(await hiddenQuestion("企业微信 Bot Secret: "), "Bot Secret");
+  process.env.WARDEN_WECOM_BOT_ID = botId;
+  process.env.WARDEN_WECOM_BOT_SECRET = secret;
   return { botId, secret };
 }
 
-async function preflightReal(): Promise<{ botId: string; secret: string }> {
-  const credentials = botCredentials();
-  const wecomVersion = (await runCommand("wecom-cli", ["--version"], { timeoutMs: 10_000 })).stdout;
+function runtimeName(input: string | undefined): RuntimeName {
+  if (input === undefined || input === "codex") return "codex";
+  if (input === "pi") return "pi";
+  throw new Error("--runtime 仅支持 codex 或 pi");
+}
+
+function adminPort(input: string | undefined): number {
+  if (input === undefined) return 17_638;
+  const port = Number(input);
+  if (!Number.isInteger(port) || port < 1 || port > 65_535) throw new Error("--admin-port 必须是 1-65535 的端口");
+  return port;
+}
+
+async function preflightDependencies(runtimes: Set<RuntimeName>): Promise<void> {
+  let wecomVersion: string;
+  try {
+    wecomVersion = (await runCommand("wecom-cli", ["--version"], { timeoutMs: 10_000 })).stdout;
+  } catch {
+    throw new Error("找不到企业微信官方 wecom-cli 1.1.0+；请安装并加入 PATH");
+  }
   if (!atLeast(wecomVersion, [1, 1, 0])) throw new Error("Warden 要求 wecom-cli 1.1.0+");
-  await runCommand("wecom-cli", ["identity", "whoami", "--json", "{}"], { timeoutMs: 30_000 });
-  const codexVersion = (await runCommand("codex", ["--version"], { timeoutMs: 10_000 })).stdout;
-  if (!atLeast(codexVersion, [0, 138, 0])) throw new Error("Warden 要求 codex-cli 0.138.0+");
+  try {
+    await runCommand("wecom-cli", ["identity", "whoami", "--json", "{}"], { timeoutMs: 30_000 });
+  } catch {
+    throw new Error("wecom-cli 尚未授权；请先运行 wecom-cli auth init");
+  }
+  if (runtimes.has("codex")) {
+    let version: string;
+    try {
+      version = (await runCommand("codex", ["--version"], { timeoutMs: 10_000 })).stdout;
+    } catch {
+      throw new Error("找不到 Codex CLI 0.138.0+；请安装并运行 codex login");
+    }
+    if (!atLeast(version, [0, 138, 0])) throw new Error("Warden 要求 codex-cli 0.138.0+");
+    try {
+      await runCommand("codex", ["login", "status"], { timeoutMs: 10_000 });
+    } catch {
+      throw new Error("Codex CLI 尚未登录；请先运行 codex login");
+    }
+  }
+  if (runtimes.has("pi")) {
+    let version: string;
+    try {
+      version = (await runCommand("pi", ["--version"], { timeoutMs: 10_000 })).stdout;
+    } catch {
+      throw new Error("找不到 Pi CLI 0.84.2+；请安装 @earendil-works/pi-coding-agent 并完成模型授权");
+    }
+    if (!atLeast(version, [0, 84, 2])) throw new Error("Warden 要求 pi 0.84.2+");
+  }
+}
+
+async function preflightReal(config: WardenConfig): Promise<{ botId: string; secret: string }> {
+  const credentials = await botCredentials();
+  await preflightDependencies(new Set(Object.values(config.agents).map((agent) => agent.runtime)));
   return credentials;
 }
 
-async function setup(configPath: string, workspaceInput: string): Promise<void> {
+async function setup(configPath: string, workspaceInput: string, agentId: string, runtime: RuntimeName, model?: string): Promise<void> {
   const target = resolve(configPath);
   const workspace = await resolveWorkspace(workspaceInput);
   if (existsSync(target)) await loadConfig(target);
-  const credentials = botCredentials();
+  const credentials = await botCredentials();
+  await preflightDependencies(new Set([runtime]));
   const code = randomBytes(4).toString("hex");
   console.log(`请在目标企业微信群发送：@机器人 warden setup ${code}`);
   console.log("等待配对消息；配置不会保存机器人凭据。");
@@ -92,7 +213,7 @@ async function setup(configPath: string, workspaceInput: string): Promise<void> 
       }
       try {
         const current = existsSync(target) ? await loadConfig(target) : undefined;
-        const content = setupConfig(message.groupId, workspace, message.senderId, current);
+        const content = setupConfig(message.groupId, agentId, { workspace, runtime, ...(model ? { model } : {}) }, message.senderId, current);
         const directory = dirname(target);
         await mkdir(directory, { recursive: true });
         const temporary = join(directory, `.${basename(target)}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`);
@@ -115,20 +236,70 @@ async function setup(configPath: string, workspaceInput: string): Promise<void> 
   });
 }
 
+async function onboard(configOption?: string): Promise<void> {
+  if (!process.stdin.isTTY || !process.stdout.isTTY) {
+    throw new Error("warden onboard 需要交互式终端；无人值守环境请使用 setup/start 参数和环境变量");
+  }
+  const configPath = resolve(configOption ?? defaultConfigPath());
+  const current = existsSync(configPath) ? await loadConfig(configPath) : undefined;
+  const initial = current ? Object.entries(current.agents)[0] : undefined;
+  const prompt = createInterface({ input: process.stdin, output: process.stdout });
+  let agentId: string;
+  let runtime: RuntimeName;
+  let workspace: string;
+  let model: string | undefined;
+  console.log(`Warden 引导配置（配置文件: ${configPath}）`);
+  console.log("[1/4] 选择 Agent 和 Workspace");
+  try {
+    const ask = async (label: string, fallback: string) => {
+      const answer = (await prompt.question(`${label} [${fallback}]: `)).trim();
+      return answer || fallback;
+    };
+    agentId = await ask("Agent 名", initial?.[0] ?? "default");
+    runtime = runtimeName((await ask("Runtime (codex/pi)", initial?.[1].runtime ?? "codex")).toLowerCase());
+    workspace = await ask("Workspace 绝对路径", initial?.[1].workspace ?? process.cwd());
+    const modelAnswer = (await prompt.question(`模型 ID（留空使用 Runtime 默认）${initial?.[1].model ? ` [${initial[1].model}]` : ""}: `)).trim();
+    model = modelAnswer || initial?.[1].model;
+  } finally {
+    prompt.close();
+  }
+
+  console.log("[2/4] 检查依赖并配对企业微信群");
+  await setup(configPath, workspace, agentId, runtime, model);
+  console.log("[3/4] 运行环境诊断");
+  if (!(await doctor(configPath))) {
+    throw new Error(`环境诊断未通过；修复后运行 warden doctor --config ${configPath}`);
+  }
+
+  console.log("[4/4] 启动 Warden");
+  const confirmation = createInterface({ input: process.stdin, output: process.stdout });
+  let shouldStart: boolean;
+  try {
+    const answer = (await confirmation.question("现在启动并保持当前终端运行？[Y/n]: ")).trim().toLowerCase();
+    shouldStart = answer === "" || answer === "y" || answer === "yes";
+  } finally {
+    confirmation.close();
+  }
+  if (shouldStart) await start(configPath, false, 17_638);
+  else console.log(`配置完成。稍后运行: warden start --config ${configPath}`);
+}
+
 async function doctor(configPath?: string): Promise<boolean> {
   const checks: Array<{ ok: boolean; message: string }> = [];
   let configuredOwner: string | undefined;
+  let configuredRuntimes = new Set<RuntimeName>(["codex"]);
   const major = Number(process.versions.node.split(".")[0]);
   checks.push({ ok: major >= 22, message: major >= 22 ? `Node ${process.version}` : `Node ${process.version}；请安装 Node.js 22+ LTS` });
 
-  const chosenConfig = resolve(configPath ?? "warden.yaml");
+  const chosenConfig = resolve(configPath ?? defaultConfigPath());
   if (!existsSync(chosenConfig)) {
-    checks.push({ ok: false, message: `配置不存在: ${chosenConfig}；复制 warden.example.yaml 后用 --config 指定` });
+    checks.push({ ok: false, message: `配置不存在: ${chosenConfig}；请先运行 warden onboard` });
   } else {
     try {
       const loaded = await loadConfig(chosenConfig);
       configuredOwner = loaded.ownerUser;
-      checks.push({ ok: true, message: `配置与 ${Object.keys(loaded.groups).length} 个 Workspace 有效` });
+      configuredRuntimes = new Set(Object.values(loaded.agents).map((agent) => agent.runtime));
+      checks.push({ ok: true, message: `配置有效：${Object.keys(loaded.agents).length} 个 Agent，${Object.keys(loaded.groups).length} 个群` });
     } catch (error) {
       checks.push({ ok: false, message: error instanceof Error ? error.message : String(error) });
     }
@@ -176,12 +347,29 @@ async function doctor(configPath?: string): Promise<boolean> {
     checks.push({ ok: false, message: "找不到 wecom-cli；请安装企业微信官方 wecom-cli 1.1.0+ 并加入 PATH" });
   }
 
-  try {
-    const { stdout } = await runCommand("codex", ["--version"], { timeoutMs: 10_000 });
-    const supported = atLeast(stdout, [0, 138, 0]);
-    checks.push({ ok: supported, message: supported ? stdout.trim() : `${stdout.trim()}；Warden 要求 0.138.0+` });
-  } catch {
-    checks.push({ ok: false, message: "找不到 Codex CLI；请安装并执行 codex login" });
+  if (configuredRuntimes.has("codex")) {
+    try {
+      const { stdout } = await runCommand("codex", ["--version"], { timeoutMs: 10_000 });
+      const supported = atLeast(stdout, [0, 138, 0]);
+      checks.push({ ok: supported, message: supported ? stdout.trim() : `${stdout.trim()}；Warden 要求 0.138.0+` });
+      try {
+        await runCommand("codex", ["login", "status"], { timeoutMs: 10_000 });
+        checks.push({ ok: true, message: "Codex CLI 登录有效（详情未显示）" });
+      } catch {
+        checks.push({ ok: false, message: "Codex CLI 尚未登录；请先运行 codex login" });
+      }
+    } catch {
+      checks.push({ ok: false, message: "找不到 Codex CLI；请安装并执行 codex login" });
+    }
+  }
+  if (configuredRuntimes.has("pi")) {
+    try {
+      const { stdout } = await runCommand("pi", ["--version"], { timeoutMs: 10_000 });
+      const supported = atLeast(stdout, [0, 84, 2]);
+      checks.push({ ok: supported, message: supported ? `pi ${stdout.trim()}` : `${stdout.trim()}；Warden 要求 pi 0.84.2+` });
+    } catch {
+      checks.push({ ok: false, message: "找不到 Pi CLI；请安装 @earendil-works/pi-coding-agent 并完成模型授权" });
+    }
   }
 
   for (const check of checks) console.log(`${check.ok ? "[ok]" : "[error]"} ${check.message}`);
@@ -190,6 +378,7 @@ async function doctor(configPath?: string): Promise<boolean> {
 
 async function runMock(config: WardenConfig): Promise<void> {
   const [groupId, group] = Object.entries(config.groups)[0]!;
+  const agent = config.agents[group.agent]!;
   const currentTime = new Date();
   const at = (minutesAgo: number) => new Date(currentTime.getTime() - minutesAgo * 60_000);
   const history: GroupMessage[] = [
@@ -208,27 +397,28 @@ async function runMock(config: WardenConfig): Promise<void> {
   };
   const app = createApp(config, {
     history: async () => history,
-    runtime: async ({ workspace, prompt }) => {
+    runtime: async ({ agentId, runtime, workspace, prompt }) => {
       if (!prompt.includes("张三") || !prompt.includes("李四") || !prompt.includes("王五")) {
         throw new Error("Mock Context Builder 未包含预期消息");
       }
-      console.log(`[mock] Codex workspace: ${workspace}`);
+      console.log(`[mock] Agent ${agentId}: ${runtime} workspace=${workspace}`);
       return { text: "Mock 分析完成：接口异常可能与 Redis 有关，且线上已重复出现三次。", sessionId: "mock-session" };
     },
   });
+  if (!agent) throw new Error("Mock 群绑定的 Agent 不存在");
   const status = await app.handle(message, async (content) => console.log(`[mock] WeCom reply: ${content}`));
   console.log(`[mock] status: ${status}`);
 }
 
 async function status(configPath?: string): Promise<void> {
-  const config = await loadConfig(resolve(configPath ?? "warden.yaml"));
+  const config = await loadConfig(resolve(configPath ?? defaultConfigPath()));
   const snapshot = await new WardenState(defaultStatePath()).snapshot();
   const counts = new Map<string, number>();
   for (const turn of snapshot.turns) counts.set(turn.status, (counts.get(turn.status) ?? 0) + 1);
   const active = (counts.get("queued") ?? 0) + (counts.get("running") ?? 0);
   const lastFailure = snapshot.turns.slice().reverse().find((turn) => turn.status === "failed");
   console.log(`Warden: ${active > 0 ? `${active} 个任务处理中或排队` : "空闲"}`);
-  console.log(`配置群: ${Object.keys(config.groups).length}；Session: ${snapshot.sessions.length}；执行记录: ${snapshot.turns.length}`);
+  console.log(`配置 Agent: ${Object.keys(config.agents).length}；群: ${Object.keys(config.groups).length}；Session: ${snapshot.sessions.length}；执行记录: ${snapshot.turns.length}`);
   console.log(`可靠性队列: inbox=${snapshot.inbox.length}, outbox=${snapshot.outbox.length}`);
   console.log(`结果: handled=${counts.get("handled") ?? 0}, stale=${counts.get("stale") ?? 0}, failed=${counts.get("failed") ?? 0}`);
   if (lastFailure) console.log(`最近失败: ${lastFailure.errorId ?? "无错误编号"} phase=${lastFailure.failurePhase ?? "unknown"} time=${lastFailure.updatedAt}`);
@@ -237,88 +427,115 @@ async function status(configPath?: string): Promise<void> {
 async function resetSession(configPath: string | undefined, groupId: string): Promise<void> {
   const lock = await acquireHostLock();
   try {
-    const config = await loadConfig(resolve(configPath ?? "warden.yaml"));
+    const config = await loadConfig(resolve(configPath ?? defaultConfigPath()));
     if (!config.groups[groupId]) throw new Error("指定群未配置");
     const removed = await new WardenState(defaultStatePath()).clearSession(groupId);
-    console.log(removed ? "该群 Codex Session 已重置。" : "该群当前没有已保存的 Codex Session。");
+    console.log(removed ? "该群 Runtime Session 已重置。" : "该群当前没有已保存的 Runtime Session。");
   } finally {
     await lock.release();
   }
 }
 
-async function start(configPath: string, mock: boolean): Promise<void> {
+async function start(configPath: string, mock: boolean, port: number): Promise<void> {
   const configFile = resolve(configPath);
   const config = await loadConfig(configFile);
   if (mock) return runMock(config);
-  const credentials = await preflightReal();
+  const credentials = await preflightReal(config);
   const lock = await acquireHostLock();
   try {
+    let configTail = Promise.resolve();
+    const updateConfig: ConfigUpdater = (change) => {
+      const operation = configTail.then(async () => {
+        const latest = await loadConfig(configFile);
+        await change(latest);
+        await saveConfig(configFile, latest);
+        config.ownerUser = latest.ownerUser;
+        config.agents = latest.agents;
+        config.groups = latest.groups;
+      });
+      configTail = operation.then(() => undefined, () => undefined);
+      return operation;
+    };
     const state = new WardenState(defaultStatePath());
     const app = createApp(config, {
       history: (groupId, options) => fetchWecomHistory(groupId, options),
-      runtime: (request) => runCodex(request),
-      updateAllowUsers: async (groupId, users) => {
-        const latest = await loadConfig(configFile);
+      runtime: (request) => request.runtime === "codex" ? runCodex(request) : runPi(request),
+      updateAllowUsers: (groupId, users) => updateConfig((latest) => {
         const group = latest.groups[groupId];
         if (!group) throw new Error("指定群未配置");
         group.allowUsers = users;
-        await saveConfig(configFile, latest);
-      },
+      }),
+      updateGroupAgent: (groupId, agentId) => updateConfig((latest) => {
+        const group = latest.groups[groupId];
+        if (!group || !latest.agents[agentId]) throw new Error("指定群或 Agent 未配置");
+        group.agent = agentId;
+      }),
       listGroups: () => listWecomGroups(),
       searchUsers: (keywords) => searchWecomUsers(keywords),
       onError: ({ errorId, phase }) => console.error(`[wecom] 处理失败 error=${errorId} phase=${phase}`),
     }, state);
-    const client = startWecomChannel(credentials, async (event, reply) => {
-      const status = event.chatType === "single"
-        ? await app.handleDirect(event.message, reply)
-        : await app.handle(event.message, reply);
-      console.log(`[wecom] 收到${event.chatType === "single" ? "单聊" : "群内 @"}消息，处理状态: ${status}`);
-    });
-    console.log(`Warden 已启动，监听 ${Object.keys(config.groups).length} 个已配置企业微信群。`);
+    const admin = await startAdminServer(config, {
+      updateConfig,
+      listGroups: () => listWecomGroups(),
+      searchUsers: (keywords) => searchWecomUsers(keywords),
+    }, port);
+    console.log(`Warden 管理台: ${admin.url}`);
+    try {
+      const client = startWecomChannel(credentials, async (event, reply) => {
+        const status = event.chatType === "single"
+          ? await app.handleDirect(event.message, reply)
+          : await app.handle(event.message, reply);
+        console.log(`[wecom] 收到${event.chatType === "single" ? "单聊" : "群内 @"}消息，处理状态: ${status}`);
+      });
+      console.log(`Warden 已启动，监听 ${Object.keys(config.groups).length} 个已配置企业微信群。`);
 
-    const recovery = (async () => {
-      const deliveries = await state.pendingDeliveries();
-      for (const delivery of deliveries) {
-        if (!config.groups[delivery.groupId]) {
-          await state.completeDelivery(delivery.id);
-          console.error("[state] 已丢弃未配置群的待发送回复");
-          continue;
+      const recovery = (async () => {
+        const deliveries = await state.pendingDeliveries();
+        for (const delivery of deliveries) {
+          if (!config.groups[delivery.groupId]) {
+            await state.completeDelivery(delivery.id);
+            console.error("[state] 已丢弃未配置群的待发送回复");
+            continue;
+          }
+          try {
+            await sendWecomReply(delivery.groupId, delivery.content);
+            await state.completeDelivery(delivery.id);
+            console.log("[state] 已补发 1 条上次未投递的回复");
+          } catch {
+            const errorId = newErrorId();
+            await state.deliveryFailed(delivery.id, errorId).catch(() => undefined);
+            console.error(`[wecom] 补发失败 error=${errorId} phase=reply`);
+          }
         }
-        try {
-          await sendWecomReply(delivery.groupId, delivery.content);
-          await state.completeDelivery(delivery.id);
-          console.log("[state] 已补发 1 条上次未投递的回复");
-        } catch {
-          const errorId = newErrorId();
-          await state.deliveryFailed(delivery.id, errorId).catch(() => undefined);
-          console.error(`[wecom] 补发失败 error=${errorId} phase=reply`);
-        }
-      }
 
-      const pending = await state.recoverPending();
-      if (pending.length > 0) console.log(`[state] 正在恢复 ${pending.length} 个上次中断的任务`);
-      await Promise.all(pending.map(async (message) => {
-        const result = await app.replay(message, async (content, finish = true) => {
-          if (finish) await sendWecomReply(message.groupId, content);
-        });
-        console.log(`[state] 恢复任务处理状态: ${result}`);
-      }));
-    })().catch(() => {
-      const errorId = newErrorId();
-      console.error(`[state] 恢复失败 error=${errorId} phase=host`);
-    });
+        const pending = await state.recoverPending();
+        if (pending.length > 0) console.log(`[state] 正在恢复 ${pending.length} 个上次中断的任务`);
+        await Promise.all(pending.map(async (message) => {
+          const result = await app.replay(message, async (content, finish = true) => {
+            if (finish) await sendWecomReply(message.groupId, content);
+          });
+          console.log(`[state] 恢复任务处理状态: ${result}`);
+        }));
+      })().catch(() => {
+        const errorId = newErrorId();
+        console.error(`[state] 恢复失败 error=${errorId} phase=host`);
+      });
 
-    await new Promise<void>((done) => {
-      let stopping = false;
-      const stop = () => {
-        if (stopping) return;
-        stopping = true;
-        client.disconnect();
-        void Promise.all([app.shutdown(), recovery]).finally(done);
-      };
-      process.once("SIGINT", stop);
-      process.once("SIGTERM", stop);
-    });
+      await new Promise<void>((done) => {
+        let stopping = false;
+        const stop = () => {
+          if (stopping) return;
+          stopping = true;
+          client.disconnect();
+          void admin.close();
+          void Promise.all([app.shutdown(), recovery]).finally(done);
+        };
+        process.once("SIGINT", stop);
+        process.once("SIGTERM", stop);
+      });
+    } finally {
+      await admin.close();
+    }
   } finally {
     await lock.release();
   }
@@ -328,6 +545,14 @@ async function main(): Promise<void> {
   const [, , command, ...args] = process.argv;
   if (!command || command === "--help" || command === "-h") {
     console.log(USAGE);
+    return;
+  }
+  if (command === "--version" || command === "-v") {
+    console.log(VERSION);
+    return;
+  }
+  if (command === "onboard") {
+    await onboard(option(args, "--config"));
     return;
   }
   if (command === "doctor") {
@@ -348,12 +573,42 @@ async function main(): Promise<void> {
   if (command === "setup") {
     const workspace = option(args, "--workspace");
     if (!workspace) throw new Error("warden setup 必须提供 --workspace <absolute-path>");
-    await setup(option(args, "--config") ?? "warden.yaml", workspace);
+    await setup(
+      option(args, "--config") ?? defaultConfigPath(),
+      workspace,
+      option(args, "--agent") ?? "default",
+      runtimeName(option(args, "--runtime")),
+      option(args, "--model"),
+    );
+    return;
+  }
+  if (command === "agent") {
+    const action = args[0];
+    const configPath = resolve(option(args, "--config") ?? defaultConfigPath());
+    const config = await loadConfig(configPath);
+    if (action === "list") {
+      for (const [id, agent] of Object.entries(config.agents)) {
+        console.log(`${id}\t${agent.runtime}\t${agent.model ?? "default"}\t${agent.workspace}`);
+      }
+      return;
+    }
+    if (action !== "add") throw new Error("warden agent 仅支持 add 或 list");
+    const name = option(args, "--name");
+    const workspaceInput = option(args, "--workspace");
+    if (!name || !workspaceInput) throw new Error("warden agent add 必须提供 --name 和 --workspace");
+    const workspace = await resolveWorkspace(workspaceInput);
+    const next = addAgent(config, name, {
+      workspace,
+      runtime: runtimeName(option(args, "--runtime")),
+      ...(option(args, "--model") ? { model: option(args, "--model") } : {}),
+    });
+    await saveConfig(configPath, next);
+    console.log(`Agent ${name} 已添加。`);
     return;
   }
   if (command === "start") {
-    const configPath = option(args, "--config") ?? "warden.yaml";
-    await start(configPath, args.includes("--mock"));
+    const configPath = option(args, "--config") ?? defaultConfigPath();
+    await start(configPath, args.includes("--mock"), adminPort(option(args, "--admin-port")));
     return;
   }
   throw new Error(`未知命令: ${command}\n${USAGE}`);

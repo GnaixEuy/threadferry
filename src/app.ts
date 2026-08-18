@@ -1,25 +1,27 @@
 import { createHash, randomBytes } from "node:crypto";
 import { authorize } from "./authorization.js";
 import { buildContext } from "./context-builder.js";
+import { resolveDirectoryUser } from "./directory.js";
 import { newErrorId, WardenState, type FailurePhase } from "./state.js";
-import type { DirectoryUser, GroupMessage, IncomingDirectMessage, IncomingMention, Reply, RuntimeResult, WardenConfig } from "./types.js";
+import type { DirectoryUser, GroupMessage, IncomingDirectMessage, IncomingMention, Reply, RuntimeRequest, RuntimeResult, WardenConfig } from "./types.js";
 
 export type HandleResult = "handled" | "stale" | "failed" | "command" | "delivery_pending" | "duplicate" | "unauthorized_group" | "missing_mention" | "unauthorized_user";
 
 export interface AppDependencies {
   history: (groupId: string, options: { lookbackHours: number; maxMessages: number; endTime: Date }) => Promise<GroupMessage[]>;
-  runtime: (request: { workspace: string; prompt: string; sessionId?: string; signal?: AbortSignal }) => Promise<RuntimeResult>;
+  runtime: (request: RuntimeRequest) => Promise<RuntimeResult>;
   updateAllowUsers?: (groupId: string, users: string[]) => Promise<void>;
+  updateGroupAgent?: (groupId: string, agentId: string) => Promise<void>;
   listGroups?: () => Promise<Array<{ id: string; name?: string }>>;
   searchUsers?: (keywords: string[]) => Promise<DirectoryUser[]>;
   onError?: (error: { errorId: string; phase: FailurePhase }) => void;
 }
 
-type ManagementCommand = "help" | "whoami" | "groups" | "users" | "invite" | "join" | "add" | "remove";
+type ManagementCommand = "help" | "whoami" | "groups" | "agents" | "users" | "invite" | "join" | "add" | "remove" | "use";
 const USER_ID = /^[A-Za-z0-9_@.-]{1,512}$/;
 
 function managementCommand(text: string): { name: ManagementCommand; arguments: string[] } | undefined {
-  const match = text.match(/(?:^|[\s@])warden\s+(help|whoami|groups|users|invite|join|add|remove)(?:\s+(.+?))?\s*$/i);
+  const match = text.match(/(?:^|[\s@])warden\s+(help|whoami|groups|agents|users|invite|join|add|remove|use)(?:\s+(.+?))?\s*$/i);
   if (!match) return undefined;
   return { name: match[1]!.toLowerCase() as ManagementCommand, arguments: match[2]?.trim().split(/\s+/) ?? [] };
 }
@@ -77,6 +79,18 @@ export function createApp(config: WardenConfig, dependencies: AppDependencies, s
     return operation;
   }
 
+  function updateAgent(groupId: string, agentId: string): Promise<void> {
+    const operation = accessTail.then(async () => {
+      const group = config.groups[groupId];
+      if (!group || !dependencies.updateGroupAgent) throw new Error("当前启动方式不支持 Agent 管理");
+      if (!config.agents[agentId]) throw new Error(`Agent \`${agentId}\` 不存在。请先发送 \`warden agents\`。`);
+      await dependencies.updateGroupAgent(groupId, agentId);
+      group.agent = agentId;
+    });
+    accessTail = operation.then(() => undefined, () => undefined);
+    return operation;
+  }
+
   async function respond(reply: Reply, content: string): Promise<HandleResult> {
     try {
       await reply(limitUtf8(content), true);
@@ -104,14 +118,14 @@ export function createApp(config: WardenConfig, dependencies: AppDependencies, s
     if (configured.length > 1) {
       throw new Error(`有多个同名群“${reference}”，请改用群 ID：\n${configured.map((group) => `- \`${group.id}\``).join("\n")}`);
     }
-    if (matches.length > 0) throw new Error(`群“${reference}”尚未配置 Workspace，请先运行 warden setup。`);
+    if (matches.length > 0) throw new Error(`群“${reference}”尚未配置 Agent，请先运行 warden setup。`);
     throw new Error(`没有找到已配置群“${reference}”。请先发送 \`warden groups\`。`);
   }
 
-  async function resolveGroupAndUser(arguments_: string[]): Promise<{ group: { id: string; name?: string }; userReference: string }> {
-    if (arguments_.length < 2) throw new Error("缺少群名或用户姓名。");
+  async function resolveGroupAndValue(arguments_: string[], label: string): Promise<{ group: { id: string; name?: string }; value: string }> {
+    if (arguments_.length < 2) throw new Error(`缺少群名或${label}。`);
     if (config.groups[arguments_[0]!]) {
-      return { group: { id: arguments_[0]! }, userReference: arguments_.slice(1).join(" ") };
+      return { group: { id: arguments_[0]! }, value: arguments_.slice(1).join(" ") };
     }
     const input = arguments_.join(" ");
     const sessions = (await groupSessions())
@@ -123,33 +137,8 @@ export function createApp(config: WardenConfig, dependencies: AppDependencies, s
     if (matches.length > 1) {
       throw new Error(`有多个同名群“${longest}”，请改用群 ID：\n${matches.map((group) => `- \`${group.id}\``).join("\n")}`);
     }
-    if (matches.length === 0) throw new Error(`群“${longest}”尚未配置 Workspace，请先运行 warden setup。`);
-    return { group: matches[0]!, userReference: input.slice(longest.length).trim() };
-  }
-
-  async function resolveUser(reference: string): Promise<DirectoryUser> {
-    if (reference.startsWith("id:")) {
-      const id = reference.slice(3);
-      if (!USER_ID.test(id)) throw new Error("userid 无效。");
-      return { id, name: id };
-    }
-    if (!reference || !dependencies.searchUsers) throw new Error("当前启动方式不支持按姓名查询用户。");
-    let users: DirectoryUser[];
-    try {
-      users = await dependencies.searchUsers([reference]);
-    } catch {
-      throw new Error("企业微信通讯录查询失败。请检查 wecom-cli 授权，或使用 `id:<userid>`。");
-    }
-    const normalized = reference.toLocaleLowerCase();
-    const exact = users.filter((user) => user.name.toLocaleLowerCase() === normalized || user.alias?.toLocaleLowerCase() === normalized);
-    const matches = exact.length > 0 ? exact : users;
-    if (matches.length === 1) return matches[0]!;
-    if (matches.length === 0) throw new Error(`通讯录中没有找到“${reference}”。也可以使用 \`id:<userid>\`。`);
-    const choices = matches.slice(0, 10).map((user) => {
-      const department = user.departments?.length ? `，${user.departments.join(" / ")}` : "";
-      return `- ${user.name}${user.alias ? `（${user.alias}）` : ""}${department}：\`id:${user.id}\``;
-    });
-    throw new Error(`找到多个“${reference}”，请使用对应的 id 重新发送：\n${choices.join("\n")}`);
+    if (matches.length === 0) throw new Error(`群“${longest}”尚未配置 Agent，请先运行 warden setup。`);
+    return { group: matches[0]!, value: input.slice(longest.length).trim() };
   }
 
   async function directoryIdForCallback(callbackId: string): Promise<string | undefined> {
@@ -240,7 +229,11 @@ export function createApp(config: WardenConfig, dependencies: AppDependencies, s
     if (command.name === "join") return join(message.senderId, command.arguments[0], reply);
     if (message.senderId !== config.ownerUser) return respond(reply, "只有机器人创建者（Warden Owner）可以在私聊中管理群权限。");
     if (command.name === "help") {
-      return respond(reply, "Warden 私聊管理命令：\n- `warden groups` 查看机器人所在群\n- `warden users <群名>` 查看可使用用户\n- `warden invite <群名>` 生成一次性邀请码\n- `warden add <群名> <姓名>` 直接授权\n- `warden remove <群名> <姓名>` 移除授权\n- `warden whoami` 查看自己的 userid\n\n群或成员重名时，按机器人返回的 ID 重新发送即可。");
+      return respond(reply, "Warden 私聊管理命令：\n- `warden groups` 查看群与当前 Agent\n- `warden agents` 查看可用 Agent\n- `warden use <群名> <Agent名>` 切换群 Agent\n- `warden users <群名>` 查看可使用用户\n- `warden invite <群名>` 生成一次性邀请码\n- `warden add <群名> <姓名>` 直接授权\n- `warden remove <群名> <姓名>` 移除授权\n- `warden whoami` 查看自己的 userid\n\n群或成员重名时，按机器人返回的 ID 重新发送即可。");
+    }
+    if (command.name === "agents") {
+      const lines = Object.entries(config.agents).map(([id, agent]) => `- \`${id}\`：${agent.runtime}${agent.model ? ` / ${agent.model}` : ""}\n  ${agent.workspace}`);
+      return respond(reply, `可用 Agent：\n${lines.join("\n")}`);
     }
     if (command.name === "groups") {
       let sessions: Array<{ id: string; name?: string }> = [];
@@ -254,16 +247,17 @@ export function createApp(config: WardenConfig, dependencies: AppDependencies, s
       const lines = ids.map((id) => {
         const session = byId.get(id);
         const configured = Boolean(config.groups[id]);
-        return `- ${configured ? "[已配置]" : "[未配置 Workspace]"} ${session?.name ?? "未获取群名"}\n  \`${id}\``;
+        const agent = config.groups[id]?.agent;
+        return `- ${configured ? `[${agent}]` : "[未配置 Agent]"} ${session?.name ?? "未获取群名"}\n  \`${id}\``;
       });
       return respond(reply, `机器人最近群会话：\n${lines.length ? lines.join("\n") : "暂无可见群会话"}`);
     }
 
     let group: { id: string; name?: string };
-    let target: { group: { id: string; name?: string }; userReference: string } | undefined;
+    let target: { group: { id: string; name?: string }; value: string } | undefined;
     try {
-      if (command.name === "add" || command.name === "remove") {
-        target = await resolveGroupAndUser(command.arguments);
+      if (command.name === "add" || command.name === "remove" || command.name === "use") {
+        target = await resolveGroupAndValue(command.arguments, command.name === "use" ? " Agent 名" : "用户姓名");
         group = target.group;
       } else {
         group = await resolveGroup(command.arguments.join(" "));
@@ -282,10 +276,18 @@ export function createApp(config: WardenConfig, dependencies: AppDependencies, s
       invites.set(code, { groupId: group.id, expiresAt: Date.now() + 10 * 60_000 });
       return respond(reply, `群“${groupLabel}”的一次性邀请码：\`${code}\`\n\n目标用户可私聊机器人发送 \`warden join ${code}\`，或在该群发送 \`@机器人 warden join ${code}\`。10 分钟内有效。`);
     }
+    if (command.name === "use") {
+      try {
+        await updateAgent(group.id, target!.value);
+        return respond(reply, `群“${groupLabel}”已切换到 Agent \`${target!.value}\`。下一条 @ 消息生效。`);
+      } catch (error) {
+        return respond(reply, error instanceof Error ? error.message : "Agent 切换失败。");
+      }
+    }
 
     let user: DirectoryUser;
     try {
-      user = await resolveUser(target!.userReference);
+      user = await resolveDirectoryUser(target!.value, dependencies.searchUsers);
     } catch (error) {
       return respond(reply, error instanceof Error ? error.message : "用户姓名解析失败。");
     }
@@ -366,7 +368,7 @@ export function createApp(config: WardenConfig, dependencies: AppDependencies, s
     }
   }
 
-  async function process(message: IncomingMention, reply: Reply, workspace: string, context: { lookbackHours: number; maxMessages: number }): Promise<HandleResult> {
+  async function process(message: IncomingMention, reply: Reply, agentId: string, context: { lookbackHours: number; maxMessages: number }): Promise<HandleResult> {
     let phase: FailurePhase = "history";
     try {
       if (shuttingDown) throw new Error("Warden 正在停止");
@@ -374,17 +376,20 @@ export function createApp(config: WardenConfig, dependencies: AppDependencies, s
       const history = await dependencies.history(message.groupId, { ...context, endTime: message.time });
       const fingerprint = historyFingerprint(history, message);
       const prompt = buildContext(history, message, context);
-      const sessionId = await state.session(message.groupId, workspace);
+      const agent = config.agents[agentId];
+      if (!agent) throw new Error("群绑定的 Agent 不存在");
+      const sessionScope = `${agentId}\0${agent.runtime}\0${agent.workspace}`;
+      const sessionId = await state.session(message.groupId, sessionScope);
       phase = "runtime";
       const controller = new AbortController();
       controllers.set(message.groupId, controller);
       let result: RuntimeResult;
       try {
-        result = await dependencies.runtime({ workspace, prompt, ...(sessionId ? { sessionId } : {}), signal: controller.signal });
+        result = await dependencies.runtime({ agentId, ...agent, prompt, ...(sessionId ? { sessionId } : {}), signal: controller.signal });
       } finally {
         if (controllers.get(message.groupId) === controller) controllers.delete(message.groupId);
       }
-      if (result.sessionId) await state.setSession(message.groupId, workspace, result.sessionId);
+      if (result.sessionId) await state.setSession(message.groupId, sessionScope, result.sessionId);
 
       phase = "freshness";
       const latest = await dependencies.history(message.groupId, { ...context, endTime: new Date() });
@@ -411,7 +416,8 @@ export function createApp(config: WardenConfig, dependencies: AppDependencies, s
           ? "missing_mention"
           : "unauthorized_user";
     }
-    return serial(message.groupId, () => process(message, reply, authorization.group.workspace, authorization.group.context));
+    const agentId = authorization.group.agent;
+    return serial(message.groupId, () => process(message, reply, agentId, authorization.group.context));
   }
 
   return {
@@ -434,7 +440,8 @@ export function createApp(config: WardenConfig, dependencies: AppDependencies, s
       } catch {
         return fail(message, reply, "ack");
       }
-      return serial(message.groupId, () => process(message, reply, authorization.group.workspace, authorization.group.context));
+      const agentId = authorization.group.agent;
+      return serial(message.groupId, () => process(message, reply, agentId, authorization.group.context));
     },
     handleDirect,
     replay,

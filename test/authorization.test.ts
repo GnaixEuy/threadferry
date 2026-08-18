@@ -4,12 +4,12 @@ import { authorize } from "../src/authorization.js";
 import type { IncomingMention, WardenConfig } from "../src/types.js";
 
 const config: WardenConfig = {
-  version: 4,
+  version: 5,
   ownerUser: "user_allowed",
+  agents: { default: { workspace: process.cwd(), runtime: "codex" } },
   groups: {
     group_allowed: {
-      workspace: process.cwd(),
-      runtime: "codex",
+      agent: "default",
       allowUsers: ["user_allowed"],
       context: { lookbackHours: 6, maxMessages: 80 },
     },

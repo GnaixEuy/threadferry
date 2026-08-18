@@ -42,9 +42,16 @@ export interface DirectoryUser {
   matchedKeywords?: string[];
 }
 
-export interface GroupConfig {
+export type RuntimeName = "codex" | "pi";
+
+export interface AgentConfig {
   workspace: string;
-  runtime: "codex";
+  runtime: RuntimeName;
+  model?: string;
+}
+
+export interface GroupConfig {
+  agent: string;
   allowUsers: string[];
   context: {
     lookbackHours: number;
@@ -53,8 +60,9 @@ export interface GroupConfig {
 }
 
 export interface WardenConfig {
-  version: 4;
+  version: 5;
   ownerUser: string;
+  agents: Record<string, AgentConfig>;
   groups: Record<string, GroupConfig>;
   security: {
     requireMention: true;
@@ -72,6 +80,13 @@ export type Reply = (content: string, finish?: boolean) => Promise<void>;
 export interface RuntimeResult {
   text: string;
   sessionId?: string;
+}
+
+export interface RuntimeRequest extends AgentConfig {
+  agentId: string;
+  prompt: string;
+  sessionId?: string;
+  signal?: AbortSignal;
 }
 
 export type CommandRunner = (

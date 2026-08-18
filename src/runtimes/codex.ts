@@ -1,6 +1,6 @@
 import { resolveWorkspace } from "../config.js";
 import { CommandExecutionError, runCommand } from "../process.js";
-import type { CommandRunner, RuntimeResult } from "../types.js";
+import type { CommandRunner, RuntimeRequest, RuntimeResult } from "../types.js";
 
 function safeEnvironment(): NodeJS.ProcessEnv {
   const allowed = [
@@ -24,7 +24,7 @@ function messageText(item: unknown): string | undefined {
 }
 
 export async function runCodex(
-  request: { workspace: string; prompt: string; sessionId?: string; signal?: AbortSignal },
+  request: Omit<RuntimeRequest, "agentId" | "runtime">,
   runner: CommandRunner = runCommand,
 ): Promise<RuntimeResult> {
   const workspace = await resolveWorkspace(request.workspace);
@@ -45,6 +45,7 @@ export async function runCodex(
     "--disable", "browser_use",
     "--disable", "computer_use",
     "--disable", "image_generation",
+    ...(request.model ? ["--model", request.model] : []),
     "exec",
     "--json",
     "--ignore-user-config",

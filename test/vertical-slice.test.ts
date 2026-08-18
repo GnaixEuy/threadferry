@@ -9,26 +9,26 @@ import { loadConfig, resolveWorkspace, saveConfig, setupConfig } from "../src/co
 import { fetchWecomHistory } from "../src/history/wecom-cli.js";
 import { CommandExecutionError, runCommand } from "../src/process.js";
 import { runCodex } from "../src/runtimes/codex.js";
+import { allowedReadPath } from "../src/runtimes/pi-readonly-extension.js";
+import { runPi } from "../src/runtimes/pi.js";
 import { WardenState } from "../src/state.js";
 import type { CommandRunner, GroupMessage, IncomingMention, WardenConfig } from "../src/types.js";
+
+function testConfig(workspace = "/workspace", ownerUser = "user", groupId = "group"): WardenConfig {
+  return {
+    version: 5,
+    ownerUser,
+    agents: { default: { workspace, runtime: "codex" } },
+    groups: { [groupId]: { agent: "default", allowUsers: [ownerUser], context: { lookbackHours: 6, maxMessages: 80 } } },
+    security: { requireMention: true, readOnly: true },
+  };
+}
 
 test("mock WeCom -> history -> context -> Codex -> reply vertical slice", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "warden-test-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   const workspace = await realpath(root);
-  const config: WardenConfig = {
-    version: 4,
-    ownerUser: "user_allowed",
-    groups: {
-      group_allowed: {
-        workspace,
-        runtime: "codex",
-        allowUsers: ["user_allowed"],
-        context: { lookbackHours: 6, maxMessages: 80 },
-      },
-    },
-    security: { requireMention: true, readOnly: true },
-  };
+  const config = testConfig(workspace, "user_allowed", "group_allowed");
   const currentTime = new Date("2026-08-18T10:05:00+08:00");
   const history: GroupMessage[] = [
     { senderId: "user-1", senderName: "张三", time: new Date("2026-08-18T10:00:00+08:00"), text: "这个接口有问题" },
@@ -96,28 +96,23 @@ test("mock WeCom -> history -> context -> Codex -> reply vertical slice", async 
 });
 
 test("robot owner manages per-group users in direct chat", async () => {
-  const config: WardenConfig = {
-    version: 4,
-    ownerUser: "owner",
-    groups: {
-      group: {
-        workspace: "/workspace",
-        runtime: "codex",
-        allowUsers: ["owner"],
-        context: { lookbackHours: 6, maxMessages: 80 },
-      },
-    },
-    security: { requireMention: true, readOnly: true },
-  };
+  const config = testConfig("/workspace", "owner");
+  config.agents.reviewer = { workspace: "/review-workspace", runtime: "pi", model: "provider/reviewer" };
   const persisted: Array<{ groupId: string; users: string[] }> = [];
+  const persistedAgents: Array<{ groupId: string; agentId: string }> = [];
+  const runtimeAgents: string[] = [];
+  const runtimeSessions: Array<string | undefined> = [];
   let runtimeCalls = 0;
   const app = createApp(config, {
     history: async () => [],
-    runtime: async () => {
+    runtime: async (request) => {
       runtimeCalls += 1;
-      return { text: "分析结果" };
+      runtimeAgents.push(`${request.agentId}:${request.runtime}:${request.workspace}`);
+      runtimeSessions.push(request.sessionId);
+      return { text: "分析结果", sessionId: `${request.agentId}-session` };
     },
     updateAllowUsers: async (groupId, users) => { persisted.push({ groupId, users: [...users] }); },
+    updateGroupAgent: async (groupId, agentId) => { persistedAgents.push({ groupId, agentId }); },
     listGroups: async () => [
       { id: "group", name: "AI Coding" },
       { id: "group-unconfigured", name: "未配置群" },
@@ -152,9 +147,17 @@ test("robot owner manages per-group users in direct chat", async () => {
 
   assert.equal(await direct("new-user", "warden groups"), "command");
   assert.match(replies.at(-1) ?? "", /只有.*Owner/);
+  assert.equal(await direct("new-user", "warden use AI Coding reviewer"), "command");
+  assert.equal(persistedAgents.length, 0);
   assert.equal(await direct("owner", "warden groups"), "command");
   assert.match(replies.at(-1) ?? "", /AI Coding/);
-  assert.match(replies.at(-1) ?? "", /\[已配置\].*\[未配置 Workspace\]/s);
+  assert.match(replies.at(-1) ?? "", /\[default\].*\[未配置 Agent\]/s);
+  assert.equal(await direct("owner", "warden agents"), "command");
+  assert.match(replies.at(-1) ?? "", /reviewer.*pi.*provider\/reviewer/s);
+  assert.equal(await group("owner", "@机器人 先用默认 Agent 分析"), "handled");
+  assert.equal(runtimeAgents[0], "default:codex:/workspace");
+  assert.equal(await direct("owner", "warden use AI Coding reviewer"), "command");
+  assert.deepEqual(persistedAgents, [{ groupId: "group", agentId: "reviewer" }]);
   assert.equal(await direct("owner", "warden invite AI Coding"), "command");
   const code = replies.at(-1)?.match(/邀请码：`([A-F0-9]{12})`/)?.[1];
   assert.ok(code);
@@ -162,14 +165,17 @@ test("robot owner manages per-group users in direct chat", async () => {
   assert.deepEqual(persisted, [{ groupId: "group", users: ["owner", "new-user"] }]);
 
   assert.equal(await group("new-user", "@机器人 分析"), "handled");
-  assert.equal(runtimeCalls, 1);
+  assert.equal(runtimeCalls, 2);
+  assert.equal(runtimeAgents[1], "reviewer:pi:/review-workspace");
+  assert.deepEqual(runtimeSessions.slice(0, 2), [undefined, undefined]);
   assert.equal(await direct("owner", "warden users AI Coding"), "command");
   assert.match(replies.at(-1) ?? "", /新用户/);
   assert.equal(await direct("owner", "warden add AI Coding 李四"), "command");
   assert.deepEqual(persisted.at(-1), { groupId: "group", users: ["owner", "new-user", "lisi"] });
   assert.match(replies.at(-1) ?? "", /授权 李四/);
   assert.equal(await group("lisi-callback", "@机器人 分析李四的问题"), "handled");
-  assert.equal(runtimeCalls, 2);
+  assert.equal(runtimeCalls, 3);
+  assert.equal(runtimeSessions[2], "reviewer-session");
   const beforeAmbiguous = persisted.length;
   assert.equal(await direct("owner", "warden add AI Coding 张三"), "command");
   assert.equal(persisted.length, beforeAmbiguous);
@@ -187,7 +193,7 @@ test("robot owner manages per-group users in direct chat", async () => {
   assert.match(replies.at(-1) ?? "", /不能移除/);
   assert.equal(await direct("owner", "warden groups", "duplicate-direct"), "command");
   assert.equal(await direct("owner", "warden groups", "duplicate-direct"), "duplicate");
-  assert.equal(runtimeCalls, 2);
+  assert.equal(runtimeCalls, 3);
 });
 
 test("wecom group session listing uses the official message command", async () => {
@@ -237,23 +243,25 @@ test("workspace paths cannot be relative or escape through a symlink", async (t)
   await assert.rejects(resolveWorkspace(link), /符号链接/);
 
   const configPath = join(root, "bad.yaml");
-  await writeFile(configPath, `version: 4\nowner_user: user\ngroups:\n  group:\n    workspace: ../outside\n    allow_users: [user]\n`);
+  await writeFile(configPath, `version: 5\nowner_user: user\nagents:\n  default:\n    runtime: codex\n    workspace: ../outside\ngroups:\n  group:\n    agent: default\n    allow_users: [user]\n`);
   await assert.rejects(loadConfig(configPath), /绝对路径/);
 
   const compactPath = join(root, "compact.yaml");
-  await writeFile(compactPath, setupConfig("group", await realpath(root), "user"));
+  const workspace = await realpath(root);
+  const defaultAgent = { workspace, runtime: "codex" as const };
+  await writeFile(compactPath, setupConfig("group", "default", defaultAgent, "user"));
   const compact = await loadConfig(compactPath);
-  assert.equal(compact.groups.group?.runtime, "codex");
+  assert.equal(compact.agents.default?.runtime, "codex");
   assert.equal(compact.ownerUser, "user");
   assert.deepEqual(compact.groups.group?.context, { lookbackHours: 6, maxMessages: 80 });
   assert.deepEqual(compact.groups.group?.allowUsers, ["user"]);
 
   const mergedPath = join(root, "merged.yaml");
-  await writeFile(mergedPath, setupConfig("group", await realpath(root), "user", compact));
+  await writeFile(mergedPath, setupConfig("group", "default", defaultAgent, "user", compact));
   const merged = await loadConfig(mergedPath);
   assert.deepEqual(merged.groups.group?.allowUsers, ["user"]);
-  assert.throws(() => setupConfig("group", compact.groups.group!.workspace, "user-2", compact), /Owner/);
-  assert.throws(() => setupConfig("group", "/different", "user", compact), /已绑定其他 Workspace/);
+  assert.throws(() => setupConfig("group", "default", defaultAgent, "user-2", compact), /Owner/);
+  assert.throws(() => setupConfig("group", "other", defaultAgent, "user", compact), /已绑定其他 Agent/);
 
   compact.groups.group!.allowUsers.push("user-2");
   await saveConfig(compactPath, compact);
@@ -268,18 +276,13 @@ test("legacy and extra configuration fields are rejected", async (t) => {
   await assert.rejects(loadConfig(legacyPath), /旧版配置不再兼容/);
 
   const extraPath = join(root, "extra.yaml");
-  await writeFile(extraPath, `version: 4\nowner_user: user\ngroups:\n  group:\n    workspace: ${JSON.stringify(await realpath(root))}\n    allow_users: [user]\n    runtime: codex\n`);
+  await writeFile(extraPath, `version: 5\nowner_user: user\nagents:\n  default:\n    runtime: codex\n    workspace: ${JSON.stringify(await realpath(root))}\ngroups:\n  group:\n    agent: default\n    allow_users: [user]\n    runtime: codex\n`);
   await assert.rejects(loadConfig(extraPath), /不支持字段: runtime/);
 });
 
 test("a newer group message makes the completed analysis stale", async () => {
   const now = new Date("2026-08-18T10:05:00+08:00");
-  const config: WardenConfig = {
-    version: 4,
-    ownerUser: "user",
-    groups: { group: { workspace: "/workspace", runtime: "codex", allowUsers: ["user"], context: { lookbackHours: 6, maxMessages: 80 } } },
-    security: { requireMention: true, readOnly: true },
-  };
+  const config = testConfig();
   let reads = 0;
   const app = createApp(config, {
     history: async () => ++reads === 1 ? [] : [{ senderId: "other", time: new Date(now.getTime() + 1000), text: "新消息" }],
@@ -298,12 +301,7 @@ test("a newer group message makes the completed analysis stale", async () => {
 });
 
 test("same-group turns run serially and queued users get immediate feedback", async () => {
-  const config: WardenConfig = {
-    version: 4,
-    ownerUser: "user",
-    groups: { group: { workspace: "/workspace", runtime: "codex", allowUsers: ["user"], context: { lookbackHours: 6, maxMessages: 80 } } },
-    security: { requireMention: true, readOnly: true },
-  };
+  const config = testConfig();
   let releaseFirst!: () => void;
   const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve; });
   let calls = 0;
@@ -340,12 +338,7 @@ test("same-group turns run serially and queued users get immediate feedback", as
 });
 
 test("runtime failures return and persist a redacted error id", async () => {
-  const config: WardenConfig = {
-    version: 4,
-    ownerUser: "user",
-    groups: { group: { workspace: "/workspace", runtime: "codex", allowUsers: ["user"], context: { lookbackHours: 6, maxMessages: 80 } } },
-    security: { requireMention: true, readOnly: true },
-  };
+  const config = testConfig();
   const state = new WardenState();
   const errors: Array<{ errorId: string; phase: string }> = [];
   const app = createApp(config, {
@@ -398,12 +391,7 @@ test("wecom history uses chat.messages.list arguments and keeps attachment metad
 test("same-second history changes are detected by fingerprint", async () => {
   const now = new Date("2026-08-18T10:05:00+08:00");
   const base: GroupMessage = { senderId: "first", time: new Date(now.getTime() - 60_000), text: "原消息" };
-  const config: WardenConfig = {
-    version: 4,
-    ownerUser: "user",
-    groups: { group: { workspace: "/workspace", runtime: "codex", allowUsers: ["user"], context: { lookbackHours: 6, maxMessages: 80 } } },
-    security: { requireMention: true, readOnly: true },
-  };
+  const config = testConfig();
   let reads = 0;
   const app = createApp(config, {
     history: async () => ++reads === 1 ? [base] : [base, { senderId: "other", time: now, text: "同一秒的新消息" }],
@@ -429,12 +417,7 @@ test("an interrupted inbox is replayed after restart and final content is remove
   const restarted = new WardenState(statePath);
   const [pending] = await restarted.recoverPending();
   assert.ok(pending);
-  const config: WardenConfig = {
-    version: 4,
-    ownerUser: "user",
-    groups: { group: { workspace: "/workspace", runtime: "codex", allowUsers: ["user"], context: { lookbackHours: 6, maxMessages: 80 } } },
-    security: { requireMention: true, readOnly: true },
-  };
+  const config = testConfig();
   const replies: string[] = [];
   const app = createApp(config, {
     history: async () => [],
@@ -449,12 +432,7 @@ test("an interrupted inbox is replayed after restart and final content is remove
 });
 
 test("a failed callback delivery remains in the durable outbox", async () => {
-  const config: WardenConfig = {
-    version: 4,
-    ownerUser: "user",
-    groups: { group: { workspace: "/workspace", runtime: "codex", allowUsers: ["user"], context: { lookbackHours: 6, maxMessages: 80 } } },
-    security: { requireMention: true, readOnly: true },
-  };
+  const config = testConfig();
   const state = new WardenState();
   const app = createApp(config, { history: async () => [], runtime: async () => ({ text: "待补发结果" }) }, state);
   const result = await app.handle({
@@ -505,13 +483,50 @@ test("Codex starts a fresh session only when a saved session is definitely missi
   assert.deepEqual(result, { text: "新会话结果", sessionId: "new-session" });
 });
 
-test("running Codex work can be cancelled during shutdown", async () => {
-  const config: WardenConfig = {
-    version: 4,
-    ownerUser: "user",
-    groups: { group: { workspace: "/workspace", runtime: "codex", allowUsers: ["user"], context: { lookbackHours: 6, maxMessages: 80 } } },
-    security: { requireMention: true, readOnly: true },
+test("Pi uses only guarded read tools and parses its machine-readable result", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "warden-pi-test-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const workspace = await realpath(root);
+  let received: { command: string; args: string[]; cwd?: string; input?: string; secret?: string } | undefined;
+  const runner: CommandRunner = async (command, args, options) => {
+    received = { command, args, cwd: options?.cwd, input: options?.input, secret: options?.env?.WARDEN_WECOM_BOT_SECRET };
+    return {
+      stdout: `${JSON.stringify({ type: "session", id: "pi-session" })}\n${JSON.stringify({
+        type: "message_end",
+        message: { role: "assistant", content: [{ type: "text", text: "Pi 只读分析" }] },
+      })}\n`,
+      stderr: "",
+    };
   };
+  const result = await runPi({ agentId: "reviewer", workspace, prompt: "分析", model: "provider/model" }, runner, join(root, "sessions"));
+  assert.deepEqual(result, { text: "Pi 只读分析", sessionId: "pi-session" });
+  assert.equal(received?.command, "pi");
+  assert.equal(received?.cwd, workspace);
+  assert.equal(received?.input, "分析");
+  assert.equal(received?.secret, undefined);
+  assert.equal(received?.args[received.args.indexOf("--tools") + 1], "read,ls");
+  for (const flag of ["--no-extensions", "--extension", "--no-skills", "--no-context-files", "--no-approve"]) {
+    assert.ok(received?.args.includes(flag));
+  }
+  assert.equal(received?.args[received.args.indexOf("--model") + 1], "provider/model");
+});
+
+test("Pi read guard rejects workspace escapes, symlinks, and sensitive files", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "warden-pi-guard-"));
+  const outside = await mkdtemp(join(tmpdir(), "warden-pi-outside-"));
+  t.after(() => Promise.all([rm(root, { recursive: true, force: true }), rm(outside, { recursive: true, force: true })]));
+  await writeFile(join(root, "source.ts"), "export {};\n");
+  await writeFile(join(root, ".env"), "SECRET=hidden\n");
+  await symlink(outside, join(root, "outside"), "dir");
+  assert.equal(allowedReadPath(root, "source.ts"), true);
+  assert.equal(allowedReadPath(root, "../outside"), false);
+  assert.equal(allowedReadPath(root, "~/.ssh/id_ed25519"), false);
+  assert.equal(allowedReadPath(root, "outside"), false);
+  assert.equal(allowedReadPath(root, ".env"), false);
+});
+
+test("running Codex work can be cancelled during shutdown", async () => {
+  const config = testConfig();
   let started!: () => void;
   const running = new Promise<void>((resolve) => { started = resolve; });
   const app = createApp(config, {

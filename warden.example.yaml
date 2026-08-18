@@ -1,9 +1,18 @@
-version: 4
+version: 5
 
 owner_user: "user_owner"
 
+agents:
+  default:
+    runtime: "codex"
+    workspace: "/absolute/path/to/project"
+  reviewer:
+    runtime: "pi"
+    workspace: "/absolute/path/to/another-project"
+    model: "provider/model"
+
 groups:
   "group_xxx":
-    workspace: "/absolute/path/to/project"
+    agent: "default"
     allow_users:
       - "user_owner"

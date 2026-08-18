@@ -2,9 +2,11 @@ import { randomBytes } from "node:crypto";
 import { chmod, lstat, mkdir, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { parse, stringify } from "yaml";
-import type { GroupConfig, WardenConfig } from "./types.js";
+import type { AgentConfig, GroupConfig, RuntimeName, WardenConfig } from "./types.js";
 
 const USER_ID = /^[A-Za-z0-9_@.-]{1,512}$/;
+const AGENT_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
+const RUNTIMES = new Set<RuntimeName>(["codex", "pi"]);
 
 function object(value: unknown, name: string): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
@@ -32,30 +34,62 @@ export async function resolveWorkspace(input: string): Promise<string> {
   return canonical;
 }
 
-export function setupConfig(groupId: string, workspace: string, userId: string, current?: WardenConfig): string {
+function validateAgent(agentId: string, agent: AgentConfig): void {
+  if (!AGENT_ID.test(agentId)) throw new Error("Agent 名只能包含字母、数字、下划线和连字符，最长 64 个字符");
+  if (!RUNTIMES.has(agent.runtime)) throw new Error(`Agent ${agentId} 的 runtime 仅支持 codex 或 pi`);
+  if (agent.model !== undefined && (!agent.model.trim() || agent.model.length > 256 || /[\r\n]/.test(agent.model))) {
+    throw new Error(`Agent ${agentId} 的 model 无效`);
+  }
+}
+
+export function setupConfig(
+  groupId: string,
+  agentId: string,
+  agent: AgentConfig,
+  userId: string,
+  current?: WardenConfig,
+): string {
   if (!USER_ID.test(userId)) throw new Error("企业微信回调 userid 无效");
+  validateAgent(agentId, agent);
   const existing = current?.groups[groupId];
-  if (existing && existing.workspace !== workspace) {
-    throw new Error("该群已绑定其他 Workspace；请先明确移除原绑定，不会自动改写");
+  if (existing && existing.agent !== agentId) {
+    throw new Error("该群已绑定其他 Agent；请通过 Owner 私聊命令切换，不会自动改写");
   }
   if (current && current.ownerUser !== userId) throw new Error("只有机器人 Warden Owner 可以新增群绑定");
+  const configuredAgent = current?.agents[agentId];
+  if (configuredAgent && (configuredAgent.workspace !== agent.workspace
+    || configuredAgent.runtime !== agent.runtime || configuredAgent.model !== agent.model)) {
+    throw new Error(`Agent ${agentId} 已存在且配置不同；请使用 warden agent add 新名称`);
+  }
+  const agents = { ...(current?.agents ?? {}), [agentId]: agent };
   const groups = Object.fromEntries(Object.entries(current?.groups ?? {}).map(([id, group]) => [id, {
-    workspace: group.workspace,
+    agent: group.agent,
     allow_users: group.allowUsers,
   }]));
   groups[groupId] = {
-    workspace,
+    agent: agentId,
     allow_users: [...new Set([...(existing?.allowUsers ?? []), current?.ownerUser ?? userId])],
   };
-  return stringify({ version: 4, owner_user: current?.ownerUser ?? userId, groups });
+  return stringify({ version: 5, owner_user: current?.ownerUser ?? userId, agents, groups });
 }
 
 export function configText(config: WardenConfig): string {
+  const agents = Object.fromEntries(Object.entries(config.agents).map(([id, agent]) => [id, {
+    runtime: agent.runtime,
+    workspace: agent.workspace,
+    ...(agent.model ? { model: agent.model } : {}),
+  }]));
   const groups = Object.fromEntries(Object.entries(config.groups).map(([id, group]) => [id, {
-    workspace: group.workspace,
+    agent: group.agent,
     allow_users: group.allowUsers,
   }]));
-  return stringify({ version: 4, owner_user: config.ownerUser, groups });
+  return stringify({ version: 5, owner_user: config.ownerUser, agents, groups });
+}
+
+export function addAgent(config: WardenConfig, agentId: string, agent: AgentConfig): WardenConfig {
+  validateAgent(agentId, agent);
+  if (config.agents[agentId]) throw new Error(`Agent ${agentId} 已存在`);
+  return { ...config, agents: { ...config.agents, [agentId]: agent } };
 }
 
 export async function saveConfig(path: string, config: WardenConfig): Promise<void> {
@@ -91,19 +125,39 @@ export async function loadConfig(path: string): Promise<WardenConfig> {
   }
 
   const root = object(document, "配置");
-  if (root.version !== 4) throw new Error("配置 version 必须为 4；旧版配置不再兼容，请重新运行 warden setup");
-  const unsupportedRootKeys = Object.keys(root).filter((key) => !["version", "owner_user", "groups"].includes(key));
+  if (root.version !== 5) throw new Error("配置 version 必须为 5；旧版配置不再兼容，请重新运行 warden setup");
+  const unsupportedRootKeys = Object.keys(root).filter((key) => !["version", "owner_user", "agents", "groups"].includes(key));
   if (unsupportedRootKeys.length > 0) throw new Error(`配置包含不支持字段: ${unsupportedRootKeys.join(", ")}`);
   if (typeof root.owner_user !== "string" || !USER_ID.test(root.owner_user)) throw new Error("配置缺少有效的 owner_user");
+  const rawAgents = object(root.agents, "agents");
+  if (Object.keys(rawAgents).length === 0) throw new Error("至少需要配置一个 Agent");
+  const agents: Record<string, AgentConfig> = {};
+  for (const [agentId, value] of Object.entries(rawAgents)) {
+    const agent = object(value, `Agent ${agentId}`);
+    const unsupportedAgentKeys = Object.keys(agent).filter((key) => !["runtime", "workspace", "model"].includes(key));
+    if (unsupportedAgentKeys.length > 0) throw new Error(`Agent ${agentId} 包含不支持字段: ${unsupportedAgentKeys.join(", ")}`);
+    if (typeof agent.runtime !== "string" || typeof agent.workspace !== "string") {
+      throw new Error(`Agent ${agentId} 缺少 runtime 或 workspace`);
+    }
+    const configured: AgentConfig = {
+      runtime: agent.runtime as RuntimeName,
+      workspace: await resolveWorkspace(agent.workspace),
+      ...(typeof agent.model === "string" ? { model: agent.model } : {}),
+    };
+    if (agent.model !== undefined && typeof agent.model !== "string") throw new Error(`Agent ${agentId} 的 model 必须是字符串`);
+    validateAgent(agentId, configured);
+    agents[agentId] = configured;
+  }
+
   const rawGroups = object(root.groups, "groups");
   if (Object.keys(rawGroups).length === 0) throw new Error("至少需要配置一个企业微信群");
 
   const groups: Record<string, GroupConfig> = {};
   for (const [groupId, value] of Object.entries(rawGroups)) {
     const group = object(value, `群 ${groupId}`);
-    const unsupportedGroupKeys = Object.keys(group).filter((key) => !["workspace", "allow_users"].includes(key));
+    const unsupportedGroupKeys = Object.keys(group).filter((key) => !["agent", "allow_users"].includes(key));
     if (unsupportedGroupKeys.length > 0) throw new Error(`群 ${groupId} 包含不支持字段: ${unsupportedGroupKeys.join(", ")}`);
-    if (typeof group.workspace !== "string") throw new Error(`群 ${groupId} 缺少 workspace`);
+    if (typeof group.agent !== "string" || !agents[group.agent]) throw new Error(`群 ${groupId} 引用了不存在的 Agent`);
     if (!Array.isArray(group.allow_users) || !group.allow_users.every((user) => typeof user === "string" && USER_ID.test(user))) {
       throw new Error(`群 ${groupId} 的 allow_users 必须是非空字符串数组`);
     }
@@ -111,12 +165,11 @@ export async function loadConfig(path: string): Promise<WardenConfig> {
     if (group.allow_users.length > 256) throw new Error(`群 ${groupId} 的 allow_users 超过 256 人上限`);
     if (!group.allow_users.includes(root.owner_user)) throw new Error(`群 ${groupId} 的 allow_users 必须包含机器人 owner_user`);
     groups[groupId] = {
-      workspace: await resolveWorkspace(group.workspace),
-      runtime: "codex",
+      agent: group.agent,
       allowUsers: [...new Set(group.allow_users as string[])],
       context: { lookbackHours: 6, maxMessages: 80 },
     };
   }
 
-  return { version: 4, ownerUser: root.owner_user, groups, security: { requireMention: true, readOnly: true } };
+  return { version: 5, ownerUser: root.owner_user, agents, groups, security: { requireMention: true, readOnly: true } };
 }

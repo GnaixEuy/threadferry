@@ -436,10 +436,10 @@ export class WardenState {
     });
   }
 
-  async session(groupId: string, workspace: string): Promise<string | undefined> {
+  async session(groupId: string, scope: string): Promise<string | undefined> {
     return this.exclusive(async () => {
       await this.load();
-      const current = this.data.sessions.find((item) => item.group === key(groupId) && item.workspace === key(workspace));
+      const current = this.data.sessions.find((item) => item.group === key(groupId) && item.workspace === key(scope));
       if (!current) return undefined;
       if (Date.now() - Date.parse(current.updatedAt) <= SESSION_TTL_MS) return current.sessionId;
       this.data.sessions = this.data.sessions.filter((item) => item !== current);
@@ -448,13 +448,13 @@ export class WardenState {
     });
   }
 
-  async setSession(groupId: string, workspace: string, sessionId: string): Promise<void> {
+  async setSession(groupId: string, scope: string, sessionId: string): Promise<void> {
     await this.exclusive(async () => {
-      if (!SESSION_ID.test(sessionId)) throw new Error("Codex Session ID 无效");
+      if (!SESSION_ID.test(sessionId)) throw new Error("Runtime Session ID 无效");
       await this.load();
       const group = key(groupId);
-      const workspaceKey = key(workspace);
-      const current = this.data.sessions.find((item) => item.group === group);
+      const workspaceKey = key(scope);
+      const current = this.data.sessions.find((item) => item.group === group && item.workspace === workspaceKey);
       const next = { group, workspace: workspaceKey, sessionId, updatedAt: new Date().toISOString() };
       if (current) Object.assign(current, next);
       else this.data.sessions.push(next);
