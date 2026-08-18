@@ -5,7 +5,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { createApp } from "../src/app.js";
 import { listWecomGroups, searchWecomUsers, sendWecomReply } from "../src/channels/wecom.js";
-import { loadConfig, resolveWorkspace, saveConfig, setupConfig } from "../src/config.js";
+import { loadConfig, onboardingDefaults, resolveWorkspace, saveConfig, setupConfig } from "../src/config.js";
 import { fetchWecomHistory } from "../src/history/wecom-cli.js";
 import { CommandExecutionError, runCommand } from "../src/process.js";
 import { runCodex } from "../src/runtimes/codex.js";
@@ -266,6 +266,30 @@ test("workspace paths cannot be relative or escape through a symlink", async (t)
   compact.groups.group!.allowUsers.push("user-2");
   await saveConfig(compactPath, compact);
   assert.deepEqual((await loadConfig(compactPath)).groups.group?.allowUsers, ["user", "user-2"]);
+});
+
+test("agent names support Chinese and spaces while onboarding uses the invocation directory", () => {
+  const current = testConfig("/saved/workspace");
+  const defaults = onboardingDefaults(current, "/current/invocation");
+
+  assert.deepEqual(defaults, {
+    agentId: "default",
+    runtime: "codex",
+    workspace: "/current/invocation",
+    model: undefined,
+  });
+  assert.doesNotThrow(() => setupConfig("group", "代码审查 Agent", {
+    workspace: "/current/invocation",
+    runtime: "codex",
+  }, "user"));
+  assert.throws(() => setupConfig("group", " Agent", {
+    workspace: "/current/invocation",
+    runtime: "codex",
+  }, "user"), /Agent 名/);
+  assert.throws(() => setupConfig("group", "超".repeat(65), {
+    workspace: "/current/invocation",
+    runtime: "codex",
+  }, "user"), /1-64/);
 });
 
 test("legacy and extra configuration fields are rejected", async (t) => {
@@ -546,6 +570,31 @@ test("running Codex work can be cancelled during shutdown", async () => {
   await running;
   await app.shutdown();
   assert.equal(await result, "failed");
+});
+
+test("running work finishes during an automatic-update drain", async () => {
+  const config = testConfig();
+  let started!: () => void;
+  let finish!: (result: { text: string }) => void;
+  const running = new Promise<void>((resolve) => { started = resolve; });
+  const app = createApp(config, {
+    history: async () => [],
+    runtime: () => new Promise((resolve) => {
+      finish = resolve;
+      started();
+    }),
+  });
+  const result = app.handle({
+    msgId: "drain-1", groupId: "group", senderId: "user", time: new Date(), text: "@ThreadFerry 分析", mentioned: true,
+  }, async () => undefined);
+  await running;
+  let drained = false;
+  const drain = app.shutdown(false).then(() => { drained = true; });
+  await Promise.resolve();
+  assert.equal(drained, false);
+  finish({ text: "done" });
+  await drain;
+  assert.equal(await result, "handled");
 });
 
 test("command runner aborts the child process", async () => {

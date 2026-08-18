@@ -450,9 +450,11 @@ export function createApp(config: ThreadFerryConfig, dependencies: AppDependenci
       controller?.abort();
       return Boolean(controller);
     },
-    async shutdown(): Promise<void> {
-      shuttingDown = true;
-      for (const controller of controllers.values()) controller.abort();
+    async shutdown(cancel = true): Promise<void> {
+      if (cancel) {
+        shuttingDown = true;
+        for (const controller of controllers.values()) controller.abort();
+      }
       await Promise.all([...groupTails.values()]);
     },
   };
