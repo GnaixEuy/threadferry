@@ -5,7 +5,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { createApp } from "../src/app.js";
 import { listWecomGroups, searchWecomUsers, sendWecomReply } from "../src/channels/wecom.js";
-import { loadConfig, onboardingDefaults, resolveWorkspace, saveConfig, setupConfig } from "../src/config.js";
+import { loadConfig, onboardingDefaults, pairConfig, resolveWorkspace, saveConfig, setupConfig } from "../src/config.js";
 import { fetchWecomHistory } from "../src/history/wecom-cli.js";
 import { CommandExecutionError, runCommand } from "../src/process.js";
 import { runCodex } from "../src/runtimes/codex.js";
@@ -100,8 +100,11 @@ test("robot owner manages per-group users in direct chat", async () => {
   config.agents.reviewer = { workspace: "/review-workspace", runtime: "pi", model: "provider/reviewer" };
   const persisted: Array<{ groupId: string; users: string[] }> = [];
   const persistedAgents: Array<{ groupId: string; agentId: string }> = [];
+  const boundGroups: Array<{ groupId: string; agentId: string }> = [];
   const runtimeAgents: string[] = [];
   const runtimeSessions: Array<string | undefined> = [];
+  const runtimePrompts: string[] = [];
+  let searchCalls = 0;
   let runtimeCalls = 0;
   const app = createApp(config, {
     history: async () => [],
@@ -109,24 +112,29 @@ test("robot owner manages per-group users in direct chat", async () => {
       runtimeCalls += 1;
       runtimeAgents.push(`${request.agentId}:${request.runtime}:${request.workspace}`);
       runtimeSessions.push(request.sessionId);
+      runtimePrompts.push(request.prompt);
       return { text: "分析结果", sessionId: `${request.agentId}-session` };
     },
     updateAllowUsers: async (groupId, users) => { persisted.push({ groupId, users: [...users] }); },
     updateGroupAgent: async (groupId, agentId) => { persistedAgents.push({ groupId, agentId }); },
+    bindGroup: async (groupId, agentId) => { boundGroups.push({ groupId, agentId }); },
     listGroups: async () => [
       { id: "group", name: "AI Coding" },
       { id: "group-unconfigured", name: "未配置群" },
     ],
-    searchUsers: async (keywords) => [
-      { id: "owner-directory", name: "创建者", callbackId: "owner" },
-      { id: "new-user", name: "新用户" },
-      { id: "lisi", name: "李四", callbackId: "lisi-callback" },
-      { id: "zhangsan-1", name: "张三", departments: ["研发一部"] },
-      { id: "zhangsan-2", name: "张三", departments: ["研发二部"] },
-    ].flatMap((user) => {
-      const matchedKeywords = keywords.filter((keyword) => user.id === keyword || user.name.includes(keyword) || user.callbackId === keyword);
-      return matchedKeywords.length ? [{ ...user, matchedKeywords }] : [];
-    }),
+    searchUsers: async (keywords) => {
+      searchCalls += 1;
+      return [
+        { id: "owner-directory", name: "创建者", callbackId: "owner" },
+        { id: "new-user", name: "新用户" },
+        { id: "lisi", name: "李四", callbackId: "lisi-callback" },
+        { id: "zhangsan-1", name: "张三", departments: ["研发一部"] },
+        { id: "zhangsan-2", name: "张三", departments: ["研发二部"] },
+      ].flatMap((user) => {
+        const matchedKeywords = keywords.filter((keyword) => user.id === keyword || user.name.includes(keyword) || user.callbackId === keyword);
+        return matchedKeywords.length ? [{ ...user, matchedKeywords }] : [];
+      });
+    },
   });
   const replies: string[] = [];
   let sequence = 0;
@@ -154,6 +162,10 @@ test("robot owner manages per-group users in direct chat", async () => {
   assert.match(replies.at(-1) ?? "", /\[default\].*\[未配置 Agent\]/s);
   assert.equal(await direct("owner", "threadferry agents"), "command");
   assert.match(replies.at(-1) ?? "", /reviewer.*pi.*provider\/reviewer/s);
+  assert.equal(await direct("owner", "threadferry bind 未配置群 reviewer"), "command");
+  assert.deepEqual(boundGroups, [{ groupId: "group-unconfigured", agentId: "reviewer" }]);
+  assert.equal(config.groups["group-unconfigured"]?.agent, "reviewer");
+  assert.equal(searchCalls, 0);
   assert.equal(await group("owner", "@机器人 先用默认 Agent 分析"), "handled");
   assert.equal(runtimeAgents[0], "default:codex:/workspace");
   assert.equal(await direct("owner", "threadferry use AI Coding reviewer"), "command");
@@ -191,9 +203,20 @@ test("robot owner manages per-group users in direct chat", async () => {
   assert.match(replies.at(-1) ?? "", /new-user/);
   assert.equal(await direct("owner", "threadferry remove AI Coding 创建者"), "command");
   assert.match(replies.at(-1) ?? "", /不能移除/);
+  const beforeDirectSearch = searchCalls;
+  assert.equal(await direct("new-user", "帮我分析私聊问题"), "command");
+  assert.match(replies.at(-1) ?? "", /只有.*Owner/);
+  assert.equal(await direct("owner", "帮我分析私聊问题"), "handled");
+  assert.equal(runtimeCalls, 4);
+  assert.equal(runtimeAgents[3], "default:codex:/workspace");
+  assert.equal(runtimeSessions[3], undefined);
+  assert.match(runtimePrompts[3] ?? "", /UNTRUSTED_DIRECT_HISTORY.*企业微信私聊/s);
+  assert.equal(await direct("owner", "继续分析私聊问题"), "handled");
+  assert.equal(runtimeSessions[4], "default-session");
+  assert.equal(searchCalls, beforeDirectSearch);
   assert.equal(await direct("owner", "threadferry groups", "duplicate-direct"), "command");
   assert.equal(await direct("owner", "threadferry groups", "duplicate-direct"), "duplicate");
-  assert.equal(runtimeCalls, 3);
+  assert.equal(runtimeCalls, 5);
 });
 
 test("wecom group session listing uses the official message command", async () => {
@@ -264,6 +287,12 @@ test("workspace paths cannot be relative or escape through a symlink", async (t)
   const pairedByCode = await loadConfig(mergedPath);
   assert.equal(pairedByCode.ownerUser, "user");
   assert.deepEqual(pairedByCode.groups["group-2"]?.allowUsers, ["user"]);
+  await writeFile(mergedPath, pairConfig("default", defaultAgent, "user-2", compact));
+  const pairedDirectly = await loadConfig(mergedPath);
+  assert.equal(pairedDirectly.ownerUser, "user-2");
+  assert.deepEqual(pairedDirectly.groups.group?.allowUsers, ["user-2"]);
+  await writeFile(mergedPath, pairConfig("default", defaultAgent, "user-3"));
+  assert.deepEqual((await loadConfig(mergedPath)).groups, {});
   assert.throws(() => setupConfig("group", "other", defaultAgent, "user", compact), /已绑定其他 Agent/);
 
   compact.groups.group!.allowUsers.push("user-2");

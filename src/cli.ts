@@ -10,7 +10,7 @@ import { createInterface } from "node:readline/promises";
 import { createApp } from "./app.js";
 import { startAdminServer, type ConfigUpdater } from "./admin.js";
 import { listWecomGroups, searchWecomUsers, sendWecomReply, startWecomChannel } from "./channels/wecom.js";
-import { addAgent, loadConfig, onboardingDefaults, resolveWorkspace, saveConfig, setupConfig } from "./config.js";
+import { addAgent, loadConfig, onboardingDefaults, pairConfig, resolveWorkspace, saveConfig } from "./config.js";
 import { fetchWecomHistory } from "./history/wecom-cli.js";
 import { runCommand } from "./process.js";
 import { runCodex } from "./runtimes/codex.js";
@@ -20,7 +20,7 @@ import type { GroupMessage, IncomingMention, RuntimeName, ThreadFerryConfig } fr
 import { findUpdate, installUpdate } from "./update.js";
 import { loadWecomCliCredentials } from "./wecom-credentials.js";
 
-const VERSION = "0.11.0";
+const VERSION = "0.12.0";
 const UPDATE_INTERVAL_MS = 6 * 60 * 60 * 1_000;
 const USAGE = `ThreadFerry ${VERSION}
 
@@ -257,14 +257,15 @@ async function preflightReal(config: ThreadFerryConfig): Promise<{ botId: string
 }
 
 async function setup(configPath: string, workspaceInput: string, agentId: string, runtime: RuntimeName, model?: string): Promise<void> {
+  if (!process.stdin.isTTY || !process.stdout.isTTY) throw new Error("threadferry setup 需要交互式终端确认私聊身份");
   const target = resolve(configPath);
   const workspace = await resolveWorkspace(workspaceInput);
   if (existsSync(target)) await loadConfig(target);
   const credentials = await botCredentials();
   await preflightDependencies(new Set([runtime]));
   const code = randomBytes(8).toString("hex");
-  console.log(`请在目标企业微信群发送：@机器人 threadferry setup ${code}`);
-  console.log("等待配对消息；配置不会保存机器人凭据。");
+  console.log(`请私聊机器人发送：threadferry pair ${code}`);
+  console.log("等待私聊配对消息；收到后还需要在本机终端确认。配置不会保存机器人凭据。");
 
   await new Promise<void>((done, reject) => {
     let client: ReturnType<typeof startWecomChannel> | undefined;
@@ -280,20 +281,33 @@ async function setup(configPath: string, workspaceInput: string, agentId: string
       done();
     };
     client = startWecomChannel(credentials, async (event, reply) => {
-      if (event.chatType !== "group") {
-        await reply("ThreadFerry 群配对必须在目标企业微信群中完成。", true).catch(() => undefined);
+      if (event.chatType !== "single") {
+        await reply("请私聊机器人完成 ThreadFerry Owner 配对。", true).catch(() => undefined);
         return;
       }
       const message = event.message;
-      if (!message.text.includes(`threadferry setup ${code}`)) {
-        console.log("[setup] 收到群内 @，但配对码不匹配");
+      if (!message.text.includes(`threadferry pair ${code}`)) {
+        console.log("[setup] 收到私聊消息，但配对码不匹配");
         return;
       }
       if (claimed) return;
       claimed = true;
       try {
+        const confirmation = createInterface({ input: process.stdin, output: process.stdout });
+        let approved: boolean;
+        try {
+          const answer = (await confirmation.question(`收到 userid ${message.senderId} 的私聊配对请求，确认为 ThreadFerry Owner？[y/N]: `)).trim().toLowerCase();
+          approved = answer === "y" || answer === "yes";
+        } finally {
+          confirmation.close();
+        }
+        if (!approved) {
+          claimed = false;
+          await reply("本机终端未确认本次配对。", true).catch(() => undefined);
+          return;
+        }
         const current = existsSync(target) ? await loadConfig(target) : undefined;
-        const content = setupConfig(message.groupId, agentId, { workspace, runtime, ...(model ? { model } : {}) }, message.senderId, current);
+        const content = pairConfig(agentId, { workspace, runtime, ...(model ? { model } : {}) }, message.senderId, current);
         const directory = dirname(target);
         await mkdir(directory, { recursive: true });
         const temporary = join(directory, `.${basename(target)}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`);
@@ -303,7 +317,7 @@ async function setup(configPath: string, workspaceInput: string, agentId: string
         } finally {
           await rm(temporary, { force: true });
         }
-        await reply("ThreadFerry 配对完成。请在运行 ThreadFerry 的机器上执行 `threadferry doctor`。").catch(() => undefined);
+        await reply("ThreadFerry Owner 配对完成。启动服务后可直接私聊 Agent；群绑定可私聊发送 `threadferry bind <群名或ID> <Agent名>`。").catch(() => undefined);
         console.log(`配置已更新: ${target}`);
         finish();
       } catch (error) {
@@ -344,7 +358,7 @@ async function onboard(configOption?: string): Promise<void> {
     prompt.close();
   }
 
-  console.log("[2/4] 检查依赖并配对企业微信群");
+  console.log("[2/4] 检查依赖并通过私聊配对 Owner");
   await setup(configPath, workspace, agentId, runtime, model);
   console.log("[3/4] 运行环境诊断");
   if (!(await doctor(configPath))) {
@@ -369,7 +383,6 @@ async function onboard(configOption?: string): Promise<void> {
 
 async function doctor(configPath?: string): Promise<boolean> {
   const checks: Array<{ ok: boolean; message: string }> = [];
-  let configuredOwner: string | undefined;
   let configuredRuntimes = new Set<RuntimeName>(["codex"]);
   const major = Number(process.versions.node.split(".")[0]);
   checks.push({ ok: major >= 22, message: major >= 22 ? `Node ${process.version}` : `Node ${process.version}；请安装 Node.js 22+ LTS` });
@@ -380,7 +393,6 @@ async function doctor(configPath?: string): Promise<boolean> {
   } else {
     try {
       const loaded = await loadConfig(chosenConfig);
-      configuredOwner = loaded.ownerUser;
       configuredRuntimes = new Set(Object.values(loaded.agents).map((agent) => agent.runtime));
       checks.push({ ok: true, message: `配置有效：${Object.keys(loaded.agents).length} 个 Agent，${Object.keys(loaded.groups).length} 个群` });
     } catch (error) {
@@ -409,20 +421,6 @@ async function doctor(configPath?: string): Promise<boolean> {
     try {
       await runCommand("wecom-cli", ["identity", "whoami", "--json", "{}"], { timeoutMs: 30_000 });
       checks.push({ ok: true, message: "wecom-cli 身份授权有效（详情未显示）" });
-      if (configuredOwner) {
-        try {
-          const users = await searchWecomUsers([configuredOwner]);
-          const mapped = users.some((user) => user.matchedKeywords?.includes(configuredOwner!));
-          checks.push({
-            ok: mapped,
-            message: mapped
-              ? "企业微信通讯录姓名解析与回调身份映射有效（详情未显示）"
-              : "企业微信通讯录无法映射 ThreadFerry Owner；请检查机器人通讯录可见范围",
-          });
-        } catch {
-          checks.push({ ok: false, message: "企业微信通讯录查询失败；请检查 wecom-cli 授权和机器人通讯录可见范围" });
-        }
-      }
     } catch {
       checks.push({ ok: false, message: "wecom-cli 未授权或身份检查失败；请先执行 wecom-cli auth init" });
     }
@@ -556,6 +554,10 @@ async function start(configPath: string, mock: boolean, port: number): Promise<s
         const group = latest.groups[groupId];
         if (!group || !latest.agents[agentId]) throw new Error("指定群或 Agent 未配置");
         group.agent = agentId;
+      }),
+      bindGroup: (groupId, agentId) => updateConfig((latest) => {
+        if (latest.groups[groupId] || !latest.agents[agentId]) throw new Error("指定群已配置或 Agent 不存在");
+        latest.groups[groupId] = { agent: agentId, allowUsers: [latest.ownerUser], context: { lookbackHours: 6, maxMessages: 80 } };
       }),
       listGroups: () => listWecomGroups(),
       searchUsers: (keywords) => searchWecomUsers(keywords),

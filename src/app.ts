@@ -12,16 +12,17 @@ export interface AppDependencies {
   runtime: (request: RuntimeRequest) => Promise<RuntimeResult>;
   updateAllowUsers?: (groupId: string, users: string[]) => Promise<void>;
   updateGroupAgent?: (groupId: string, agentId: string) => Promise<void>;
+  bindGroup?: (groupId: string, agentId: string) => Promise<void>;
   listGroups?: () => Promise<Array<{ id: string; name?: string }>>;
   searchUsers?: (keywords: string[]) => Promise<DirectoryUser[]>;
   onError?: (error: { errorId: string; phase: FailurePhase }) => void;
 }
 
-type ManagementCommand = "help" | "whoami" | "groups" | "agents" | "users" | "invite" | "join" | "add" | "remove" | "use";
+type ManagementCommand = "help" | "whoami" | "groups" | "agents" | "users" | "invite" | "join" | "add" | "remove" | "use" | "bind";
 const USER_ID = /^[A-Za-z0-9_@.-]{1,512}$/;
 
 function managementCommand(text: string): { name: ManagementCommand; arguments: string[] } | undefined {
-  const match = text.match(/(?:^|[\s@])threadferry\s+(help|whoami|groups|agents|users|invite|join|add|remove|use)(?:\s+(.+?))?\s*$/i);
+  const match = text.match(/(?:^|[\s@])threadferry\s+(help|whoami|groups|agents|users|invite|join|add|remove|use|bind)(?:\s+(.+?))?\s*$/i);
   if (!match) return undefined;
   return { name: match[1]!.toLowerCase() as ManagementCommand, arguments: match[2]?.trim().split(/\s+/) ?? [] };
 }
@@ -91,6 +92,18 @@ export function createApp(config: ThreadFerryConfig, dependencies: AppDependenci
     return operation;
   }
 
+  function bindGroup(groupId: string, agentId: string): Promise<void> {
+    const operation = accessTail.then(async () => {
+      if (config.groups[groupId]) throw new Error("该群已经配置");
+      if (!config.agents[agentId]) throw new Error(`Agent \`${agentId}\` 不存在。请先发送 \`threadferry agents\`。`);
+      if (!dependencies.bindGroup) throw new Error("当前启动方式不支持群绑定");
+      await dependencies.bindGroup(groupId, agentId);
+      config.groups[groupId] = { agent: agentId, allowUsers: [config.ownerUser], context: { lookbackHours: 6, maxMessages: 80 } };
+    });
+    accessTail = operation.then(() => undefined, () => undefined);
+    return operation;
+  }
+
   async function respond(reply: Reply, content: string): Promise<HandleResult> {
     try {
       await reply(limitUtf8(content), true);
@@ -122,22 +135,28 @@ export function createApp(config: ThreadFerryConfig, dependencies: AppDependenci
     throw new Error(`没有找到已配置群“${reference}”。请先发送 \`threadferry groups\`。`);
   }
 
-  async function resolveGroupAndValue(arguments_: string[], label: string): Promise<{ group: { id: string; name?: string }; value: string }> {
+  async function resolveGroupAndValue(arguments_: string[], label: string, requireConfigured = true): Promise<{ group: { id: string; name?: string }; value: string }> {
     if (arguments_.length < 2) throw new Error(`缺少群名或${label}。`);
     if (config.groups[arguments_[0]!]) {
       return { group: { id: arguments_[0]! }, value: arguments_.slice(1).join(" ") };
     }
+    const sessions = await groupSessions();
+    const byId = sessions.find((session) => session.id === arguments_[0]);
+    if (byId) {
+      if (requireConfigured) throw new Error(`群 \`${byId.id}\` 尚未配置 Agent，请先发送 \`threadferry bind <群名或ID> <Agent名>\`。`);
+      return { group: byId, value: arguments_.slice(1).join(" ") };
+    }
     const input = arguments_.join(" ");
-    const sessions = (await groupSessions())
+    const named = sessions
       .filter((session) => session.name && input.startsWith(`${session.name} `))
       .sort((left, right) => right.name!.length - left.name!.length);
-    if (sessions.length === 0) throw new Error("没有识别出群名。请先发送 `threadferry groups`，也可以改用群 ID。");
-    const longest = sessions[0]!.name!;
-    const matches = sessions.filter((session) => session.name === longest && config.groups[session.id]);
+    if (named.length === 0) throw new Error("没有识别出群名。请先发送 `threadferry groups`，也可以改用群 ID。");
+    const longest = named[0]!.name!;
+    const matches = named.filter((session) => session.name === longest && (!requireConfigured || config.groups[session.id]));
     if (matches.length > 1) {
       throw new Error(`有多个同名群“${longest}”，请改用群 ID：\n${matches.map((group) => `- \`${group.id}\``).join("\n")}`);
     }
-    if (matches.length === 0) throw new Error(`群“${longest}”尚未配置 Agent，请先运行 threadferry setup。`);
+    if (matches.length === 0) throw new Error(`群“${longest}”尚未配置 Agent，请先发送 \`threadferry bind <群名或ID> <Agent名>\`。`);
     return { group: matches[0]!, value: input.slice(longest.length).trim() };
   }
 
@@ -224,12 +243,22 @@ export function createApp(config: ThreadFerryConfig, dependencies: AppDependenci
   async function handleDirect(message: IncomingDirectMessage, reply: Reply): Promise<HandleResult> {
     if (!(await state.claimCommand(message.msgId, `direct:${message.senderId}`))) return "duplicate";
     const command = managementCommand(message.text);
-    if (!command) return respond(reply, "ThreadFerry 私聊仅用于机器人管理。发送 `threadferry help` 查看命令。");
+    if (!command) {
+      if (message.senderId !== config.ownerUser) return respond(reply, "只有机器人创建者（ThreadFerry Owner）可以私聊 Agent。");
+      const scope = `direct:${message.senderId}`;
+      const queued = groupTails.has(scope);
+      try {
+        await reply(queued ? "ThreadFerry 已收到，当前私聊有任务处理中，已排队。" : "ThreadFerry 已收到，正在分析。", false);
+      } catch {
+        return "failed";
+      }
+      return serial(scope, () => processDirect(message, reply));
+    }
     if (command.name === "whoami") return respond(reply, `你的 ThreadFerry userid：\`${message.senderId}\``);
     if (command.name === "join") return join(message.senderId, command.arguments[0], reply);
     if (message.senderId !== config.ownerUser) return respond(reply, "只有机器人创建者（ThreadFerry Owner）可以在私聊中管理群权限。");
     if (command.name === "help") {
-      return respond(reply, "ThreadFerry 私聊管理命令：\n- `threadferry groups` 查看群与当前 Agent\n- `threadferry agents` 查看可用 Agent\n- `threadferry use <群名> <Agent名>` 切换群 Agent\n- `threadferry users <群名>` 查看可使用用户\n- `threadferry invite <群名>` 生成一次性邀请码\n- `threadferry add <群名> <姓名>` 直接授权\n- `threadferry remove <群名> <姓名>` 移除授权\n- `threadferry whoami` 查看自己的 userid\n\n群或成员重名时，按机器人返回的 ID 重新发送即可。");
+      return respond(reply, "直接发送普通消息即可私聊默认 Agent。管理命令：\n- `threadferry groups` 查看群与当前 Agent\n- `threadferry agents` 查看可用 Agent\n- `threadferry bind <群名或ID> <Agent名>` 绑定群\n- `threadferry use <群名> <Agent名>` 切换群 Agent\n- `threadferry users <群名>` 查看可使用用户\n- `threadferry invite <群名>` 生成一次性邀请码\n- `threadferry add <群名> <姓名>` 直接授权\n- `threadferry remove <群名> <姓名>` 移除授权\n- `threadferry whoami` 查看自己的 userid\n\n群或成员重名时，按机器人返回的 ID 重新发送即可。");
     }
     if (command.name === "agents") {
       const lines = Object.entries(config.agents).map(([id, agent]) => `- \`${id}\`：${agent.runtime}${agent.model ? ` / ${agent.model}` : ""}\n  ${agent.workspace}`);
@@ -256,8 +285,8 @@ export function createApp(config: ThreadFerryConfig, dependencies: AppDependenci
     let group: { id: string; name?: string };
     let target: { group: { id: string; name?: string }; value: string } | undefined;
     try {
-      if (command.name === "add" || command.name === "remove" || command.name === "use") {
-        target = await resolveGroupAndValue(command.arguments, command.name === "use" ? " Agent 名" : "用户姓名");
+      if (command.name === "add" || command.name === "remove" || command.name === "use" || command.name === "bind") {
+        target = await resolveGroupAndValue(command.arguments, command.name === "use" || command.name === "bind" ? " Agent 名" : "用户姓名", command.name !== "bind");
         group = target.group;
       } else {
         group = await resolveGroup(command.arguments.join(" "));
@@ -265,8 +294,16 @@ export function createApp(config: ThreadFerryConfig, dependencies: AppDependenci
     } catch (error) {
       return respond(reply, error instanceof Error ? error.message : "群名解析失败。");
     }
-    const configured = config.groups[group.id]!;
     const groupLabel = group.name ?? group.id;
+    if (command.name === "bind") {
+      try {
+        await bindGroup(group.id, target!.value);
+        return respond(reply, `群“${groupLabel}”已绑定 Agent \`${target!.value}\`。`);
+      } catch (error) {
+        return respond(reply, error instanceof Error ? error.message : "群绑定失败。");
+      }
+    }
+    const configured = config.groups[group.id]!;
     if (command.name === "users") {
       return respond(reply, `群“${groupLabel}”可使用用户：\n${await formatUsers(configured.allowUsers)}`);
     }
@@ -333,6 +370,40 @@ export function createApp(config: ThreadFerryConfig, dependencies: AppDependenci
     return current.finally(() => {
       if (groupTails.get(groupId) === tail) groupTails.delete(groupId);
     });
+  }
+
+  async function processDirect(message: IncomingDirectMessage, reply: Reply): Promise<HandleResult> {
+    const scope = `direct:${message.senderId}`;
+    const entry = Object.entries(config.agents)[0];
+    if (!entry) return respond(reply, "当前没有可用 Agent。");
+    const [agentId, agent] = entry;
+    try {
+      if (shuttingDown) throw new Error("ThreadFerry 正在停止");
+      const sessionScope = `${agentId}\0${agent.runtime}\0${agent.workspace}`;
+      const sessionId = await state.session(scope, sessionScope);
+      const controller = new AbortController();
+      controllers.set(scope, controller);
+      let result: RuntimeResult;
+      try {
+        result = await dependencies.runtime({
+          agentId,
+          ...agent,
+          prompt: buildContext([], message, { lookbackHours: 0, maxMessages: 1 }, "direct"),
+          ...(sessionId ? { sessionId } : {}),
+          signal: controller.signal,
+        });
+      } finally {
+        if (controllers.get(scope) === controller) controllers.delete(scope);
+      }
+      if (result.sessionId) await state.setSession(scope, sessionScope, result.sessionId);
+      await reply(limitUtf8(result.text), true);
+      return "handled";
+    } catch {
+      const errorId = newErrorId();
+      dependencies.onError?.({ errorId, phase: "runtime" });
+      await reply(`ThreadFerry 处理失败（错误编号 ${errorId}）。请在运行 ThreadFerry 的机器上执行 \`threadferry status\`。`, true).catch(() => undefined);
+      return "failed";
+    }
   }
 
   async function complete(

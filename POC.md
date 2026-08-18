@@ -50,12 +50,12 @@ Every missing item is reported with a next action. The command must fail until r
 1. Install official `wecom-cli 1.1.0+` and run `wecom-cli auth init` for the target enterprise.
 2. Verify `wecom-cli identity whoami --json '{}'` succeeds.
 3. Run `codex login`, then verify `codex --version` is at least `0.138.0`.
-4. Create an Enterprise WeCom intelligent robot and add it to the configured internal group.
+4. Create an Enterprise WeCom intelligent robot. Group membership is optional until group acceptance begins.
 5. Run `threadferry onboard`; enter the Bot ID and hidden Bot Secret when prompted.
-6. Complete the Agent and Workspace prompts, then send the printed one-time pairing command by selecting the robot with WeCom's `@` picker. Do not derive `allow_users` from `wecom-cli identity`; the WebSocket SDK can use a different userid scope.
+6. Complete the Agent and Workspace prompts, privately send the printed one-time pairing command to the robot, then approve the callback userid in the local terminal. Pairing must not call the directory API.
 7. Run `threadferry doctor` and require all checks to pass.
-8. Run `threadferry start`.
-9. Send three ordinary messages, then have an allowed user send `@ThreadFerry 帮忙分析`.
+8. Run `threadferry start`, privately send a normal analysis request as the Owner, and verify a direct reply arrives without an `@` mention or directory permission.
+9. Add the robot to an internal group, privately send `threadferry bind <群名或ID> <Agent名>`, then send three ordinary group messages and have an allowed user send `@ThreadFerry 帮忙分析`.
 10. Verify the reply appears in the same group and reflects the three preceding messages.
 11. Verify the stream first shows the processing acknowledgement and then the final result.
 12. Send two mentions quickly in the same group and verify the second is queued and Runtime executions do not overlap.
