@@ -57,7 +57,7 @@ The wizard guides you through:
 5. Sending a one-time pairing command in the target group.
 6. Checking dependencies and starting ThreadFerry.
 
-The first person to pair becomes the Owner. The Owner can then manage groups, agents, and authorized members through direct messages with the bot.
+The first person to pair becomes the Owner. The Owner can then manage groups, agents, and authorized members through direct messages with the bot. For additional groups, the locally generated one-time pairing code is the authorization credential, so the sender's callback userid does not need to match the stored Owner userid. Pairing keeps the existing Owner unchanged.
 
 To install without starting the wizard, or to inspect the installation actions:
 

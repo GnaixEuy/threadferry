@@ -260,7 +260,10 @@ test("workspace paths cannot be relative or escape through a symlink", async (t)
   await writeFile(mergedPath, setupConfig("group", "default", defaultAgent, "user", compact));
   const merged = await loadConfig(mergedPath);
   assert.deepEqual(merged.groups.group?.allowUsers, ["user"]);
-  assert.throws(() => setupConfig("group", "default", defaultAgent, "user-2", compact), /Owner/);
+  await writeFile(mergedPath, setupConfig("group-2", "default", defaultAgent, "user-2", compact));
+  const pairedByCode = await loadConfig(mergedPath);
+  assert.equal(pairedByCode.ownerUser, "user");
+  assert.deepEqual(pairedByCode.groups["group-2"]?.allowUsers, ["user"]);
   assert.throws(() => setupConfig("group", "other", defaultAgent, "user", compact), /已绑定其他 Agent/);
 
   compact.groups.group!.allowUsers.push("user-2");

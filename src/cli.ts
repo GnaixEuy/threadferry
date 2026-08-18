@@ -262,12 +262,13 @@ async function setup(configPath: string, workspaceInput: string, agentId: string
   if (existsSync(target)) await loadConfig(target);
   const credentials = await botCredentials();
   await preflightDependencies(new Set([runtime]));
-  const code = randomBytes(4).toString("hex");
+  const code = randomBytes(8).toString("hex");
   console.log(`请在目标企业微信群发送：@机器人 threadferry setup ${code}`);
   console.log("等待配对消息；配置不会保存机器人凭据。");
 
   await new Promise<void>((done, reject) => {
     let client: ReturnType<typeof startWecomChannel> | undefined;
+    let claimed = false;
     const stop = () => {
       client?.disconnect();
       reject(new Error("setup 已取消"));
@@ -288,6 +289,8 @@ async function setup(configPath: string, workspaceInput: string, agentId: string
         console.log("[setup] 收到群内 @，但配对码不匹配");
         return;
       }
+      if (claimed) return;
+      claimed = true;
       try {
         const current = existsSync(target) ? await loadConfig(target) : undefined;
         const content = setupConfig(message.groupId, agentId, { workspace, runtime, ...(model ? { model } : {}) }, message.senderId, current);
