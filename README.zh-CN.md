@@ -2,7 +2,7 @@
 
 [English](./README.md)
 
-ThreadFerry 把企业微信群里的 `@机器人` 请求和近期讨论一起交给本机 AI Agent，在指定 Workspace 中完成只读分析，再把结果回复到原群。
+ThreadFerry 支持经本机确认的企业微信用户直接私聊本机 AI Agent，也可以把群里的 `@机器人` 请求和近期讨论一起交给 Agent，在指定 Workspace 中完成只读分析。
 
 ```text
 10:00 张三：这个接口有问题
@@ -11,7 +11,7 @@ ThreadFerry 把企业微信群里的 `@机器人` 请求和近期讨论一起交
 10:05 用户：@机器人 帮忙分析
 ```
 
-当前支持企业微信内部群、Codex 和 Pi。每个群可以绑定不同 Agent、模型和 Workspace。
+当前支持企业微信私聊、内部群、Codex 和 Pi。私聊使用默认 Agent；每个群可以绑定不同 Agent、模型和 Workspace。
 机器人只在收到 `@` 后补拉最近 6 小时、最多 80 条群消息，普通消息不会实时回调。
 
 [查看更新日志](./CHANGELOG.md)
@@ -24,7 +24,7 @@ ThreadFerry 把企业微信群里的 `@机器人` 请求和近期讨论一起交
 - Node.js 22+
 - 企业微信官方 `wecom-cli 1.1.0+`（安装器会自动检测并补装）
 - Codex CLI `0.138.0+`，或 Pi CLI `0.84.2+`
-- 已加入目标内部群的企业微信智能机器人
+- 企业微信智能机器人；只有需要群聊时才需要把机器人加入内部群
 
 使用 Codex 时先完成登录：
 
@@ -54,10 +54,10 @@ threadferry onboard
 2. `wecom-cli` 未授权时，通过扫码或手动输入 Bot ID/Secret 完成官方初始化。
 3. 设置 Agent 名、Runtime、模型和 Workspace。Agent 名支持中文和空格；Workspace 默认使用运行向导时的当前目录。
 4. 检测 `wecom-cli` 已保存的凭据，并询问是否直接读取复用；拒绝复用或读取失败时，可以手动输入 Bot ID 和隐藏显示的 Bot Secret。
-5. 在目标群发送一次性配对命令。
+5. 私聊机器人发送一次性配对命令，再在本机终端确认回调 userid。
 6. 检查依赖并启动 ThreadFerry。
 
-第一次配对者会成为 Owner，后续可以私聊机器人管理群、Agent 和可使用成员。新增群绑定时，以本机生成的一次性配对码作为授权凭证，不再要求发送者的回调 userid 与已保存的 Owner userid 严格相等；配对不会修改现有 Owner。
+本机终端确认的私聊发送者会成为 Owner，并可立即私聊默认 Agent。配对和私聊 Agent 直接使用机器人事件中的回调 userid，不需要企业微信通讯录权限。重新运行 setup 可以在本机确认新的 Owner，并把已有群的 Owner 权限迁移到新 userid。群聊配置是可选的。
 
 只安装而不进入向导，或检查安装动作：
 
@@ -81,7 +81,13 @@ threadferry start
 threadferry update
 ```
 
-回到已配置群，通过企业微信的 `@` 选择器选中机器人：
+Owner 可以不带 `@`，直接私聊机器人：
+
+```text
+帮我排查登录失败问题
+```
+
+在已配置群中，通过企业微信的 `@` 选择器选中机器人：
 
 ```text
 @机器人 帮忙分析刚才讨论的问题
@@ -95,6 +101,7 @@ Owner 可以直接私聊机器人：
 | --- | --- |
 | `threadferry groups` | 查看机器人所在群和当前 Agent |
 | `threadferry agents` | 查看已配置 Agent |
+| `threadferry bind <群名或ID> <Agent名>` | 把最近群会话绑定到 Agent |
 | `threadferry use <群名> <Agent名>` | 切换群使用的 Agent |
 | `threadferry users <群名>` | 查看可使用成员 |
 | `threadferry add <群名> <姓名>` | 按通讯录姓名授权 |
@@ -102,7 +109,7 @@ Owner 可以直接私聊机器人：
 | `threadferry invite <群名>` | 生成一次性邀请码 |
 | `threadferry whoami` | 查看自己的回调 userid |
 
-同名群或同名成员会返回候选 ID，按提示使用 `id:<userid>` 或群 ID 重试。管理命令只能在 Owner 私聊中执行。
+同名群或同名成员会返回候选 ID，按提示使用 `id:<userid>` 或群 ID 重试。管理命令和普通私聊 Agent 只对本机确认的 Owner 开放。只有 `add`、`remove` 按姓名解析成员时需要通讯录权限；配对、私聊 Agent 和群绑定都不需要。
 
 目标用户拿到邀请码后，可以私聊机器人：
 
@@ -142,7 +149,7 @@ threadferry agent list
 | `threadferry start` | 启动服务和管理台 |
 | `threadferry status` | 查看队列、Session 和最近失败 |
 | `threadferry update` | 立即检查并安装最新版本 |
-| `threadferry setup --workspace <绝对路径>` | 配对其他群 |
+| `threadferry setup --workspace <绝对路径>` | 通过本机确认的私聊配对或更换 Owner |
 | `threadferry session reset --group <群ID>` | 重置指定群的 Runtime Session |
 | `threadferry start --mock` | 运行无真实凭据的 Mock 链路 |
 
@@ -162,7 +169,7 @@ threadferry start --admin-port 18080
 
 ## 安全边界
 
-- 只有当前 `@机器人` 的消息是用户指令；历史消息、引用和附件元数据都是不可信背景。
+- 私聊中只有本机确认的 Owner 消息会启动 Runtime；群聊中只有当前 `@机器人` 的消息是用户指令。历史消息、引用和附件元数据都是不可信背景。
 - 未配置群、未授权用户和未 `@机器人` 的消息不会启动 Runtime。
 - Runtime 固定在 Agent Workspace，不能读取 Workspace 外文件。
 - Codex 禁用网络和写文件；Pi 只开放受路径守卫保护的 `read` 和 `ls`。
@@ -179,7 +186,7 @@ threadferry doctor
 ```
 
 - `unauthorized_user`：让 Owner 私聊机器人执行 `threadferry add <群名> <姓名>`。
-- `unauthorized_group`：通过管理台绑定群，或重新运行 `threadferry setup`。
+- `unauthorized_group`：让 Owner 私聊机器人执行 `threadferry bind <群名或ID> <Agent名>`，或通过管理台绑定群。
 - 缺少 `wecom-cli` 或版本过低：重新运行安装器，或执行 `npm install --global @wecom/cli`。
 - `wecom-cli` 授权失效：重新运行 `wecom-cli auth init`，然后重启 ThreadFerry。
 

@@ -89,6 +89,33 @@ export function setupConfig(
   return stringify({ version: 5, owner_user: current?.ownerUser ?? userId, agents, groups });
 }
 
+export function pairConfig(
+  agentId: string,
+  agent: AgentConfig,
+  userId: string,
+  current?: ThreadFerryConfig,
+): string {
+  if (!USER_ID.test(userId)) throw new Error("企业微信回调 userid 无效");
+  validateAgent(agentId, agent);
+  const configuredAgent = current?.agents[agentId];
+  if (configuredAgent && (configuredAgent.workspace !== agent.workspace
+    || configuredAgent.runtime !== agent.runtime || configuredAgent.model !== agent.model)) {
+    throw new Error(`Agent ${agentId} 已存在且配置不同；请使用 threadferry agent add 新名称`);
+  }
+  const previousOwner = current?.ownerUser;
+  const groups = Object.fromEntries(Object.entries(current?.groups ?? {}).map(([id, group]) => [id, {
+    ...group,
+    allowUsers: [...new Set([...group.allowUsers.map((user) => user === previousOwner ? userId : user), userId])],
+  }]));
+  return configText({
+    version: 5,
+    ownerUser: userId,
+    agents: { ...(current?.agents ?? {}), [agentId]: agent },
+    groups,
+    security: { requireMention: true, readOnly: true },
+  });
+}
+
 export function configText(config: ThreadFerryConfig): string {
   const agents = Object.fromEntries(Object.entries(config.agents).map(([id, agent]) => [id, {
     runtime: agent.runtime,
@@ -166,7 +193,6 @@ export async function loadConfig(path: string): Promise<ThreadFerryConfig> {
   }
 
   const rawGroups = object(root.groups, "groups");
-  if (Object.keys(rawGroups).length === 0) throw new Error("至少需要配置一个企业微信群");
 
   const groups: Record<string, GroupConfig> = {};
   for (const [groupId, value] of Object.entries(rawGroups)) {

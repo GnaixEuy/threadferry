@@ -4,6 +4,43 @@ ThreadFerry 的每个 GitHub Release 都使用这里对应版本的内容，不�
 
 ## Unreleased
 
+## 0.12.0
+
+本次版本把 Owner 认证从群聊中解耦，支持经本机确认后直接私聊 Agent，并让群聊成为按需启用的可选能力。
+
+### 主要变化
+
+- Owner 配对改为私聊机器人发送一次性配对码，并由本机终端人工确认回调 userid；配对不再依赖群聊或企业微信通讯录权限。
+- Owner 可以直接私聊默认 Agent，私聊 Runtime Session 与各群 Session 相互隔离；群聊配置改为可选。
+- 新增 Owner 私聊命令 `threadferry bind <群名或ID> <Agent名>`，可直接绑定机器人最近可见的群会话。
+
+### 安装与升级
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/GnaixEuy/threadferry/main/install.sh | bash
+```
+
+新安装会引导用户私聊机器人发送一次性配对码，并在本机终端确认 Owner。现有配置可以继续使用；需要更换或修复 Owner userid 时重新运行：
+
+```sh
+threadferry setup --workspace <绝对路径>
+threadferry doctor
+```
+
+### 发布资产
+
+- `threadferry.tgz`：包含已经编译的 CLI，可直接由 npm 全局安装。
+- `SHA256SUMS`：用于校验发布包完整性。
+
+### 运行要求
+
+- macOS 或 Linux
+- Node.js 22+
+- 企业微信官方 `wecom-cli 1.1.0+`
+- Codex CLI `0.138.0+` 或 Pi CLI `0.84.2+`
+
+[查看 v0.11.0...v0.12.0 的完整变更](https://github.com/GnaixEuy/threadferry/compare/v0.11.0...v0.12.0)
+
 ## 0.11.0
 
 本次版本完善了 ThreadFerry 的安装、企业微信初始化和持续升级流程，让用户可以更快完成首次配置，并自动获得后续缺陷修复。
