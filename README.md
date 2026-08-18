@@ -138,19 +138,13 @@ threadferry agent list
 threadferry start --admin-port 18080
 ```
 
-## 配置和凭据
+## 本地数据
 
 - 配置：`~/.threadferry/threadferry.yaml`
 - 状态：`~/.threadferry/state-v3.json`
 - 配置示例：[threadferry.example.yaml](./threadferry.example.yaml)
 
-Bot Secret 不会写入配置、日志或状态文件。交互式启动会安全提示输入；无人值守启动使用环境变量：
-
-```sh
-export THREADFERRY_WECOM_BOT_ID='<Bot ID>'
-export THREADFERRY_WECOM_BOT_SECRET='<Bot Secret>'
-threadferry start
-```
+正常使用不需要手工配置环境变量。`threadferry onboard` 和 `threadferry start` 会引导输入 Bot ID，并隐藏输入 Bot Secret；凭据不会写入配置、日志或状态文件。
 
 ## 安全边界
 
