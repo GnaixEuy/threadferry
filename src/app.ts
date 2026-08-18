@@ -258,7 +258,7 @@ export function createApp(config: ThreadFerryConfig, dependencies: AppDependenci
     if (command.name === "join") return join(message.senderId, command.arguments[0], reply);
     if (message.senderId !== config.ownerUser) return respond(reply, "只有机器人创建者（ThreadFerry Owner）可以在私聊中管理群权限。");
     if (command.name === "help") {
-      return respond(reply, "直接发送普通消息即可私聊默认 Agent。管理命令：\n- `threadferry groups` 查看群与当前 Agent\n- `threadferry agents` 查看可用 Agent\n- `threadferry bind <群名或ID> <Agent名>` 绑定群\n- `threadferry use <群名> <Agent名>` 切换群 Agent\n- `threadferry users <群名>` 查看可使用用户\n- `threadferry invite <群名>` 生成一次性邀请码\n- `threadferry add <群名> <姓名>` 直接授权\n- `threadferry remove <群名> <姓名>` 移除授权\n- `threadferry whoami` 查看自己的 userid\n\n群或成员重名时，按机器人返回的 ID 重新发送即可。");
+      return respond(reply, "直接发送普通消息即可私聊默认 Agent。\n\n接入群聊：\n1. 请企业管理员批准机器人的数据访问权限，并把机器人加入目标内部群\n2. 发送 `threadferry groups` 查看群名或群 ID\n3. 发送 `threadferry agents` 查看 Agent 名\n4. 发送 `threadferry bind <群名或ID> <Agent名>` 完成绑定\n\n其他管理命令：\n- `threadferry use <群名> <Agent名>` 切换群 Agent\n- `threadferry users <群名>` 查看可使用用户\n- `threadferry invite <群名>` 生成一次性邀请码\n- `threadferry add <群名> <姓名>` 直接授权\n- `threadferry remove <群名> <姓名>` 移除授权\n- `threadferry whoami` 查看自己的 userid\n\n群或成员重名时，按机器人返回的 ID 重新发送即可。");
     }
     if (command.name === "agents") {
       const lines = Object.entries(config.agents).map(([id, agent]) => `- \`${id}\`：${agent.runtime}${agent.model ? ` / ${agent.model}` : ""}\n  ${agent.workspace}`);

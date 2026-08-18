@@ -189,6 +189,7 @@ threadferry doctor
 - `unauthorized_group`: Ask the Owner to send `threadferry bind <group-name-or-id> <agent-name>` directly to the bot, or bind it in the admin console.
 - Missing or outdated `wecom-cli`: Run the installer again, or run `npm install --global @wecom/cli`.
 - Expired `wecom-cli` authorization: Run `wecom-cli auth init` again, then restart ThreadFerry.
+- `errcode 853006`: Ask the enterprise administrator to approve the bot data-access permission required for group message history.
 
 ## Development
 

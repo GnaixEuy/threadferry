@@ -1,4 +1,4 @@
-import { runCommand } from "../process.js";
+import { CommandExecutionError, runCommand } from "../process.js";
 import type { AttachmentMetadata, CommandRunner, GroupMessage, QuoteMetadata } from "../types.js";
 
 interface WecomMessage {
@@ -36,6 +36,9 @@ function pageFrom(stdout: string): WecomPage {
   if (!result || typeof result !== "object") throw new Error("wecom-cli 返回结构无效");
   const envelope = result as Record<string, unknown>;
   if (typeof envelope.errcode === "number" && envelope.errcode !== 0) {
+    if (envelope.errcode === 853006) {
+      throw new Error("企业未授权群消息历史能力（errcode 853006）；请让企业管理员批准机器人数据访问权限");
+    }
     throw new Error(`wecom-cli chat.messages.list 失败（errcode ${envelope.errcode}）`);
   }
   const data = envelope.data ?? envelope.result ?? result;
@@ -99,7 +102,14 @@ export async function fetchWecomHistory(
       "--end-time", cliTime(options.endTime),
       ...(cursor ? ["--cursor", cursor] : []),
     ];
-    const page = pageFrom((await runner("wecom-cli", args, { timeoutMs: 30_000 })).stdout);
+    let stdout: string;
+    try {
+      stdout = (await runner("wecom-cli", args, { timeoutMs: 30_000 })).stdout;
+    } catch (error) {
+      if (error instanceof CommandExecutionError && error.stdout.trim()) pageFrom(error.stdout);
+      throw error;
+    }
+    const page = pageFrom(stdout);
     messages.push(...(page.messages ?? []));
     cursor = page.has_more ? page.next_cursor : undefined;
   } while (cursor && messages.length < options.maxMessages);

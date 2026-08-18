@@ -153,6 +153,8 @@ test("robot owner manages per-group users in direct chat", async () => {
     mentioned: true,
   }, async (content) => { replies.push(content); });
 
+  assert.equal(await direct("owner", "threadferry help"), "command");
+  assert.match(replies.at(-1) ?? "", /接入群聊.*数据访问权限.*threadferry groups.*threadferry agents.*threadferry bind/s);
   assert.equal(await direct("new-user", "threadferry groups"), "command");
   assert.match(replies.at(-1) ?? "", /只有.*Owner/);
   assert.equal(await direct("new-user", "threadferry use AI Coding reviewer"), "command");
@@ -442,6 +444,21 @@ test("wecom history uses chat.messages.list arguments and keeps attachment metad
   assert.equal(messages[0]?.text, "接口异常");
   assert.deepEqual(messages[1]?.attachments, [{ type: "file", name: "trace.log" }]);
   assert.doesNotMatch(JSON.stringify(messages), /metadata-only/);
+});
+
+test("wecom history reports unavailable corporation permission", async () => {
+  const runner: CommandRunner = async () => {
+    throw new CommandExecutionError("wecom-cli", 1, JSON.stringify({
+      errcode: 853006,
+      errmsg: "this tool is not available for your corporation",
+    }), "");
+  };
+
+  await assert.rejects(fetchWecomHistory("group_allowed", {
+    lookbackHours: 6,
+    maxMessages: 80,
+    endTime: new Date("2026-08-18T10:05:00+08:00"),
+  }, runner), /企业未授权群消息历史能力.*853006/);
 });
 
 test("same-second history changes are detected by fingerprint", async () => {

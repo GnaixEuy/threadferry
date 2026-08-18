@@ -20,7 +20,7 @@ import type { GroupMessage, IncomingMention, RuntimeName, ThreadFerryConfig } fr
 import { findUpdate, installUpdate } from "./update.js";
 import { loadWecomCliCredentials } from "./wecom-credentials.js";
 
-const VERSION = "0.12.0";
+const VERSION = "0.12.2";
 const UPDATE_INTERVAL_MS = 6 * 60 * 60 * 1_000;
 const USAGE = `ThreadFerry ${VERSION}
 
@@ -317,7 +317,7 @@ async function setup(configPath: string, workspaceInput: string, agentId: string
         } finally {
           await rm(temporary, { force: true });
         }
-        await reply("ThreadFerry Owner 配对完成。启动服务后可直接私聊 Agent；群绑定可私聊发送 `threadferry bind <群名或ID> <Agent名>`。").catch(() => undefined);
+        await reply("配对完成。请回到电脑终端继续启动 ThreadFerry。\n\n启动后：\n- 直接在这里发消息，即可私聊 Agent\n- 发送 `threadferry help`，查看群聊接入和管理方法").catch(() => undefined);
         console.log(`配置已更新: ${target}`);
         finish();
       } catch (error) {
@@ -383,6 +383,7 @@ async function onboard(configOption?: string): Promise<void> {
 
 async function doctor(configPath?: string): Promise<boolean> {
   const checks: Array<{ ok: boolean; message: string }> = [];
+  let loadedConfig: ThreadFerryConfig | undefined;
   let configuredRuntimes = new Set<RuntimeName>(["codex"]);
   const major = Number(process.versions.node.split(".")[0]);
   checks.push({ ok: major >= 22, message: major >= 22 ? `Node ${process.version}` : `Node ${process.version}；请安装 Node.js 22+ LTS` });
@@ -392,9 +393,9 @@ async function doctor(configPath?: string): Promise<boolean> {
     checks.push({ ok: false, message: `配置不存在: ${chosenConfig}；请先运行 threadferry onboard` });
   } else {
     try {
-      const loaded = await loadConfig(chosenConfig);
-      configuredRuntimes = new Set(Object.values(loaded.agents).map((agent) => agent.runtime));
-      checks.push({ ok: true, message: `配置有效：${Object.keys(loaded.agents).length} 个 Agent，${Object.keys(loaded.groups).length} 个群` });
+      loadedConfig = await loadConfig(chosenConfig);
+      configuredRuntimes = new Set(Object.values(loadedConfig.agents).map((agent) => agent.runtime));
+      checks.push({ ok: true, message: `配置有效：${Object.keys(loadedConfig.agents).length} 个 Agent，${Object.keys(loadedConfig.groups).length} 个群` });
     } catch (error) {
       checks.push({ ok: false, message: error instanceof Error ? error.message : String(error) });
     }
@@ -407,25 +408,41 @@ async function doctor(configPath?: string): Promise<boolean> {
     checks.push({ ok: false, message: "本地状态存储无效；请检查 ~/.threadferry 的权限和 state-v3.json 格式" });
   }
 
+  const environmentCredentials = Boolean(process.env.THREADFERRY_WECOM_BOT_ID && process.env.THREADFERRY_WECOM_BOT_SECRET);
+  const savedCredentials = environmentCredentials ? undefined : await loadWecomCliCredentials();
   checks.push({
-    ok: Boolean(process.env.THREADFERRY_WECOM_BOT_ID && process.env.THREADFERRY_WECOM_BOT_SECRET),
-    message: process.env.THREADFERRY_WECOM_BOT_ID && process.env.THREADFERRY_WECOM_BOT_SECRET
-      ? "企业微信机器人环境变量已设置（值未显示）"
-      : "缺少 THREADFERRY_WECOM_BOT_ID/THREADFERRY_WECOM_BOT_SECRET；请通过环境变量设置",
+    ok: environmentCredentials || Boolean(savedCredentials),
+    message: environmentCredentials
+      ? "企业微信机器人凭据可用（环境变量，值未显示）"
+      : savedCredentials
+        ? "企业微信机器人凭据可用（wecom-cli 加密存储，值未显示）"
+        : "缺少企业微信机器人凭据；请运行 threadferry onboard 或设置 THREADFERRY_WECOM_BOT_ID/THREADFERRY_WECOM_BOT_SECRET",
   });
 
+  let wecomAuthorized = false;
   try {
     const { stdout } = await runCommand("wecom-cli", ["--version"], { timeoutMs: 10_000 });
     const supported = atLeast(stdout, [1, 1, 0]);
     checks.push({ ok: supported, message: supported ? stdout.trim() : `${stdout.trim()}；ThreadFerry 要求 1.1.0+` });
     try {
       await runCommand("wecom-cli", ["identity", "whoami", "--json", "{}"], { timeoutMs: 30_000 });
+      wecomAuthorized = true;
       checks.push({ ok: true, message: "wecom-cli 身份授权有效（详情未显示）" });
     } catch {
       checks.push({ ok: false, message: "wecom-cli 未授权或身份检查失败；请先执行 wecom-cli auth init" });
     }
   } catch {
     checks.push({ ok: false, message: "找不到 wecom-cli；请安装企业微信官方 wecom-cli 1.1.0+ 并加入 PATH" });
+  }
+
+  const firstGroupId = loadedConfig && Object.keys(loadedConfig.groups)[0];
+  if (wecomAuthorized && firstGroupId) {
+    try {
+      await fetchWecomHistory(firstGroupId, { lookbackHours: 1 / 60, maxMessages: 1, endTime: new Date() });
+      checks.push({ ok: true, message: "企业微信群消息历史权限有效" });
+    } catch (error) {
+      checks.push({ ok: false, message: error instanceof Error ? error.message : "企业微信群消息历史检查失败" });
+    }
   }
 
   if (configuredRuntimes.has("codex")) {
