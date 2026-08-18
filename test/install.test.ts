@@ -46,6 +46,41 @@ test("installer supports curl-pipe execution", () => {
   assert.match(result.stdout, /threadferry onboard/);
 });
 
+test("installer installs the official wecom CLI when it is missing", () => {
+  const temporary = mkdtempSync(join(tmpdir(), "threadferry-wecom-dependency-"));
+  try {
+    const commandDirectory = join(temporary, "commands");
+    mkdirSync(commandDirectory);
+    const fakeNode = join(commandDirectory, "node");
+    const fakeNpm = join(commandDirectory, "npm");
+    writeFileSync(fakeNode, "#!/usr/bin/env bash\nprintf '22\\n'\n");
+    writeFileSync(fakeNpm, `#!/usr/bin/env bash
+if [[ "$1 $2" == "root --global" ]]; then
+  printf '%s\\n' "${temporary}/prefix/lib/node_modules"
+elif [[ "$1 $2" == "prefix --global" ]]; then
+  printf '%s\\n' "${temporary}/prefix"
+else
+  exit 99
+fi
+`);
+    chmodSync(fakeNode, 0o755);
+    chmodSync(fakeNpm, 0o755);
+
+    const result = spawnSync("/bin/bash", ["install.sh", "--dry-run", "--no-onboard"], {
+      cwd: project,
+      encoding: "utf8",
+      env: { ...process.env, PATH: `${commandDirectory}:/usr/bin:/bin` },
+    });
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /Installing official wecom-cli/);
+    assert.match(result.stdout, /npm install --global @wecom\/cli/);
+    assert.ok(result.stdout.indexOf("@wecom/cli") < result.stdout.indexOf("threadferry.tgz"));
+  } finally {
+    rmSync(temporary, { force: true, recursive: true });
+  }
+});
+
 test("release package contains the compiled CLI without a consumer build hook", () => {
   assert.equal(packageMetadata.scripts?.prepare, undefined);
 
