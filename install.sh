@@ -126,7 +126,7 @@ fi
 printf 'Installed ThreadFerry %s.\n' "$(threadferry --version)"
 if [[ "$NO_ONBOARD" == "1" ]]; then
   if wecom_cli_authorized; then
-    printf 'Next: threadferry onboard\n'
+    printf 'wecom-cli is already configured. Next: threadferry onboard; it will ask whether to reuse the saved credentials.\n'
   else
     printf 'Next: wecom-cli auth init, then threadferry onboard\n'
   fi
@@ -154,6 +154,8 @@ if ! wecom_cli_authorized; then
     exit 1
   fi
 fi
+
+printf 'wecom-cli is configured. ThreadFerry will ask whether to reuse its saved credentials.\n'
 
 if [[ -t 0 && -t 1 ]]; then
   exec threadferry onboard

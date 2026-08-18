@@ -11,6 +11,7 @@ ThreadFerry 的每个 GitHub Release 都使用这里对应版本的内容，不�
 - `threadferry start` 会在启动前和运行期间主动检查 GitHub Latest Release，自动安装新版本并在当前任务结束后重启。
 - 新增 `threadferry update` 手动更新命令；自动检查或安装失败时保留当前服务并输出告警。
 - 安装器会检测 `wecom-cli 1.1.0+`，缺失或版本过低时自动执行官方 npm 安装命令，并在未授权时进入官方初始化流程。
+- `wecom-cli` 已配置时，ThreadFerry 会询问是否直接读取并复用其加密凭据；读取失败或用户拒绝时仍可手动输入。
 - Release Notes 改为从本文件提取经过整理的中文说明；缺少对应版本内容时发布流程会直接失败。
 
 ## 0.10.1

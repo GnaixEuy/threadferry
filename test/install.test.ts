@@ -81,6 +81,45 @@ fi
   }
 });
 
+test("installer offers to reuse configured wecom CLI credentials", () => {
+  const temporary = mkdtempSync(join(tmpdir(), "threadferry-wecom-configured-"));
+  try {
+    const commandDirectory = join(temporary, "commands");
+    mkdirSync(commandDirectory);
+    writeFileSync(join(commandDirectory, "node"), "#!/usr/bin/env bash\nprintf '22\\n'\n");
+    writeFileSync(join(commandDirectory, "npm"), `#!/usr/bin/env bash
+if [[ "$1 $2" == "root --global" ]]; then
+  printf '%s\\n' "${temporary}/prefix/lib/node_modules"
+elif [[ "$1 $2" == "prefix --global" ]]; then
+  printf '%s\\n' "${temporary}/prefix"
+fi
+`);
+    writeFileSync(join(commandDirectory, "wecom-cli"), `#!/usr/bin/env bash
+if [[ "$1" == "--version" ]]; then
+  printf 'wecom-cli 1.1.0\\n'
+elif [[ "$*" == "auth show --status" ]]; then
+  printf 'authorized\\n'
+fi
+`);
+    writeFileSync(join(commandDirectory, "threadferry"), "#!/usr/bin/env bash\nprintf '0.10.1\\n'\n");
+    for (const command of ["node", "npm", "wecom-cli", "threadferry"]) {
+      chmodSync(join(commandDirectory, command), 0o755);
+    }
+
+    const result = spawnSync("/bin/bash", ["install.sh", "--no-onboard"], {
+      cwd: project,
+      encoding: "utf8",
+      env: { ...process.env, PATH: `${commandDirectory}:/usr/bin:/bin` },
+    });
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /wecom-cli is already configured/);
+    assert.match(result.stdout, /ask whether to reuse the saved credentials/);
+  } finally {
+    rmSync(temporary, { force: true, recursive: true });
+  }
+});
+
 test("release package contains the compiled CLI without a consumer build hook", () => {
   assert.equal(packageMetadata.scripts?.prepare, undefined);
 
