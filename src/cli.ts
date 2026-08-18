@@ -1,0 +1,365 @@
+#!/usr/bin/env node
+import { randomBytes } from "node:crypto";
+import { existsSync } from "node:fs";
+import { mkdir, rename, rm, writeFile } from "node:fs/promises";
+import { basename, dirname, join, resolve } from "node:path";
+import { createApp } from "./app.js";
+import { listWecomGroups, searchWecomUsers, sendWecomReply, startWecomChannel } from "./channels/wecom.js";
+import { loadConfig, resolveWorkspace, saveConfig, setupConfig } from "./config.js";
+import { fetchWecomHistory } from "./history/wecom-cli.js";
+import { runCommand } from "./process.js";
+import { runCodex } from "./runtimes/codex.js";
+import { acquireHostLock, defaultStatePath, newErrorId, WardenState } from "./state.js";
+import type { GroupMessage, IncomingMention, WardenConfig } from "./types.js";
+
+const USAGE = `Warden 0.5
+
+Usage:
+  warden setup --workspace <absolute-path> [--config <path>]
+  warden doctor [--config <path>]
+  warden status [--config <path>]
+  warden session reset --group <group-id> [--config <path>]
+  warden start [--config <path>] [--mock]
+`;
+
+function option(args: string[], name: string): string | undefined {
+  const index = args.indexOf(name);
+  if (index === -1) return undefined;
+  const value = args[index + 1];
+  if (!value || value.startsWith("--")) throw new Error(`${name} 缺少值`);
+  return value;
+}
+
+function atLeast(output: string, minimum: [number, number, number]): boolean {
+  const match = output.match(/\d+\.\d+\.\d+/);
+  if (!match) return false;
+  const version = match[0].split(".").map(Number);
+  for (let index = 0; index < minimum.length; index += 1) {
+    if (version[index] !== minimum[index]) return (version[index] ?? 0) > minimum[index]!;
+  }
+  return true;
+}
+
+function botCredentials(): { botId: string; secret: string } {
+  const botId = process.env.WARDEN_WECOM_BOT_ID;
+  const secret = process.env.WARDEN_WECOM_BOT_SECRET;
+  if (!botId || !secret) {
+    throw new Error("缺少 WARDEN_WECOM_BOT_ID 或 WARDEN_WECOM_BOT_SECRET；请只通过环境变量设置凭据");
+  }
+  return { botId, secret };
+}
+
+async function preflightReal(): Promise<{ botId: string; secret: string }> {
+  const credentials = botCredentials();
+  const wecomVersion = (await runCommand("wecom-cli", ["--version"], { timeoutMs: 10_000 })).stdout;
+  if (!atLeast(wecomVersion, [1, 1, 0])) throw new Error("Warden 要求 wecom-cli 1.1.0+");
+  await runCommand("wecom-cli", ["identity", "whoami", "--json", "{}"], { timeoutMs: 30_000 });
+  const codexVersion = (await runCommand("codex", ["--version"], { timeoutMs: 10_000 })).stdout;
+  if (!atLeast(codexVersion, [0, 138, 0])) throw new Error("Warden 要求 codex-cli 0.138.0+");
+  return credentials;
+}
+
+async function setup(configPath: string, workspaceInput: string): Promise<void> {
+  const target = resolve(configPath);
+  const workspace = await resolveWorkspace(workspaceInput);
+  if (existsSync(target)) await loadConfig(target);
+  const credentials = botCredentials();
+  const code = randomBytes(4).toString("hex");
+  console.log(`请在目标企业微信群发送：@机器人 warden setup ${code}`);
+  console.log("等待配对消息；配置不会保存机器人凭据。");
+
+  await new Promise<void>((done, reject) => {
+    let client: ReturnType<typeof startWecomChannel> | undefined;
+    const stop = () => {
+      client?.disconnect();
+      reject(new Error("setup 已取消"));
+    };
+    const finish = () => {
+      process.off("SIGINT", stop);
+      process.off("SIGTERM", stop);
+      client?.disconnect();
+      done();
+    };
+    client = startWecomChannel(credentials, async (event, reply) => {
+      if (event.chatType !== "group") {
+        await reply("Warden 群配对必须在目标企业微信群中完成。", true).catch(() => undefined);
+        return;
+      }
+      const message = event.message;
+      if (!message.text.includes(`warden setup ${code}`)) {
+        console.log("[setup] 收到群内 @，但配对码不匹配");
+        return;
+      }
+      try {
+        const current = existsSync(target) ? await loadConfig(target) : undefined;
+        const content = setupConfig(message.groupId, workspace, message.senderId, current);
+        const directory = dirname(target);
+        await mkdir(directory, { recursive: true });
+        const temporary = join(directory, `.${basename(target)}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`);
+        try {
+          await writeFile(temporary, content, { flag: "wx", mode: 0o600 });
+          await rename(temporary, target);
+        } finally {
+          await rm(temporary, { force: true });
+        }
+        await reply("Warden 配对完成。请在运行 Warden 的机器上执行 `warden doctor`。").catch(() => undefined);
+        console.log(`配置已更新: ${target}`);
+        finish();
+      } catch (error) {
+        client?.disconnect();
+        reject(error);
+      }
+    });
+    process.once("SIGINT", stop);
+    process.once("SIGTERM", stop);
+  });
+}
+
+async function doctor(configPath?: string): Promise<boolean> {
+  const checks: Array<{ ok: boolean; message: string }> = [];
+  let configuredOwner: string | undefined;
+  const major = Number(process.versions.node.split(".")[0]);
+  checks.push({ ok: major >= 22, message: major >= 22 ? `Node ${process.version}` : `Node ${process.version}；请安装 Node.js 22+ LTS` });
+
+  const chosenConfig = resolve(configPath ?? "warden.yaml");
+  if (!existsSync(chosenConfig)) {
+    checks.push({ ok: false, message: `配置不存在: ${chosenConfig}；复制 warden.example.yaml 后用 --config 指定` });
+  } else {
+    try {
+      const loaded = await loadConfig(chosenConfig);
+      configuredOwner = loaded.ownerUser;
+      checks.push({ ok: true, message: `配置与 ${Object.keys(loaded.groups).length} 个 Workspace 有效` });
+    } catch (error) {
+      checks.push({ ok: false, message: error instanceof Error ? error.message : String(error) });
+    }
+  }
+
+  try {
+    const snapshot = await new WardenState(defaultStatePath()).snapshot();
+    checks.push({ ok: true, message: `本地状态存储有效（${snapshot.turns.length} 条执行记录，${snapshot.sessions.length} 个 Session）` });
+  } catch {
+    checks.push({ ok: false, message: "本地状态存储无效；请检查 ~/.warden 的权限和 state-v3.json 格式" });
+  }
+
+  checks.push({
+    ok: Boolean(process.env.WARDEN_WECOM_BOT_ID && process.env.WARDEN_WECOM_BOT_SECRET),
+    message: process.env.WARDEN_WECOM_BOT_ID && process.env.WARDEN_WECOM_BOT_SECRET
+      ? "企业微信机器人环境变量已设置（值未显示）"
+      : "缺少 WARDEN_WECOM_BOT_ID/WARDEN_WECOM_BOT_SECRET；请通过环境变量设置",
+  });
+
+  try {
+    const { stdout } = await runCommand("wecom-cli", ["--version"], { timeoutMs: 10_000 });
+    const supported = atLeast(stdout, [1, 1, 0]);
+    checks.push({ ok: supported, message: supported ? stdout.trim() : `${stdout.trim()}；Warden 要求 1.1.0+` });
+    try {
+      await runCommand("wecom-cli", ["identity", "whoami", "--json", "{}"], { timeoutMs: 30_000 });
+      checks.push({ ok: true, message: "wecom-cli 身份授权有效（详情未显示）" });
+      if (configuredOwner) {
+        try {
+          const users = await searchWecomUsers([configuredOwner]);
+          const mapped = users.some((user) => user.matchedKeywords?.includes(configuredOwner!));
+          checks.push({
+            ok: mapped,
+            message: mapped
+              ? "企业微信通讯录姓名解析与回调身份映射有效（详情未显示）"
+              : "企业微信通讯录无法映射 Warden Owner；请检查机器人通讯录可见范围",
+          });
+        } catch {
+          checks.push({ ok: false, message: "企业微信通讯录查询失败；请检查 wecom-cli 授权和机器人通讯录可见范围" });
+        }
+      }
+    } catch {
+      checks.push({ ok: false, message: "wecom-cli 未授权或身份检查失败；请先执行 wecom-cli auth init" });
+    }
+  } catch {
+    checks.push({ ok: false, message: "找不到 wecom-cli；请安装企业微信官方 wecom-cli 1.1.0+ 并加入 PATH" });
+  }
+
+  try {
+    const { stdout } = await runCommand("codex", ["--version"], { timeoutMs: 10_000 });
+    const supported = atLeast(stdout, [0, 138, 0]);
+    checks.push({ ok: supported, message: supported ? stdout.trim() : `${stdout.trim()}；Warden 要求 0.138.0+` });
+  } catch {
+    checks.push({ ok: false, message: "找不到 Codex CLI；请安装并执行 codex login" });
+  }
+
+  for (const check of checks) console.log(`${check.ok ? "[ok]" : "[error]"} ${check.message}`);
+  return checks.every((check) => check.ok);
+}
+
+async function runMock(config: WardenConfig): Promise<void> {
+  const [groupId, group] = Object.entries(config.groups)[0]!;
+  const currentTime = new Date();
+  const at = (minutesAgo: number) => new Date(currentTime.getTime() - minutesAgo * 60_000);
+  const history: GroupMessage[] = [
+    { senderId: "zhangsan", senderName: "张三", time: at(5), text: "这个接口有问题" },
+    { senderId: "lisi", senderName: "李四", time: at(4), text: "可能是 Redis" },
+    { senderId: "wangwu", senderName: "王五", time: at(3), text: "线上出现三次" },
+  ];
+  const message: IncomingMention = {
+    msgId: "mock-msg-1",
+    groupId,
+    senderId: group.allowUsers[0]!,
+    senderName: "用户",
+    time: currentTime,
+    text: "@Warden 帮忙分析",
+    mentioned: true,
+  };
+  const app = createApp(config, {
+    history: async () => history,
+    runtime: async ({ workspace, prompt }) => {
+      if (!prompt.includes("张三") || !prompt.includes("李四") || !prompt.includes("王五")) {
+        throw new Error("Mock Context Builder 未包含预期消息");
+      }
+      console.log(`[mock] Codex workspace: ${workspace}`);
+      return { text: "Mock 分析完成：接口异常可能与 Redis 有关，且线上已重复出现三次。", sessionId: "mock-session" };
+    },
+  });
+  const status = await app.handle(message, async (content) => console.log(`[mock] WeCom reply: ${content}`));
+  console.log(`[mock] status: ${status}`);
+}
+
+async function status(configPath?: string): Promise<void> {
+  const config = await loadConfig(resolve(configPath ?? "warden.yaml"));
+  const snapshot = await new WardenState(defaultStatePath()).snapshot();
+  const counts = new Map<string, number>();
+  for (const turn of snapshot.turns) counts.set(turn.status, (counts.get(turn.status) ?? 0) + 1);
+  const active = (counts.get("queued") ?? 0) + (counts.get("running") ?? 0);
+  const lastFailure = snapshot.turns.slice().reverse().find((turn) => turn.status === "failed");
+  console.log(`Warden: ${active > 0 ? `${active} 个任务处理中或排队` : "空闲"}`);
+  console.log(`配置群: ${Object.keys(config.groups).length}；Session: ${snapshot.sessions.length}；执行记录: ${snapshot.turns.length}`);
+  console.log(`可靠性队列: inbox=${snapshot.inbox.length}, outbox=${snapshot.outbox.length}`);
+  console.log(`结果: handled=${counts.get("handled") ?? 0}, stale=${counts.get("stale") ?? 0}, failed=${counts.get("failed") ?? 0}`);
+  if (lastFailure) console.log(`最近失败: ${lastFailure.errorId ?? "无错误编号"} phase=${lastFailure.failurePhase ?? "unknown"} time=${lastFailure.updatedAt}`);
+}
+
+async function resetSession(configPath: string | undefined, groupId: string): Promise<void> {
+  const lock = await acquireHostLock();
+  try {
+    const config = await loadConfig(resolve(configPath ?? "warden.yaml"));
+    if (!config.groups[groupId]) throw new Error("指定群未配置");
+    const removed = await new WardenState(defaultStatePath()).clearSession(groupId);
+    console.log(removed ? "该群 Codex Session 已重置。" : "该群当前没有已保存的 Codex Session。");
+  } finally {
+    await lock.release();
+  }
+}
+
+async function start(configPath: string, mock: boolean): Promise<void> {
+  const configFile = resolve(configPath);
+  const config = await loadConfig(configFile);
+  if (mock) return runMock(config);
+  const credentials = await preflightReal();
+  const lock = await acquireHostLock();
+  try {
+    const state = new WardenState(defaultStatePath());
+    const app = createApp(config, {
+      history: (groupId, options) => fetchWecomHistory(groupId, options),
+      runtime: (request) => runCodex(request),
+      updateAllowUsers: async (groupId, users) => {
+        const latest = await loadConfig(configFile);
+        const group = latest.groups[groupId];
+        if (!group) throw new Error("指定群未配置");
+        group.allowUsers = users;
+        await saveConfig(configFile, latest);
+      },
+      listGroups: () => listWecomGroups(),
+      searchUsers: (keywords) => searchWecomUsers(keywords),
+      onError: ({ errorId, phase }) => console.error(`[wecom] 处理失败 error=${errorId} phase=${phase}`),
+    }, state);
+    const client = startWecomChannel(credentials, async (event, reply) => {
+      const status = event.chatType === "single"
+        ? await app.handleDirect(event.message, reply)
+        : await app.handle(event.message, reply);
+      console.log(`[wecom] 收到${event.chatType === "single" ? "单聊" : "群内 @"}消息，处理状态: ${status}`);
+    });
+    console.log(`Warden 已启动，监听 ${Object.keys(config.groups).length} 个已配置企业微信群。`);
+
+    const recovery = (async () => {
+      const deliveries = await state.pendingDeliveries();
+      for (const delivery of deliveries) {
+        if (!config.groups[delivery.groupId]) {
+          await state.completeDelivery(delivery.id);
+          console.error("[state] 已丢弃未配置群的待发送回复");
+          continue;
+        }
+        try {
+          await sendWecomReply(delivery.groupId, delivery.content);
+          await state.completeDelivery(delivery.id);
+          console.log("[state] 已补发 1 条上次未投递的回复");
+        } catch {
+          const errorId = newErrorId();
+          await state.deliveryFailed(delivery.id, errorId).catch(() => undefined);
+          console.error(`[wecom] 补发失败 error=${errorId} phase=reply`);
+        }
+      }
+
+      const pending = await state.recoverPending();
+      if (pending.length > 0) console.log(`[state] 正在恢复 ${pending.length} 个上次中断的任务`);
+      await Promise.all(pending.map(async (message) => {
+        const result = await app.replay(message, async (content, finish = true) => {
+          if (finish) await sendWecomReply(message.groupId, content);
+        });
+        console.log(`[state] 恢复任务处理状态: ${result}`);
+      }));
+    })().catch(() => {
+      const errorId = newErrorId();
+      console.error(`[state] 恢复失败 error=${errorId} phase=host`);
+    });
+
+    await new Promise<void>((done) => {
+      let stopping = false;
+      const stop = () => {
+        if (stopping) return;
+        stopping = true;
+        client.disconnect();
+        void Promise.all([app.shutdown(), recovery]).finally(done);
+      };
+      process.once("SIGINT", stop);
+      process.once("SIGTERM", stop);
+    });
+  } finally {
+    await lock.release();
+  }
+}
+
+async function main(): Promise<void> {
+  const [, , command, ...args] = process.argv;
+  if (!command || command === "--help" || command === "-h") {
+    console.log(USAGE);
+    return;
+  }
+  if (command === "doctor") {
+    if (!(await doctor(option(args, "--config")))) process.exitCode = 1;
+    return;
+  }
+  if (command === "status") {
+    await status(option(args, "--config"));
+    return;
+  }
+  if (command === "session") {
+    if (args[0] !== "reset") throw new Error("warden session 仅支持 reset");
+    const groupId = option(args, "--group");
+    if (!groupId) throw new Error("warden session reset 必须提供 --group <group-id>");
+    await resetSession(option(args, "--config"), groupId);
+    return;
+  }
+  if (command === "setup") {
+    const workspace = option(args, "--workspace");
+    if (!workspace) throw new Error("warden setup 必须提供 --workspace <absolute-path>");
+    await setup(option(args, "--config") ?? "warden.yaml", workspace);
+    return;
+  }
+  if (command === "start") {
+    const configPath = option(args, "--config") ?? "warden.yaml";
+    await start(configPath, args.includes("--mock"));
+    return;
+  }
+  throw new Error(`未知命令: ${command}\n${USAGE}`);
+}
+
+void main().catch((error) => {
+  console.error(`Warden: ${error instanceof Error ? error.message : String(error)}`);
+  process.exitCode = 1;
+});

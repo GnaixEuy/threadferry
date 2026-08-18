@@ -1,0 +1,9 @@
+version: 4
+
+owner_user: "user_owner"
+
+groups:
+  "group_xxx":
+    workspace: "/absolute/path/to/project"
+    allow_users:
+      - "user_owner"

@@ -1,0 +1,544 @@
+import assert from "node:assert/strict";
+import { mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import test from "node:test";
+import { createApp } from "../src/app.js";
+import { listWecomGroups, searchWecomUsers, sendWecomReply } from "../src/channels/wecom.js";
+import { loadConfig, resolveWorkspace, saveConfig, setupConfig } from "../src/config.js";
+import { fetchWecomHistory } from "../src/history/wecom-cli.js";
+import { CommandExecutionError, runCommand } from "../src/process.js";
+import { runCodex } from "../src/runtimes/codex.js";
+import { WardenState } from "../src/state.js";
+import type { CommandRunner, GroupMessage, IncomingMention, WardenConfig } from "../src/types.js";
+
+test("mock WeCom -> history -> context -> Codex -> reply vertical slice", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "warden-test-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const workspace = await realpath(root);
+  const config: WardenConfig = {
+    version: 4,
+    ownerUser: "user_allowed",
+    groups: {
+      group_allowed: {
+        workspace,
+        runtime: "codex",
+        allowUsers: ["user_allowed"],
+        context: { lookbackHours: 6, maxMessages: 80 },
+      },
+    },
+    security: { requireMention: true, readOnly: true },
+  };
+  const currentTime = new Date("2026-08-18T10:05:00+08:00");
+  const history: GroupMessage[] = [
+    { senderId: "user-1", senderName: "张三", time: new Date("2026-08-18T10:00:00+08:00"), text: "这个接口有问题" },
+    { senderId: "user-2", senderName: "李四", time: new Date("2026-08-18T10:01:00+08:00"), text: "可能是 Redis" },
+    { senderId: "user-3", senderName: "王五", time: new Date("2026-08-18T10:02:00+08:00"), text: "线上出现三次" },
+  ];
+  let runtimeCalls = 0;
+  let receivedPrompt = "";
+  const runtimeArgs: string[][] = [];
+  const fakeCodex: CommandRunner = async (command, args, options) => {
+    runtimeCalls += 1;
+    runtimeArgs.push(args);
+    receivedPrompt = options?.input ?? "";
+    assert.equal(command, "codex");
+    assert.equal(options?.cwd, workspace);
+    assert.equal(args[args.indexOf("-C") + 1], workspace);
+    assert.match(args.find((arg) => arg.startsWith("permissions.warden-read-only.filesystem=")) ?? "", /":workspace_roots"=\{"\."="read"/);
+    assert.ok(args.includes("permissions.warden-read-only.network.enabled=false"));
+    assert.ok(!args.includes("workspace-write"));
+    assert.ok(args.indexOf("-a") < args.indexOf("exec"));
+    assert.ok(args.includes("never"));
+    assert.ok(args.includes("--json"));
+    assert.ok(args.includes("--ignore-user-config"));
+    assert.ok(!args.includes("--ephemeral"));
+    assert.equal(options?.env?.WARDEN_WECOM_BOT_SECRET, undefined);
+    return {
+      stdout: `${JSON.stringify({ type: "thread.started", thread_id: "session-1" })}\n${JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: "只读分析结果" } })}\n`,
+      stderr: "",
+    };
+  };
+  const app = createApp(config, {
+    history: async () => history,
+    runtime: (request) => runCodex(request, fakeCodex),
+  });
+  const replies: Array<{ content: string; finish: boolean }> = [];
+  const reply = async (content: string, finish = true) => { replies.push({ content, finish }); };
+  const message: IncomingMention = {
+    msgId: "msg-4",
+    groupId: "group_allowed",
+    senderId: "user_allowed",
+    senderName: "用户",
+    time: currentTime,
+    text: "@Warden 帮忙分析",
+    mentioned: true,
+  };
+
+  assert.equal(await app.handle(message, reply), "handled");
+  assert.equal(runtimeCalls, 1);
+  assert.deepEqual(replies, [
+    { content: "Warden 已收到，正在分析。", finish: false },
+    { content: "只读分析结果", finish: true },
+  ]);
+  for (const expected of ["张三", "这个接口有问题", "李四", "可能是 Redis", "王五", "线上出现三次", "@Warden 帮忙分析"]) {
+    assert.match(receivedPrompt, new RegExp(expected));
+  }
+
+  assert.equal(await app.handle({ ...message, msgId: "msg-5", time: new Date(currentTime.getTime() + 60_000), text: "@Warden 继续分析" }, reply), "handled");
+  assert.deepEqual(runtimeArgs[1]?.slice(-3), ["resume", "session-1", "-"]);
+  assert.equal(await app.handle(message, reply), "duplicate");
+  assert.equal(await app.handle({ ...message, msgId: "bad-group", groupId: "group_other" }, reply), "unauthorized_group");
+  assert.equal(await app.handle({ ...message, msgId: "bad-user", senderId: "user_other" }, reply), "unauthorized_user");
+  assert.equal(await app.handle({ ...message, msgId: "no-mention", mentioned: false }, reply), "missing_mention");
+  assert.equal(runtimeCalls, 2);
+  assert.equal(replies.length, 4);
+});
+
+test("robot owner manages per-group users in direct chat", async () => {
+  const config: WardenConfig = {
+    version: 4,
+    ownerUser: "owner",
+    groups: {
+      group: {
+        workspace: "/workspace",
+        runtime: "codex",
+        allowUsers: ["owner"],
+        context: { lookbackHours: 6, maxMessages: 80 },
+      },
+    },
+    security: { requireMention: true, readOnly: true },
+  };
+  const persisted: Array<{ groupId: string; users: string[] }> = [];
+  let runtimeCalls = 0;
+  const app = createApp(config, {
+    history: async () => [],
+    runtime: async () => {
+      runtimeCalls += 1;
+      return { text: "分析结果" };
+    },
+    updateAllowUsers: async (groupId, users) => { persisted.push({ groupId, users: [...users] }); },
+    listGroups: async () => [
+      { id: "group", name: "AI Coding" },
+      { id: "group-unconfigured", name: "未配置群" },
+    ],
+    searchUsers: async (keywords) => [
+      { id: "owner-directory", name: "创建者", callbackId: "owner" },
+      { id: "new-user", name: "新用户" },
+      { id: "lisi", name: "李四", callbackId: "lisi-callback" },
+      { id: "zhangsan-1", name: "张三", departments: ["研发一部"] },
+      { id: "zhangsan-2", name: "张三", departments: ["研发二部"] },
+    ].flatMap((user) => {
+      const matchedKeywords = keywords.filter((keyword) => user.id === keyword || user.name.includes(keyword) || user.callbackId === keyword);
+      return matchedKeywords.length ? [{ ...user, matchedKeywords }] : [];
+    }),
+  });
+  const replies: string[] = [];
+  let sequence = 0;
+  const direct = (senderId: string, text: string, msgId = `direct-${sequence += 1}`) => app.handleDirect({
+    msgId,
+    senderId,
+    time: new Date(),
+    text,
+  }, async (content) => { replies.push(content); });
+  const group = (senderId: string, text: string) => app.handle({
+    msgId: `group-${sequence += 1}`,
+    groupId: "group",
+    senderId,
+    time: new Date(),
+    text,
+    mentioned: true,
+  }, async (content) => { replies.push(content); });
+
+  assert.equal(await direct("new-user", "warden groups"), "command");
+  assert.match(replies.at(-1) ?? "", /只有.*Owner/);
+  assert.equal(await direct("owner", "warden groups"), "command");
+  assert.match(replies.at(-1) ?? "", /AI Coding/);
+  assert.match(replies.at(-1) ?? "", /\[已配置\].*\[未配置 Workspace\]/s);
+  assert.equal(await direct("owner", "warden invite AI Coding"), "command");
+  const code = replies.at(-1)?.match(/邀请码：`([A-F0-9]{12})`/)?.[1];
+  assert.ok(code);
+  assert.equal(await group("new-user", `@机器人 warden join ${code}`), "command");
+  assert.deepEqual(persisted, [{ groupId: "group", users: ["owner", "new-user"] }]);
+
+  assert.equal(await group("new-user", "@机器人 分析"), "handled");
+  assert.equal(runtimeCalls, 1);
+  assert.equal(await direct("owner", "warden users AI Coding"), "command");
+  assert.match(replies.at(-1) ?? "", /新用户/);
+  assert.equal(await direct("owner", "warden add AI Coding 李四"), "command");
+  assert.deepEqual(persisted.at(-1), { groupId: "group", users: ["owner", "new-user", "lisi"] });
+  assert.match(replies.at(-1) ?? "", /授权 李四/);
+  assert.equal(await group("lisi-callback", "@机器人 分析李四的问题"), "handled");
+  assert.equal(runtimeCalls, 2);
+  const beforeAmbiguous = persisted.length;
+  assert.equal(await direct("owner", "warden add AI Coding 张三"), "command");
+  assert.equal(persisted.length, beforeAmbiguous);
+  assert.match(replies.at(-1) ?? "", /多个.*id:zhangsan-1.*id:zhangsan-2/s);
+  assert.equal(await direct("owner", "warden add AI Coding id:zhangsan-2"), "command");
+  assert.deepEqual(persisted.at(-1), { groupId: "group", users: ["owner", "new-user", "lisi", "zhangsan-2"] });
+  assert.equal(await direct("owner", "warden remove AI Coding 新用户"), "command");
+  assert.deepEqual(persisted.at(-1), { groupId: "group", users: ["owner", "lisi", "zhangsan-2"] });
+  assert.equal(await group("new-user", "@机器人 再分析"), "unauthorized_user");
+  assert.equal(await group("owner", "@机器人 warden users group"), "command");
+  assert.match(replies.at(-1) ?? "", /请私聊/);
+  assert.equal(await direct("new-user", "warden whoami"), "command");
+  assert.match(replies.at(-1) ?? "", /new-user/);
+  assert.equal(await direct("owner", "warden remove AI Coding 创建者"), "command");
+  assert.match(replies.at(-1) ?? "", /不能移除/);
+  assert.equal(await direct("owner", "warden groups", "duplicate-direct"), "command");
+  assert.equal(await direct("owner", "warden groups", "duplicate-direct"), "duplicate");
+  assert.equal(runtimeCalls, 2);
+});
+
+test("wecom group session listing uses the official message command", async () => {
+  let received: { command: string; args: string[] } | undefined;
+  const groups = await listWecomGroups(async (command, args) => {
+    received = { command, args };
+    return {
+      stdout: JSON.stringify({
+        sessions: [
+          { chat_id: "group-1", chat_name: "月相工作室", chat_type: "group" },
+          { chat_id: "user-1", chat_name: "苏粤翔", chat_type: "single" },
+        ],
+      }),
+      stderr: "",
+    };
+  });
+  assert.deepEqual(received, {
+    command: "wecom-cli",
+    args: ["message", "aibot", "sessions", "list", "--json", "{}"],
+  });
+  assert.deepEqual(groups, [{ id: "group-1", name: "月相工作室" }]);
+});
+
+test("wecom contact search uses names without shell interpolation", async () => {
+  let received: { command: string; args: string[] } | undefined;
+  const users = await searchWecomUsers(["张三"], async (command, args) => {
+    received = { command, args };
+    return {
+      stdout: JSON.stringify({
+        users: [{ userid: "zhangsan", name: "张三", alias: "Sam", departments: ["研发部"], matched_keywords: ["张三"] }],
+      }),
+      stderr: "",
+    };
+  });
+  assert.equal(received?.command, "wecom-cli");
+  assert.deepEqual(received?.args.slice(0, 5), ["contact", "users", "search", "--json", JSON.stringify({ keywords: ["张三"], search_mode: "list" })]);
+  assert.deepEqual(users, [{ id: "zhangsan", name: "张三", alias: "Sam", departments: ["研发部"], matchedKeywords: ["张三"] }]);
+});
+
+test("workspace paths cannot be relative or escape through a symlink", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "warden-path-test-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const link = `${root}-link`;
+  t.after(() => rm(link, { force: true }));
+  await symlink(root, link, "dir");
+  await assert.rejects(resolveWorkspace("../outside"), /绝对路径/);
+  await assert.rejects(resolveWorkspace(link), /符号链接/);
+
+  const configPath = join(root, "bad.yaml");
+  await writeFile(configPath, `version: 4\nowner_user: user\ngroups:\n  group:\n    workspace: ../outside\n    allow_users: [user]\n`);
+  await assert.rejects(loadConfig(configPath), /绝对路径/);
+
+  const compactPath = join(root, "compact.yaml");
+  await writeFile(compactPath, setupConfig("group", await realpath(root), "user"));
+  const compact = await loadConfig(compactPath);
+  assert.equal(compact.groups.group?.runtime, "codex");
+  assert.equal(compact.ownerUser, "user");
+  assert.deepEqual(compact.groups.group?.context, { lookbackHours: 6, maxMessages: 80 });
+  assert.deepEqual(compact.groups.group?.allowUsers, ["user"]);
+
+  const mergedPath = join(root, "merged.yaml");
+  await writeFile(mergedPath, setupConfig("group", await realpath(root), "user", compact));
+  const merged = await loadConfig(mergedPath);
+  assert.deepEqual(merged.groups.group?.allowUsers, ["user"]);
+  assert.throws(() => setupConfig("group", compact.groups.group!.workspace, "user-2", compact), /Owner/);
+  assert.throws(() => setupConfig("group", "/different", "user", compact), /已绑定其他 Workspace/);
+
+  compact.groups.group!.allowUsers.push("user-2");
+  await saveConfig(compactPath, compact);
+  assert.deepEqual((await loadConfig(compactPath)).groups.group?.allowUsers, ["user", "user-2"]);
+});
+
+test("legacy and extra configuration fields are rejected", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "warden-config-test-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const legacyPath = join(root, "legacy.yaml");
+  await writeFile(legacyPath, "version: 1\nchannels: {}\n");
+  await assert.rejects(loadConfig(legacyPath), /旧版配置不再兼容/);
+
+  const extraPath = join(root, "extra.yaml");
+  await writeFile(extraPath, `version: 4\nowner_user: user\ngroups:\n  group:\n    workspace: ${JSON.stringify(await realpath(root))}\n    allow_users: [user]\n    runtime: codex\n`);
+  await assert.rejects(loadConfig(extraPath), /不支持字段: runtime/);
+});
+
+test("a newer group message makes the completed analysis stale", async () => {
+  const now = new Date("2026-08-18T10:05:00+08:00");
+  const config: WardenConfig = {
+    version: 4,
+    ownerUser: "user",
+    groups: { group: { workspace: "/workspace", runtime: "codex", allowUsers: ["user"], context: { lookbackHours: 6, maxMessages: 80 } } },
+    security: { requireMention: true, readOnly: true },
+  };
+  let reads = 0;
+  const app = createApp(config, {
+    history: async () => ++reads === 1 ? [] : [{ senderId: "other", time: new Date(now.getTime() + 1000), text: "新消息" }],
+    runtime: async () => ({ text: "已经过期的分析" }),
+  });
+  const replies: Array<{ content: string; finish: boolean }> = [];
+  const status = await app.handle({
+    msgId: "freshness", groupId: "group", senderId: "user", time: now, text: "@Warden 分析", mentioned: true,
+  }, async (content, finish = true) => { replies.push({ content, finish }); });
+
+  assert.equal(status, "stale");
+  assert.deepEqual(replies, [
+    { content: "Warden 已收到，正在分析。", finish: false },
+    { content: "分析期间群里出现了新消息。为避免发送过期结论，请重新 @机器人。", finish: true },
+  ]);
+});
+
+test("same-group turns run serially and queued users get immediate feedback", async () => {
+  const config: WardenConfig = {
+    version: 4,
+    ownerUser: "user",
+    groups: { group: { workspace: "/workspace", runtime: "codex", allowUsers: ["user"], context: { lookbackHours: 6, maxMessages: 80 } } },
+    security: { requireMention: true, readOnly: true },
+  };
+  let releaseFirst!: () => void;
+  const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve; });
+  let calls = 0;
+  let active = 0;
+  let maxActive = 0;
+  const app = createApp(config, {
+    history: async () => [],
+    runtime: async () => {
+      calls += 1;
+      active += 1;
+      maxActive = Math.max(maxActive, active);
+      if (calls === 1) await firstGate;
+      active -= 1;
+      return { text: `result-${calls}` };
+    },
+  });
+  const message = (msgId: string): IncomingMention => ({
+    msgId, groupId: "group", senderId: "user", time: new Date(), text: "@Warden 分析", mentioned: true,
+  });
+  const firstReplies: string[] = [];
+  const secondReplies: string[] = [];
+  const first = app.handle(message("serial-1"), async (content) => { firstReplies.push(content); });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  const second = app.handle(message("serial-2"), async (content) => { secondReplies.push(content); });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+
+  assert.equal(calls, 1);
+  assert.equal(secondReplies[0], "Warden 已收到，当前群有任务处理中，已排队。");
+  releaseFirst();
+  assert.deepEqual(await Promise.all([first, second]), ["handled", "handled"]);
+  assert.equal(maxActive, 1);
+  assert.equal(firstReplies.at(-1), "result-1");
+  assert.equal(secondReplies.at(-1), "result-2");
+});
+
+test("runtime failures return and persist a redacted error id", async () => {
+  const config: WardenConfig = {
+    version: 4,
+    ownerUser: "user",
+    groups: { group: { workspace: "/workspace", runtime: "codex", allowUsers: ["user"], context: { lookbackHours: 6, maxMessages: 80 } } },
+    security: { requireMention: true, readOnly: true },
+  };
+  const state = new WardenState();
+  const errors: Array<{ errorId: string; phase: string }> = [];
+  const app = createApp(config, {
+    history: async () => [],
+    runtime: async () => { throw new Error("secret detail must not escape"); },
+    onError: (error) => { errors.push(error); },
+  }, state);
+  const replies: string[] = [];
+  const result = await app.handle({
+    msgId: "failure", groupId: "group", senderId: "user", time: new Date(), text: "@Warden 分析", mentioned: true,
+  }, async (content) => { replies.push(content); });
+
+  assert.equal(result, "failed");
+  assert.match(replies.at(-1) ?? "", /错误编号 W-[A-F0-9]{8}/);
+  assert.doesNotMatch(replies.join("\n"), /secret detail/);
+  assert.equal(errors[0]?.phase, "runtime");
+  assert.equal((await state.snapshot()).turns[0]?.errorId, errors[0]?.errorId);
+});
+
+test("wecom history uses chat.messages.list arguments and keeps attachment metadata", async () => {
+  const runner: CommandRunner = async (command, args) => {
+    assert.equal(command, "wecom-cli");
+    assert.deepEqual(args.slice(0, 3), ["chat", "messages", "list"]);
+    assert.equal(args[args.indexOf("--chat-id") + 1], "group_allowed");
+    return {
+      stdout: JSON.stringify({
+        errcode: 0,
+        data: {
+          messages: [
+            { msg_type: "text", send_time: "2026-08-18 10:00:00", userid: "user-1", user_name: "张三", text: { content: "接口异常" } },
+            { msg_type: "file", send_time: "2026-08-18 10:01:00", userid: "user-2", user_name: "李四", file: { file_name: "trace.log", media_id: "metadata-only" } },
+          ],
+          has_more: false,
+        },
+      }),
+      stderr: "",
+    };
+  };
+  const messages = await fetchWecomHistory("group_allowed", {
+    lookbackHours: 6,
+    maxMessages: 80,
+    endTime: new Date("2026-08-18T10:05:00+08:00"),
+  }, runner);
+  assert.equal(messages[0]?.senderName, "张三");
+  assert.equal(messages[0]?.text, "接口异常");
+  assert.deepEqual(messages[1]?.attachments, [{ type: "file", name: "trace.log" }]);
+  assert.doesNotMatch(JSON.stringify(messages), /metadata-only/);
+});
+
+test("same-second history changes are detected by fingerprint", async () => {
+  const now = new Date("2026-08-18T10:05:00+08:00");
+  const base: GroupMessage = { senderId: "first", time: new Date(now.getTime() - 60_000), text: "原消息" };
+  const config: WardenConfig = {
+    version: 4,
+    ownerUser: "user",
+    groups: { group: { workspace: "/workspace", runtime: "codex", allowUsers: ["user"], context: { lookbackHours: 6, maxMessages: 80 } } },
+    security: { requireMention: true, readOnly: true },
+  };
+  let reads = 0;
+  const app = createApp(config, {
+    history: async () => ++reads === 1 ? [base] : [base, { senderId: "other", time: now, text: "同一秒的新消息" }],
+    runtime: async () => ({ text: "已经过期的分析" }),
+  });
+  const status = await app.handle({
+    msgId: "same-second", groupId: "group", senderId: "user", time: now, text: "@Warden 分析", mentioned: true,
+  }, async () => undefined);
+  assert.equal(status, "stale");
+});
+
+test("an interrupted inbox is replayed after restart and final content is removed", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "warden-replay-test-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const statePath = join(root, "state-v3.json");
+  const state = new WardenState(statePath);
+  const message: IncomingMention = {
+    msgId: "replay-1", groupId: "group", senderId: "user", time: new Date(), text: "@Warden 恢复", mentioned: true,
+  };
+  await state.enqueue(message);
+  await state.markRunning(message.msgId);
+
+  const restarted = new WardenState(statePath);
+  const [pending] = await restarted.recoverPending();
+  assert.ok(pending);
+  const config: WardenConfig = {
+    version: 4,
+    ownerUser: "user",
+    groups: { group: { workspace: "/workspace", runtime: "codex", allowUsers: ["user"], context: { lookbackHours: 6, maxMessages: 80 } } },
+    security: { requireMention: true, readOnly: true },
+  };
+  const replies: string[] = [];
+  const app = createApp(config, {
+    history: async () => [],
+    runtime: async () => ({ text: "恢复后的结果", sessionId: "recovered-session" }),
+  }, restarted);
+  assert.equal(await app.replay(pending, async (content) => { replies.push(content); }), "handled");
+  assert.deepEqual(replies, ["恢复后的结果"]);
+  const snapshot = await restarted.snapshot();
+  assert.equal(snapshot.inbox.length, 0);
+  assert.equal(snapshot.outbox.length, 0);
+  assert.doesNotMatch(JSON.stringify(snapshot), /恢复后的结果|@Warden/);
+});
+
+test("a failed callback delivery remains in the durable outbox", async () => {
+  const config: WardenConfig = {
+    version: 4,
+    ownerUser: "user",
+    groups: { group: { workspace: "/workspace", runtime: "codex", allowUsers: ["user"], context: { lookbackHours: 6, maxMessages: 80 } } },
+    security: { requireMention: true, readOnly: true },
+  };
+  const state = new WardenState();
+  const app = createApp(config, { history: async () => [], runtime: async () => ({ text: "待补发结果" }) }, state);
+  const result = await app.handle({
+    msgId: "delivery-1", groupId: "group", senderId: "user", time: new Date(), text: "@Warden 分析", mentioned: true,
+  }, async (_content, finish = true) => {
+    if (finish) throw new Error("connection closed");
+  });
+  assert.equal(result, "delivery_pending");
+  const snapshot = await state.snapshot();
+  assert.equal(snapshot.turns[0]?.status, "handled");
+  assert.equal(snapshot.inbox.length, 0);
+  assert.equal(snapshot.outbox[0]?.content, "待补发结果");
+  assert.equal(snapshot.outbox[0]?.attempts, 1);
+});
+
+test("active WeCom reply uses message.aibot.send with a JSON argument", async () => {
+  const runner: CommandRunner = async (command, args) => {
+    assert.equal(command, "wecom-cli");
+    assert.deepEqual(args.slice(0, 4), ["message", "aibot", "send", "--json"]);
+    assert.deepEqual(JSON.parse(args[4]!), {
+      chat_id: "group",
+      msg_type: "markdown",
+      markdown: { content: "恢复结果" },
+    });
+    return { stdout: JSON.stringify({ errcode: 0, data: { success: true } }), stderr: "" };
+  };
+  await sendWecomReply("group", "恢复结果", runner);
+});
+
+test("Codex starts a fresh session only when a saved session is definitely missing", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "warden-codex-resume-test-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const workspace = await realpath(root);
+  const calls: string[][] = [];
+  const runner: CommandRunner = async (_command, args) => {
+    calls.push(args);
+    if (calls.length === 1) throw new CommandExecutionError("codex", 1, "", "No rollout found with id missing-session");
+    return {
+      stdout: `${JSON.stringify({ type: "thread.started", thread_id: "new-session" })}\n${JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: "新会话结果" } })}\n`,
+      stderr: "",
+    };
+  };
+  const result = await runCodex({ workspace, prompt: "分析", sessionId: "missing-session" }, runner);
+  assert.equal(calls.length, 2);
+  assert.deepEqual(calls[0]?.slice(-3), ["resume", "missing-session", "-"]);
+  assert.equal(calls[1]?.at(-1), "-");
+  assert.ok(!calls[1]?.includes("resume"));
+  assert.deepEqual(result, { text: "新会话结果", sessionId: "new-session" });
+});
+
+test("running Codex work can be cancelled during shutdown", async () => {
+  const config: WardenConfig = {
+    version: 4,
+    ownerUser: "user",
+    groups: { group: { workspace: "/workspace", runtime: "codex", allowUsers: ["user"], context: { lookbackHours: 6, maxMessages: 80 } } },
+    security: { requireMention: true, readOnly: true },
+  };
+  let started!: () => void;
+  const running = new Promise<void>((resolve) => { started = resolve; });
+  const app = createApp(config, {
+    history: async () => [],
+    runtime: ({ signal }) => new Promise((_resolve, reject) => {
+      started();
+      signal?.addEventListener("abort", () => {
+        const error = new Error("cancelled");
+        error.name = "AbortError";
+        reject(error);
+      }, { once: true });
+    }),
+  });
+  const result = app.handle({
+    msgId: "cancel-1", groupId: "group", senderId: "user", time: new Date(), text: "@Warden 分析", mentioned: true,
+  }, async () => undefined);
+  await running;
+  await app.shutdown();
+  assert.equal(await result, "failed");
+});
+
+test("command runner aborts the child process", async () => {
+  const controller = new AbortController();
+  const running = runCommand(process.execPath, ["-e", "setInterval(() => undefined, 1000)"], {
+    signal: controller.signal,
+    timeoutMs: 30_000,
+  });
+  setTimeout(() => controller.abort(), 20);
+  await assert.rejects(running, (error: unknown) => error instanceof Error && error.name === "AbortError");
+});
