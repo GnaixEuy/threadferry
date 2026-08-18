@@ -59,6 +59,9 @@ jobs:
           npm install --global --ignore-scripts --prefix "$install_prefix" ./release/threadferry.tgz
           test "$("$install_prefix/bin/threadferry" --version)" = "$PACKAGE_VERSION"
 
+      - name: Prepare release notes
+        run: node scripts/release-notes.mjs "$PACKAGE_VERSION" > release/RELEASE_NOTES.md
+
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -67,5 +70,5 @@ jobs:
           release/threadferry.tgz
           release/SHA256SUMS
           --verify-tag
-          --generate-notes
+          --notes-file release/RELEASE_NOTES.md
           --title "ThreadFerry $GITHUB_REF_NAME"

@@ -59,6 +59,21 @@ test("release package contains the compiled CLI without a consumer build hook", 
   assert.ok(files.every(({ path }) => !path.startsWith("src/")));
 });
 
+test("release workflow publishes curated changelog notes", () => {
+  const workflow = readFileSync(join(project, ".github", "workflows", "release.yml"), "utf8");
+  assert.match(workflow, /scripts\/release-notes\.mjs/);
+  assert.match(workflow, /--notes-file release\/RELEASE_NOTES\.md/);
+  assert.doesNotMatch(workflow, /--generate-notes/);
+
+  const notes = spawnSync(process.execPath, ["scripts/release-notes.mjs", packageMetadata.version], {
+    cwd: project,
+    encoding: "utf8",
+  });
+  assert.equal(notes.status, 0, notes.stderr);
+  assert.match(notes.stdout, /## 主要变化/);
+  assert.match(notes.stdout, /## 安装与升级/);
+});
+
 test("remote installer replaces an existing linked development install", () => {
   const temporary = mkdtempSync(join(tmpdir(), "threadferry-installer-"));
   try {
