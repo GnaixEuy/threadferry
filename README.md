@@ -125,7 +125,7 @@ Or send it in the relevant group:
 
 ## Manage Agents
 
-Use the admin console to add agents, bind groups, and manage users. Changes take effect immediately.
+The admin console has three pages: an overview with runtime status and pending actions, an AI spaces (agents) page for adding agents, reviewing group bindings, and removing unused agents, and a groups page for binding or unbinding groups, switching agents, managing authorized users, and resetting group sessions. Changes take effect immediately.
 
 You can also use the CLI:
 

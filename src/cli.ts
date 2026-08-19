@@ -20,7 +20,7 @@ import type { GroupMessage, IncomingMention, RuntimeName, ThreadFerryConfig } fr
 import { findUpdate, installUpdate } from "./update.js";
 import { loadWecomCliCredentials } from "./wecom-credentials.js";
 
-const VERSION = "0.12.3";
+const VERSION = "0.13.0";
 const UPDATE_INTERVAL_MS = 6 * 60 * 60 * 1_000;
 const USAGE = `ThreadFerry ${VERSION}
 
@@ -584,6 +584,8 @@ async function start(configPath: string, mock: boolean, port: number): Promise<s
       updateConfig,
       listGroups: () => listWecomGroups(),
       searchUsers: (keywords) => searchWecomUsers(keywords),
+      snapshot: () => state.snapshot(),
+      resetSession: (groupId) => state.clearSession(groupId),
     }, port);
     console.log(`ThreadFerry 管理台: ${admin.url}`);
     try {

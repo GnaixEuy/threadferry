@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { mkdtemp, realpath, rm } from "node:fs/promises";
 import { request as httpRequest } from "node:http";
 import { tmpdir } from "node:os";
@@ -18,20 +19,49 @@ test("localhost admin manages agents, groups, and users with CSRF protection", a
     groups: { group: { agent: "default", allowUsers: ["owner"], context: { lookbackHours: 6, maxMessages: 80 } } },
     security: { requireMention: true, readOnly: true },
   };
+  const digest = (value: string) => createHash("sha256").update(value).digest("hex");
+  const now = new Date().toISOString();
+  const resetCalls: string[] = [];
   const admin = await startAdminServer(config, {
     updateConfig: async (change) => { await change(config); },
     listGroups: async () => [{ id: "group", name: "AI Coding" }, { id: "new-group", name: "新群" }],
     searchUsers: async (keywords) => keywords.includes("张三")
       ? [{ id: "zhangsan", name: "张三", matchedKeywords: ["张三"] }]
       : [],
+    snapshot: async () => ({
+      turns: [
+        { id: digest("msg-1"), group: digest("group"), status: "running", receivedAt: now, updatedAt: now },
+        { id: digest("msg-2"), group: digest("group"), status: "failed", receivedAt: now, updatedAt: now, errorId: "TF-12345678", failurePhase: "runtime" },
+      ],
+      sessions: [{ group: digest("group"), workspace: digest(workspace), sessionId: "session-1", updatedAt: now }],
+      inbox: [],
+      outbox: [],
+    }),
+    resetSession: async (groupId) => { resetCalls.push(groupId); return true; },
   }, 0);
   t.after(() => admin.close());
 
-  const first = await fetch(admin.url);
+  const overview = await (await fetch(`${admin.url}/`)).text();
+  assert.match(overview, /ThreadFerry 管理台/);
+  assert.match(overview, /概览/);
+  assert.match(overview, /待绑定群/);
+  assert.match(overview, /新群/);
+  assert.match(overview, /排队 \/ 运行中/);
+  assert.match(overview, /TF-12345678/);
+
+  const agentsPage = await (await fetch(`${admin.url}/agents`)).text();
+  assert.match(agentsPage, /AI 空间/);
+  assert.match(agentsPage, /default/);
+  assert.match(agentsPage, /AI Coding/);
+
+  const first = await fetch(`${admin.url}/groups`);
   const page = await first.text();
   assert.equal(first.status, 200);
   assert.match(first.headers.get("content-security-policy") ?? "", /default-src 'none'/);
-  assert.match(page, /ThreadFerry 管理台.*AI Coding.*未绑定/s);
+  assert.match(page, /AI Coding/);
+  assert.match(page, /待绑定/);
+  assert.match(page, /重置 Session/);
+  assert.match(page, /解绑群/);
   const hostileStatus = await new Promise<number | undefined>((resolve, reject) => {
     const target = new URL(admin.url);
     const request = httpRequest({ hostname: target.hostname, port: target.port, headers: { host: "evil.example" } }, (response) => resolve(response.statusCode));
@@ -54,9 +84,11 @@ test("localhost admin manages agents, groups, and users with CSRF protection", a
 
   const added = await post("/agents/add", { agentId: "reviewer", runtime: "pi", workspace, model: "provider/model" });
   assert.equal(added.status, 303);
+  assert.match(added.headers.get("location") ?? "", /^\/agents\?ok=/);
   assert.deepEqual(config.agents.reviewer, { runtime: "pi", workspace, model: "provider/model" });
 
-  await post("/groups/agent", { groupId: "group", agentId: "reviewer" });
+  const switched = await post("/groups/agent", { groupId: "group", agentId: "reviewer" });
+  assert.match(switched.headers.get("location") ?? "", /^\/groups\?ok=.*#group$/);
   assert.equal(config.groups.group?.agent, "reviewer");
   await post("/groups/users/add", { groupId: "group", user: "张三" });
   assert.deepEqual(config.groups.group?.allowUsers, ["owner", "zhangsan"]);
@@ -72,6 +104,34 @@ test("localhost admin manages agents, groups, and users with CSRF protection", a
     allowUsers: ["owner"],
     context: { lookbackHours: 6, maxMessages: 80 },
   });
+
+  const boundRemoval = await post("/agents/remove", { agentId: "default" });
+  assert.match(boundRemoval.headers.get("location") ?? "", /error=/);
+  assert.ok(config.agents.default);
+
+  const reset = await post("/groups/session/reset", { groupId: "group" });
+  assert.equal(reset.status, 303);
+  assert.match(reset.headers.get("location") ?? "", /^\/groups\?ok=.*#group$/);
+  assert.deepEqual(resetCalls, ["group"]);
+
+  const unbound = await post("/groups/unbind", { groupId: "new-group" });
+  assert.equal(unbound.status, 303);
+  assert.match(unbound.headers.get("location") ?? "", /^\/groups\?ok=/);
+  assert.equal(config.groups["new-group"], undefined);
+
+  const removed = await post("/agents/remove", { agentId: "default" });
+  assert.equal(removed.status, 303);
+  assert.match(removed.headers.get("location") ?? "", /^\/agents\?ok=/);
+  assert.equal(config.agents.default, undefined);
+
+  const boundReviewer = await post("/agents/remove", { agentId: "reviewer" });
+  assert.match(boundReviewer.headers.get("location") ?? "", /error=/);
+  assert.ok(config.agents.reviewer);
+
+  await post("/groups/unbind", { groupId: "group" });
+  const lastRemoval = await post("/agents/remove", { agentId: "reviewer" });
+  assert.match(lastRemoval.headers.get("location") ?? "", /error=/);
+  assert.ok(config.agents.reviewer);
 
   const escaped = await post("/agents/add", { agentId: "escape", runtime: "codex", workspace: "../outside" });
   assert.match(escaped.headers.get("location") ?? "", /error=/);
