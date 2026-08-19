@@ -20,7 +20,7 @@ import type { GroupMessage, IncomingMention, RuntimeName, ThreadFerryConfig } fr
 import { findUpdate, installUpdate } from "./update.js";
 import { loadWecomCliCredentials } from "./wecom-credentials.js";
 
-const VERSION = "0.14.0";
+const VERSION = "0.14.1";
 const UPDATE_INTERVAL_MS = 6 * 60 * 60 * 1_000;
 const USAGE = `ThreadFerry ${VERSION}
 
@@ -584,7 +584,7 @@ async function start(configPath: string, mock: boolean, port: number): Promise<s
       }),
       listGroups: () => listWecomGroups(),
       searchUsers: (keywords) => searchWecomUsers(keywords),
-      onError: ({ errorId, phase }) => console.error(`[wecom] 处理失败 error=${errorId} phase=${phase}`),
+      onError: ({ errorId, phase, reason }) => console.error(`[wecom] 处理失败 error=${errorId} phase=${phase}${reason ? ` reason=${reason}` : ""}`),
     }, state);
     const admin = await startAdminServer(config, {
       updateConfig,

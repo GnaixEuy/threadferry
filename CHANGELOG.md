@@ -4,6 +4,43 @@ ThreadFerry 的每个 GitHub Release 都使用这里对应版本的内容，不�
 
 ## Unreleased
 
+## 0.14.1
+
+本次版本修复运维排查困难：群消息处理失败时，本机控制台只有错误编号和阶段，真正可操作的原因被丢弃，必须再跑一次 `threadferry doctor` 才能看到。
+
+### 主要变化
+
+- `[wecom] 处理失败` 日志新增 `reason=`，直接给出失败原因。例如企业未批准机器人数据访问权限时，控制台会直接显示「企业未授权群消息历史能力（errcode 853006）；请让企业管理员批准机器人数据访问权限」，不必再跑一次 doctor。
+- 覆盖 history、runtime、reply、ack 和权限更新各个失败阶段，私聊失败同样输出。
+- 原因只写本机控制台：群聊和私聊回复仍然只给错误编号，本地状态库也不落原因，回复内容与持久化行为完全不变。
+- 原因会压成单行并截断到 200 字符，避免多行报错污染日志。
+
+### 安装与升级
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/GnaixEuy/threadferry/main/install.sh | bash
+```
+
+本次变更不需要迁移配置，也不改变任何对外行为，升级后重启 `threadferry start` 即可。
+
+### 安全边界
+
+不变。新增的 `reason` 只来自 Runtime 与 wecom-cli 的固定诊断文案（不含群消息内容），且仅输出到运行 ThreadFerry 的本机控制台，不进入企业微信回复，也不写入本地状态库。
+
+### 发布资产
+
+- `threadferry.tgz`：包含已经编译的 CLI，可直接由 npm 全局安装。
+- `SHA256SUMS`：用于校验发布包完整性。
+
+### 运行要求
+
+- macOS 或 Linux
+- Node.js 22+
+- 企业微信官方 `wecom-cli 1.1.0+`
+- Codex CLI `0.138.0+` 或 Pi CLI `0.84.2+`
+
+[查看 v0.14.0...v0.14.1 的完整变更](https://github.com/GnaixEuy/threadferry/compare/v0.14.0...v0.14.1)
+
 ## 0.14.0
 
 本次版本新增群聊「全员可用」开关：打开后该群所有成员都可以 @ 机器人使用，不必再逐个授权；私聊命令和管理台都能切换。
