@@ -3,7 +3,7 @@ import { mkdtemp, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { acquireHostLock, ThreadFerryState } from "../src/state.js";
+import { acquireHostLock, sessionScope, ThreadFerryState } from "../src/state.js";
 import type { IncomingMention } from "../src/types.js";
 
 const message: IncomingMention = {
@@ -67,4 +67,29 @@ test("host lock rejects a second process owner and replaces a stale lock", async
   await writeFile(path, JSON.stringify({ pid: 2_147_483_647, token: "stale" }), { mode: 0o600 });
   const recovered = await acquireHostLock(path);
   await recovered.release();
+});
+
+test("resetting a session only clears the requested agent's session for that group", async () => {
+  const state = new ThreadFerryState();
+  const front = sessionScope("frontend", { runtime: "codex", workspace: "/ws-a" });
+  const back = sessionScope("backend", { runtime: "pi", workspace: "/ws-b" });
+  // 两个机器人同在一个群：各自有独立 Session。
+  await state.setSession("shared-group", front, "front-session");
+  await state.setSession("shared-group", back, "back-session");
+
+  assert.equal(await state.clearSession("shared-group", front), true);
+  assert.equal(await state.session("shared-group", front), undefined);
+  // 对方的 Session 必须还在。
+  assert.equal(await state.session("shared-group", back), "back-session");
+
+  assert.equal(await state.clearSession("shared-group", front), false);
+  assert.equal(await state.clearSession("shared-group", back), true);
+  assert.equal(await state.session("shared-group", back), undefined);
+
+  // 不传 scope 时清掉该群所有 Agent 的 Session。
+  await state.setSession("shared-group", front, "front-again");
+  await state.setSession("shared-group", back, "back-again");
+  assert.equal(await state.clearSession("shared-group"), true);
+  assert.equal(await state.session("shared-group", front), undefined);
+  assert.equal(await state.session("shared-group", back), undefined);
 });

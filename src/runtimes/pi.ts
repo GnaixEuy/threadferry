@@ -5,6 +5,7 @@ import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { resolveWorkspace } from "../config.js";
 import { runCommand } from "../process.js";
+import { runtimeFailure, structuredRuntimeError } from "./runtime-error.js";
 import type { CommandRunner, RuntimeRequest, RuntimeResult } from "../types.js";
 
 function safeEnvironment(): NodeJS.ProcessEnv {
@@ -48,13 +49,20 @@ export async function runPi(
     ...(request.model ? ["--model", request.model] : []),
     ...(request.sessionId ? ["--session-id", request.sessionId] : []),
   ];
-  const { stdout } = await runner("pi", args, {
-    cwd: workspace,
-    env: safeEnvironment(),
-    input: request.prompt,
-    timeoutMs: 10 * 60_000,
-    signal: request.signal,
-  });
+  // Pi 原先完全没处理非零退出：runner 抛出的 CommandExecutionError 直接冒泡，
+  // 结果只剩「pi 执行失败（退出码 N）」，stdout 里的真实原因被丢掉。
+  let stdout: string;
+  try {
+    ({ stdout } = await runner("pi", args, {
+      cwd: workspace,
+      env: safeEnvironment(),
+      input: request.prompt,
+      timeoutMs: 10 * 60_000,
+      signal: request.signal,
+    }));
+  } catch (error) {
+    throw runtimeFailure("Pi", error);
+  }
 
   let sessionId = request.sessionId;
   let finalMessage: string | undefined;
@@ -69,6 +77,9 @@ export async function runPi(
     if (event.type === "session" && typeof event.id === "string") sessionId = event.id;
     if (event.type === "message_end") finalMessage = assistantText(event.message) ?? finalMessage;
   }
-  if (!finalMessage) throw new Error("Pi 未返回可解析的最终消息");
+  if (!finalMessage) {
+    const reported = structuredRuntimeError(stdout);
+    throw new Error(reported ? `Pi：${reported}` : "Pi 未返回可解析的最终消息");
+  }
   return { text: finalMessage, ...(sessionId ? { sessionId } : {}) };
 }

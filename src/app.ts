@@ -2,7 +2,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { authorize } from "./authorization.js";
 import { buildContext } from "./context-builder.js";
 import { resolveDirectoryUser } from "./directory.js";
-import { newErrorId, ThreadFerryState, type FailurePhase } from "./state.js";
+import { newErrorId, sessionScope, ThreadFerryState, type FailurePhase } from "./state.js";
 import type { DirectoryUser, GroupMessage, IncomingDirectMessage, IncomingMention, Reply, RuntimeRequest, RuntimeResult, ThreadFerryConfig } from "./types.js";
 
 export type HandleResult = "handled" | "stale" | "failed" | "command" | "delivery_pending" | "duplicate" | "unauthorized_group" | "missing_mention" | "unauthorized_user";
@@ -11,30 +11,51 @@ export interface AppDependencies {
   history: (groupId: string, options: { lookbackHours: number; maxMessages: number; endTime: Date }) => Promise<GroupMessage[]>;
   runtime: (request: RuntimeRequest) => Promise<RuntimeResult>;
   updateAllowUsers?: (groupId: string, users: string[]) => Promise<void>;
-  updateGroupAgent?: (groupId: string, agentId: string) => Promise<void>;
   updateGroupAccess?: (groupId: string, allowAll: boolean) => Promise<void>;
-  bindGroup?: (groupId: string, agentId: string) => Promise<void>;
+  bindGroup?: (groupId: string) => Promise<void>;
   listGroups?: () => Promise<Array<{ id: string; name?: string }>>;
   searchUsers?: (keywords: string[]) => Promise<DirectoryUser[]>;
   onError?: (error: { errorId: string; phase: FailurePhase; reason?: string }) => void;
 }
 
-type ManagementCommand = "help" | "whoami" | "groups" | "agents" | "users" | "invite" | "join" | "add" | "remove" | "use" | "bind" | "open" | "close";
+type ManagementCommand = "help" | "whoami" | "groups" | "agents" | "users" | "invite" | "join" | "add" | "remove" | "bind" | "open" | "close";
 const USER_ID = /^[A-Za-z0-9_@.-]{1,512}$/;
 
 function managementCommand(text: string): { name: ManagementCommand; arguments: string[] } | undefined {
-  const match = text.match(/(?:^|[\s@])threadferry\s+(help|whoami|groups|agents|users|invite|join|add|remove|use|bind|open|close)(?:\s+(.+?))?\s*$/i);
+  const match = text.match(/(?:^|[\s@])threadferry\s+(help|whoami|groups|agents|users|invite|join|add|remove|bind|open|close)(?:\s+(.+?))?\s*$/i);
   if (!match) return undefined;
   return { name: match[1]!.toLowerCase() as ManagementCommand, arguments: match[2]?.trim().split(/\s+/) ?? [] };
 }
 
 // 仅用于本机控制台日志：Runtime 与 wecom-cli 的 Error.message 都是固定诊断文案，
 // 不含群消息内容；这里再压成单行并截断，避免污染日志。reason 不入库也不进群回复。
+// 失败回复里直接带上原因。原先只给错误编号、原因单独进本机控制台，实践证明这在私聊里
+// 毫无意义——私聊对象只可能是 Owner（非 Owner 在跑 Runtime 之前就被拒），对他隐瞒原因
+// 只是让他多跑一趟终端。错误编号继续保留，用于和日志对账。
+//
+// 唯一需要小心的是**群聊**：群里有非 Owner 的同事。原因文本来自 Runtime CLI 的固定文案
+// 或 wecom-cli 的错误说明，不含群消息内容；但配置类错误可能带 Workspace 绝对路径，
+// 所以群聊回复里把看起来像本机路径的片段替换掉。
+const HOME_LIKE_PATH = /(?:\/(?:Users|home)\/[^\s"']+|\/(?:private\/)?(?:var|tmp)\/[^\s"']+)/g;
+
+function publicReason(reason: string): string {
+  return reason.replace(HOME_LIKE_PATH, "<本机路径>");
+}
+
+function withReason(base: string, reason: string | undefined, audience: "direct" | "group"): string {
+  if (!reason) return base;
+  return `${base}\n\n原因：${audience === "group" ? publicReason(reason) : reason}`;
+}
+
 function failureReason(error: unknown): string | undefined {
   if (!(error instanceof Error) || !error.message) return undefined;
   const single = error.message.replace(/\s+/g, " ").trim();
   if (!single) return undefined;
   return single.length > 200 ? `${single.slice(0, 200)}…` : single;
+}
+
+function ownerOnly(action: string, senderId: string): string {
+  return `只有机器人创建者（ThreadFerry Owner）可以${action}。\n\n你的 userid：\`${senderId}\`\n如果你更换了企业或重建了机器人，回调 userid 会变化，需要在运行 ThreadFerry 的机器上重新确认 Owner：重启 \`threadferry start\` 按提示更新，或执行 \`threadferry setup\`。`;
 }
 
 function limitUtf8(input: string, maxBytes = 12_000): string {
@@ -90,18 +111,6 @@ export function createApp(config: ThreadFerryConfig, dependencies: AppDependenci
     return operation;
   }
 
-  function updateAgent(groupId: string, agentId: string): Promise<void> {
-    const operation = accessTail.then(async () => {
-      const group = config.groups[groupId];
-      if (!group || !dependencies.updateGroupAgent) throw new Error("当前启动方式不支持 Agent 管理");
-      if (!config.agents[agentId]) throw new Error(`Agent \`${agentId}\` 不存在。请先发送 \`threadferry agents\`。`);
-      await dependencies.updateGroupAgent(groupId, agentId);
-      group.agent = agentId;
-    });
-    accessTail = operation.then(() => undefined, () => undefined);
-    return operation;
-  }
-
   function updateAccess(groupId: string, allowAll: boolean): Promise<void> {
     const operation = accessTail.then(async () => {
       const group = config.groups[groupId];
@@ -113,12 +122,14 @@ export function createApp(config: ThreadFerryConfig, dependencies: AppDependenci
     return operation;
   }
 
-  function bindGroup(groupId: string, agentId: string): Promise<void> {
+  // 一个 app 实例只服务一个 Agent，所以绑定就是「绑到我」——不需要也不接受 Agent 参数。
+  function bindGroup(groupId: string): Promise<void> {
     const operation = accessTail.then(async () => {
       if (config.groups[groupId]) throw new Error("该群已经配置");
-      if (!config.agents[agentId]) throw new Error(`Agent \`${agentId}\` 不存在。请先发送 \`threadferry agents\`。`);
+      const [agentId] = Object.entries(config.agents)[0] ?? [];
+      if (!agentId) throw new Error("当前没有可用 Agent。");
       if (!dependencies.bindGroup) throw new Error("当前启动方式不支持群绑定");
-      await dependencies.bindGroup(groupId, agentId);
+      await dependencies.bindGroup(groupId);
       config.groups[groupId] = { agent: agentId, allowUsers: [config.ownerUser], context: { lookbackHours: 6, maxMessages: 80 } };
     });
     accessTail = operation.then(() => undefined, () => undefined);
@@ -152,11 +163,26 @@ export function createApp(config: ThreadFerryConfig, dependencies: AppDependenci
     if (configured.length > 1) {
       throw new Error(`有多个同名群“${reference}”，请改用群 ID：\n${configured.map((group) => `- \`${group.id}\``).join("\n")}`);
     }
-    if (matches.length > 0) throw new Error(`群“${reference}”尚未配置 Agent，请先运行 threadferry setup。`);
+    if (matches.length > 0) throw new Error(`群“${reference}”还没绑定给我，请先发送 \`threadferry bind ${reference}\`。`);
     throw new Error(`没有找到已配置群“${reference}”。请先发送 \`threadferry groups\`。`);
   }
 
-  async function resolveGroupAndValue(arguments_: string[], label: string, requireConfigured = true): Promise<{ group: { id: string; name?: string }; value: string }> {
+  // bind 用：群必须是「这个机器人看得见、但还没配置」的。
+  async function resolveUnboundGroup(reference: string): Promise<{ id: string; name?: string }> {
+    if (!reference) throw new Error("缺少群名。请先发送 `threadferry groups` 查看可绑定的群。");
+    if (config.groups[reference]) throw new Error("该群已经配置");
+    const sessions = await groupSessions();
+    const byId = sessions.find((session) => session.id === reference);
+    if (byId) return byId;
+    const matches = sessions.filter((session) => session.name === reference);
+    if (matches.length === 1) return matches[0]!;
+    if (matches.length > 1) {
+      throw new Error(`有多个同名群“${reference}”，请改用群 ID：\n${matches.map((group) => `- \`${group.id}\``).join("\n")}`);
+    }
+    throw new Error(`我看不到群“${reference}”。请确认已把我加入该内部群，然后发送 \`threadferry groups\`。`);
+  }
+
+  async function resolveGroupAndValue(arguments_: string[], label: string): Promise<{ group: { id: string; name?: string }; value: string }> {
     if (arguments_.length < 2) throw new Error(`缺少群名或${label}。`);
     if (config.groups[arguments_[0]!]) {
       return { group: { id: arguments_[0]! }, value: arguments_.slice(1).join(" ") };
@@ -164,8 +190,7 @@ export function createApp(config: ThreadFerryConfig, dependencies: AppDependenci
     const sessions = await groupSessions();
     const byId = sessions.find((session) => session.id === arguments_[0]);
     if (byId) {
-      if (requireConfigured) throw new Error(`群 \`${byId.id}\` 尚未配置 Agent，请先发送 \`threadferry bind <群名或ID> <Agent名>\`。`);
-      return { group: byId, value: arguments_.slice(1).join(" ") };
+      throw new Error(`群 \`${byId.id}\` 还没绑定给我，请先发送 \`threadferry bind ${byId.name ?? byId.id}\`。`);
     }
     const input = arguments_.join(" ");
     const named = sessions
@@ -173,11 +198,11 @@ export function createApp(config: ThreadFerryConfig, dependencies: AppDependenci
       .sort((left, right) => right.name!.length - left.name!.length);
     if (named.length === 0) throw new Error("没有识别出群名。请先发送 `threadferry groups`，也可以改用群 ID。");
     const longest = named[0]!.name!;
-    const matches = named.filter((session) => session.name === longest && (!requireConfigured || config.groups[session.id]));
+    const matches = named.filter((session) => session.name === longest && config.groups[session.id]);
     if (matches.length > 1) {
       throw new Error(`有多个同名群“${longest}”，请改用群 ID：\n${matches.map((group) => `- \`${group.id}\``).join("\n")}`);
     }
-    if (matches.length === 0) throw new Error(`群“${longest}”尚未配置 Agent，请先发送 \`threadferry bind <群名或ID> <Agent名>\`。`);
+    if (matches.length === 0) throw new Error(`群“${longest}”还没绑定给我，请先发送 \`threadferry bind ${longest}\`。`);
     return { group: matches[0]!, value: input.slice(longest.length).trim() };
   }
 
@@ -190,6 +215,18 @@ export function createApp(config: ThreadFerryConfig, dependencies: AppDependenci
     const user = matches.length === 1 ? matches[0] : undefined;
     if (user) callbackDirectoryIds.set(callbackId, user.id);
     return user?.id;
+  }
+
+  // 企业微信存在两套 userid：事件回调用的是明文 corp userid（如 SuYueXiang），
+  // 目录/identity 用的是加密 userid（如 wowBknbg...）。配置里存的是目录 ID，
+  // 所以私聊授权、whoami 展示都要先映射，否则创建者本人会被当成陌生人拒绝。
+  async function authoritativeId(senderId: string): Promise<string> {
+    return (await directoryIdForCallback(senderId)) ?? senderId;
+  }
+
+  async function isOwner(senderId: string): Promise<boolean> {
+    if (senderId === config.ownerUser) return true;
+    return (await directoryIdForCallback(senderId)) === config.ownerUser;
   }
 
   async function authorizeMessage(message: IncomingMention): Promise<ReturnType<typeof authorize>> {
@@ -252,13 +289,14 @@ export function createApp(config: ThreadFerryConfig, dependencies: AppDependenci
     }
     invites.delete(code);
     try {
-      await updateUsers(invite.groupId, (users) => [...users, senderId]);
+      const directoryId = await authoritativeId(senderId);
+      await updateUsers(invite.groupId, (users) => [...users, directoryId]);
       return respond(reply, `授权成功。你现在可以在群 \`${invite.groupId}\` 使用 ThreadFerry。`);
     } catch (error) {
       const errorId = newErrorId();
       const reason = failureReason(error);
       dependencies.onError?.({ errorId, phase: "host", ...(reason ? { reason } : {}) });
-      return respond(reply, `权限更新失败（错误编号 ${errorId}）。请联系机器人 Owner。`);
+      return respond(reply, withReason(`权限更新失败（错误编号 ${errorId}）。请联系机器人 Owner。`, reason, "group"));
     }
   }
 
@@ -266,7 +304,7 @@ export function createApp(config: ThreadFerryConfig, dependencies: AppDependenci
     if (!(await state.claimCommand(message.msgId, `direct:${message.senderId}`))) return "duplicate";
     const command = managementCommand(message.text);
     if (!command) {
-      if (message.senderId !== config.ownerUser) return respond(reply, "只有机器人创建者（ThreadFerry Owner）可以私聊 Agent。");
+      if (!(await isOwner(message.senderId))) return respond(reply, ownerOnly("私聊 Agent", await authoritativeId(message.senderId)));
       const scope = `direct:${message.senderId}`;
       const queued = groupTails.has(scope);
       try {
@@ -276,11 +314,13 @@ export function createApp(config: ThreadFerryConfig, dependencies: AppDependenci
       }
       return serial(scope, () => processDirect(message, reply));
     }
-    if (command.name === "whoami") return respond(reply, `你的 ThreadFerry userid：\`${message.senderId}\``);
+    if (command.name === "whoami") return respond(reply, `你的 ThreadFerry userid：\`${await authoritativeId(message.senderId)}\``);
     if (command.name === "join") return join(message.senderId, command.arguments[0], reply);
-    if (message.senderId !== config.ownerUser) return respond(reply, "只有机器人创建者（ThreadFerry Owner）可以在私聊中管理群权限。");
+    if (!(await isOwner(message.senderId))) return respond(reply, ownerOnly("在私聊中管理群权限", await authoritativeId(message.senderId)));
     if (command.name === "help") {
-      return respond(reply, "直接发送普通消息即可私聊默认 Agent。\n\n接入群聊：\n1. 请企业管理员批准机器人的数据访问权限，并把机器人加入目标内部群\n2. 发送 `threadferry groups` 查看群名或群 ID\n3. 发送 `threadferry agents` 查看 Agent 名\n4. 发送 `threadferry bind <群名或ID> <Agent名>` 完成绑定\n\n其他管理命令：\n- `threadferry use <群名> <Agent名>` 切换群 Agent\n- `threadferry users <群名>` 查看可使用用户\n- `threadferry invite <群名>` 生成一次性邀请码\n- `threadferry add <群名> <姓名>` 直接授权\n- `threadferry remove <群名> <姓名>` 移除授权\n- `threadferry open <群名>` 允许群内所有成员使用\n- `threadferry close <群名>` 恢复仅授权成员可用\n- `threadferry whoami` 查看自己的 userid\n\n群或成员重名时，按机器人返回的 ID 重新发送即可。");
+      const [selfId, self] = Object.entries(config.agents)[0] ?? [];
+      const selfLine = selfId ? `你正在和 Agent \`${selfId}\` 对话，Workspace 是 ${self!.workspace}。\n\n` : "";
+      return respond(reply, `${selfLine}直接发送普通消息即可让我在这个 Workspace 里分析。\n\n接入群聊：\n1. 请企业管理员批准机器人的数据访问权限，并把我加入目标内部群\n2. 发送 \`threadferry groups\` 查看群名或群 ID\n3. 发送 \`threadferry bind <群名或ID>\` 把该群绑定给我\n\n其他管理命令：\n- \`threadferry users <群名>\` 查看可使用用户\n- \`threadferry invite <群名>\` 生成一次性邀请码\n- \`threadferry add <群名> <姓名>\` 直接授权\n- \`threadferry remove <群名> <姓名>\` 移除授权\n- \`threadferry open <群名>\` 允许群内所有成员使用\n- \`threadferry close <群名>\` 恢复仅授权成员可用\n- \`threadferry whoami\` 查看自己的 userid\n\n每个 Agent 对应一个机器人：想用别的 Workspace，就去和那个机器人私聊。\n群或成员重名时，按我返回的 ID 重新发送即可。`);
     }
     if (command.name === "agents") {
       const lines = Object.entries(config.agents).map(([id, agent]) => `- \`${id}\`：${agent.runtime}${agent.model ? ` / ${agent.model}` : ""}\n  ${agent.workspace}`);
@@ -308,9 +348,11 @@ export function createApp(config: ThreadFerryConfig, dependencies: AppDependenci
     let group: { id: string; name?: string };
     let target: { group: { id: string; name?: string }; value: string } | undefined;
     try {
-      if (command.name === "add" || command.name === "remove" || command.name === "use" || command.name === "bind") {
-        target = await resolveGroupAndValue(command.arguments, command.name === "use" || command.name === "bind" ? " Agent 名" : "用户姓名", command.name !== "bind");
+      if (command.name === "add" || command.name === "remove") {
+        target = await resolveGroupAndValue(command.arguments, "用户姓名");
         group = target.group;
+      } else if (command.name === "bind") {
+        group = await resolveUnboundGroup(command.arguments.join(" "));
       } else {
         group = await resolveGroup(command.arguments.join(" "));
       }
@@ -320,8 +362,8 @@ export function createApp(config: ThreadFerryConfig, dependencies: AppDependenci
     const groupLabel = group.name ?? group.id;
     if (command.name === "bind") {
       try {
-        await bindGroup(group.id, target!.value);
-        return respond(reply, `群“${groupLabel}”已绑定 Agent \`${target!.value}\`。`);
+        await bindGroup(group.id);
+        return respond(reply, `群“${groupLabel}”已绑定到我。群内成员 @我 即可使用，可用 \`threadferry open ${groupLabel}\` 放开给全员。`);
       } catch (error) {
         return respond(reply, error instanceof Error ? error.message : "群绑定失败。");
       }
@@ -350,15 +392,6 @@ export function createApp(config: ThreadFerryConfig, dependencies: AppDependenci
         return respond(reply, error instanceof Error ? error.message : "访问开关更新失败。");
       }
     }
-    if (command.name === "use") {
-      try {
-        await updateAgent(group.id, target!.value);
-        return respond(reply, `群“${groupLabel}”已切换到 Agent \`${target!.value}\`。下一条 @ 消息生效。`);
-      } catch (error) {
-        return respond(reply, error instanceof Error ? error.message : "Agent 切换失败。");
-      }
-    }
-
     let user: DirectoryUser;
     try {
       user = await resolveDirectoryUser(target!.value, dependencies.searchUsers);
@@ -395,7 +428,7 @@ export function createApp(config: ThreadFerryConfig, dependencies: AppDependenci
   async function handleGroupCommand(message: IncomingMention, reply: Reply, command: { name: ManagementCommand; arguments: string[] }): Promise<HandleResult> {
     if (!config.groups[message.groupId]) return "unauthorized_group";
     if (!(await state.claimCommand(message.msgId, message.groupId))) return "duplicate";
-    if (command.name === "whoami") return respond(reply, `你的 ThreadFerry userid：\`${message.senderId}\``);
+    if (command.name === "whoami") return respond(reply, `你的 ThreadFerry userid：\`${await authoritativeId(message.senderId)}\``);
     if (command.name === "join") return join(message.senderId, command.arguments[0], reply, message.groupId);
     return respond(reply, "机器人权限管理请私聊 ThreadFerry，并发送 `threadferry help` 查看命令。");
   }
@@ -417,8 +450,8 @@ export function createApp(config: ThreadFerryConfig, dependencies: AppDependenci
     const [agentId, agent] = entry;
     try {
       if (shuttingDown) throw new Error("ThreadFerry 正在停止");
-      const sessionScope = `${agentId}\0${agent.runtime}\0${agent.workspace}`;
-      const sessionId = await state.session(scope, sessionScope);
+      const scopeKey = sessionScope(agentId, agent);
+      const sessionId = await state.session(scope, scopeKey);
       const controller = new AbortController();
       controllers.set(scope, controller);
       let result: RuntimeResult;
@@ -433,14 +466,17 @@ export function createApp(config: ThreadFerryConfig, dependencies: AppDependenci
       } finally {
         if (controllers.get(scope) === controller) controllers.delete(scope);
       }
-      if (result.sessionId) await state.setSession(scope, sessionScope, result.sessionId);
+      if (result.sessionId) await state.setSession(scope, scopeKey, result.sessionId);
       await reply(limitUtf8(result.text), true);
       return "handled";
     } catch (error) {
       const errorId = newErrorId();
       const reason = failureReason(error);
       dependencies.onError?.({ errorId, phase: "runtime", ...(reason ? { reason } : {}) });
-      await reply(`ThreadFerry 处理失败（错误编号 ${errorId}）。请在运行 ThreadFerry 的机器上执行 \`threadferry status\`。`, true).catch(() => undefined);
+      // 原先私聊失败不落盘，于是回复里让用户跑 threadferry status 却查不到任何东西。
+      await state.finish(message.msgId, "failed", { errorId, phase: "runtime" }).catch(() => undefined);
+      // 私聊对象只可能是 Owner，原因给全。
+      await reply(withReason(`ThreadFerry 处理失败（错误编号 ${errorId}）。`, reason, "direct"), true).catch(() => undefined);
       return "failed";
     }
   }
@@ -470,7 +506,11 @@ export function createApp(config: ThreadFerryConfig, dependencies: AppDependenci
     const errorId = newErrorId();
     const reason = failureReason(error);
     dependencies.onError?.({ errorId, phase, ...(reason ? { reason } : {}) });
-    const content = "ThreadFerry 处理失败（错误编号 " + errorId + "）。请在运行 ThreadFerry 的机器上执行 `threadferry status` 和 `threadferry doctor`。";
+    const content = withReason(
+      `ThreadFerry 处理失败（错误编号 ${errorId}）。`,
+      reason,
+      "group",
+    ) + "\n\n如需更多细节，请在运行 ThreadFerry 的机器上执行 `threadferry status` 和 `threadferry doctor`。";
     try {
       return await complete(message, reply, "failed", content, { errorId, phase });
     } catch {
@@ -490,8 +530,8 @@ export function createApp(config: ThreadFerryConfig, dependencies: AppDependenci
       const prompt = buildContext(history, message, context);
       const agent = config.agents[agentId];
       if (!agent) throw new Error("群绑定的 Agent 不存在");
-      const sessionScope = `${agentId}\0${agent.runtime}\0${agent.workspace}`;
-      const sessionId = await state.session(message.groupId, sessionScope);
+      const scopeKey = sessionScope(agentId, agent);
+      const sessionId = await state.session(message.groupId, scopeKey);
       phase = "runtime";
       const controller = new AbortController();
       controllers.set(message.groupId, controller);
@@ -501,7 +541,7 @@ export function createApp(config: ThreadFerryConfig, dependencies: AppDependenci
       } finally {
         if (controllers.get(message.groupId) === controller) controllers.delete(message.groupId);
       }
-      if (result.sessionId) await state.setSession(message.groupId, sessionScope, result.sessionId);
+      if (result.sessionId) await state.setSession(message.groupId, scopeKey, result.sessionId);
 
       phase = "freshness";
       const latest = await dependencies.history(message.groupId, { ...context, endTime: new Date() });

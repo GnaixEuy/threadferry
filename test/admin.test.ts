@@ -13,9 +13,9 @@ test("localhost admin manages agents, groups, and users with CSRF protection", a
   t.after(() => rm(root, { recursive: true, force: true }));
   const workspace = await realpath(root);
   const config: ThreadFerryConfig = {
-    version: 5,
+    version: 6,
     ownerUser: "owner",
-    agents: { default: { runtime: "codex", workspace } },
+    agents: { default: { runtime: "codex", workspace, ownerUser: "owner" } },
     groups: { group: { agent: "default", allowUsers: ["owner"], context: { lookbackHours: 6, maxMessages: 80 } } },
     security: { requireMention: true, readOnly: true },
   };
@@ -24,7 +24,12 @@ test("localhost admin manages agents, groups, and users with CSRF protection", a
   const resetCalls: string[] = [];
   const admin = await startAdminServer(config, {
     updateConfig: async (change) => { await change(config); },
-    listGroups: async () => [{ id: "group", name: "AI Coding" }, { id: "new-group", name: "新群" }],
+    listGroups: async (agentId) => agentId === "default"
+      ? [{ id: "group", name: "AI Coding" }, { id: "new-group", name: "新群" }]
+      : [],
+    botStatus: async (agentId) => agentId === "default"
+      ? { authorized: true, botId: "aib-default" }
+      : { authorized: false, hint: `请执行 threadferry agent login ${agentId}` },
     searchUsers: async (keywords) => keywords.includes("张三")
       ? [{ id: "zhangsan", name: "张三", matchedKeywords: ["张三"] }]
       : [],
@@ -87,11 +92,19 @@ test("localhost admin manages agents, groups, and users with CSRF protection", a
   const added = await post("/agents/add", { agentId: "reviewer", runtime: "pi", workspace, model: "provider/model" });
   assert.equal(added.status, 303);
   assert.match(added.headers.get("location") ?? "", /^\/agents\?ok=/);
-  assert.deepEqual(config.agents.reviewer, { runtime: "pi", workspace, model: "provider/model" });
+  // 新增 Agent 的机器人还没授权，Owner 先继承主 Agent 的；该 Agent 授权后启动时会提示更正。
+  assert.deepEqual(config.agents.reviewer, { runtime: "pi", workspace, model: "provider/model", ownerUser: "owner" });
 
-  const switched = await post("/groups/agent", { groupId: "group", agentId: "reviewer" });
-  assert.match(switched.headers.get("location") ?? "", /^\/groups\?ok=.*#group$/);
-  assert.equal(config.groups.group?.agent, "reviewer");
+  // 1:1 之后没有「切换 Agent」这个路由：换 Agent 等于换机器人，而那台机器人未必在这个群。
+  assert.equal((await post("/groups/agent", { groupId: "group", agentId: "reviewer" })).status, 404);
+  assert.equal(config.groups.group?.agent, "default");
+  // Agent 卡片必须显示机器人授权状态和该 Agent 自己的 Owner。
+  const agentCards = await (await fetch(`${admin.url}/agents`)).text();
+  assert.match(agentCards, /已授权[\s\S]*aib-default/);
+  assert.match(agentCards, /未授权/);
+  assert.match(agentCards, /threadferry agent login reviewer/);
+  assert.match(agentCards, /Owner[\s\S]*owner/);
+
   await post("/groups/users/add", { groupId: "group", user: "张三" });
   assert.deepEqual(config.groups.group?.allowUsers, ["owner", "zhangsan"]);
   await post("/groups/users/remove", { groupId: "group", userId: "zhangsan" });
@@ -109,6 +122,11 @@ test("localhost admin manages agents, groups, and users with CSRF protection", a
   assert.equal(config.groups.group?.allowAll, undefined);
   const badAccess = await post("/groups/access", { groupId: "group", allowAll: "yes" });
   assert.match(badAccess.headers.get("location") ?? "", /error=/);
+
+  // 绑定必须用目标 Agent 自己的机器人校验：reviewer 的机器人不在 new-group 里。
+  const wrongBot = await post("/groups/bind", { groupId: "new-group", agentId: "reviewer" });
+  assert.match(wrongBot.headers.get("location") ?? "", /error=/);
+  assert.equal(config.groups["new-group"], undefined);
 
   await post("/groups/bind", { groupId: "new-group", agentId: "default" });
   assert.deepEqual(config.groups["new-group"], {
@@ -131,19 +149,22 @@ test("localhost admin manages agents, groups, and users with CSRF protection", a
   assert.match(unbound.headers.get("location") ?? "", /^\/groups\?ok=/);
   assert.equal(config.groups["new-group"], undefined);
 
-  const removed = await post("/agents/remove", { agentId: "default" });
-  assert.equal(removed.status, 303);
-  assert.match(removed.headers.get("location") ?? "", /^\/agents\?ok=/);
-  assert.equal(config.agents.default, undefined);
+  // default 仍绑着 group，删不掉。
+  const stillBound = await post("/agents/remove", { agentId: "default" });
+  assert.match(stillBound.headers.get("location") ?? "", /error=/);
+  assert.ok(config.agents.default);
 
-  const boundReviewer = await post("/agents/remove", { agentId: "reviewer" });
-  assert.match(boundReviewer.headers.get("location") ?? "", /error=/);
-  assert.ok(config.agents.reviewer);
+  // reviewer 没有任何群，可以删。
+  const removedReviewer = await post("/agents/remove", { agentId: "reviewer" });
+  assert.equal(removedReviewer.status, 303);
+  assert.match(removedReviewer.headers.get("location") ?? "", /^\/agents\?ok=/);
+  assert.equal(config.agents.reviewer, undefined);
 
+  // 只剩 default：即使解绑所有群也必须保留至少一个 Agent。
   await post("/groups/unbind", { groupId: "group" });
-  const lastRemoval = await post("/agents/remove", { agentId: "reviewer" });
+  const lastRemoval = await post("/agents/remove", { agentId: "default" });
   assert.match(lastRemoval.headers.get("location") ?? "", /error=/);
-  assert.ok(config.agents.reviewer);
+  assert.ok(config.agents.default);
 
   const escaped = await post("/agents/add", { agentId: "escape", runtime: "codex", workspace: "../outside" });
   assert.match(escaped.headers.get("location") ?? "", /error=/);
@@ -158,15 +179,16 @@ test("workspace browser lists local directories and prefills the add form", asyn
   await mkdir(join(root, ".hidden"));
   const workspace = await realpath(root);
   const config: ThreadFerryConfig = {
-    version: 5,
+    version: 6,
     ownerUser: "owner",
-    agents: { default: { runtime: "codex", workspace } },
+    agents: { default: { runtime: "codex", workspace, ownerUser: "owner" } },
     groups: {},
     security: { requireMention: true, readOnly: true },
   };
   const admin = await startAdminServer(config, {
     updateConfig: async (change) => { await change(config); },
     listGroups: async () => [],
+    botStatus: async () => ({ authorized: true, botId: "aib-x" }),
     searchUsers: async () => [],
   }, 0);
   t.after(() => admin.close());

@@ -48,7 +48,14 @@ export interface AgentConfig {
   workspace: string;
   runtime: RuntimeName;
   model?: string;
+  /** 该 Agent 机器人下的 Owner 回调 userid。换企业后同一个人的 userid 不同，所以按 Agent 存。 */
+  ownerUser: string;
+  /** 该 Agent 机器人凭据目录的显式覆盖；缺省由 agentId 推导（见 src/bots.ts）。 */
+  configDir?: string;
 }
+
+/** 新建 Agent 时还不知道它自己机器人下的 Owner，由调用方补齐（配对时用配对者，新增时继承）。 */
+export type AgentDefinition = Omit<AgentConfig, "ownerUser">;
 
 export interface GroupConfig {
   agent: string;
@@ -61,7 +68,8 @@ export interface GroupConfig {
 }
 
 export interface ThreadFerryConfig {
-  version: 5;
+  /** 磁盘格式版本。只接受 v6。 */
+  version: 6;
   ownerUser: string;
   agents: Record<string, AgentConfig>;
   groups: Record<string, GroupConfig>;
@@ -83,7 +91,9 @@ export interface RuntimeResult {
   sessionId?: string;
 }
 
-export interface RuntimeRequest extends AgentConfig {
+// Runtime 只需要 workspace / runtime / model；Owner 与凭据目录跟它无关，所以继承
+// AgentDefinition 而不是 AgentConfig，避免把身份信息带进 Runtime 边界。
+export interface RuntimeRequest extends Omit<AgentDefinition, "configDir"> {
   agentId: string;
   prompt: string;
   sessionId?: string;
