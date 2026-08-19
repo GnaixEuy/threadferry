@@ -174,6 +174,12 @@ function restoreMention(message: StoredMention): IncomingMention {
   return { ...structuredClone(message), time: new Date(message.time) };
 }
 
+// Session 的第二维身份。两个机器人可能同在一个群，只按 groupId 定位会互相清掉对方的
+// Session，所以重置必须带上这个作用域。app.ts 与重置路径共用这一处构造，避免漂移。
+export function sessionScope(agentId: string, agent: { runtime: string; workspace: string }): string {
+  return `${agentId}\0${agent.runtime}\0${agent.workspace}`;
+}
+
 export function defaultStatePath(): string {
   return join(homedir(), ".threadferry", "state-v3.json");
 }
@@ -462,15 +468,19 @@ export class ThreadFerryState {
     });
   }
 
-  async clearSession(groupId: string): Promise<boolean> {
+  // scope 省略时清掉该群所有 Agent 的 Session；传入时只清该 Agent 的。
+  async clearSession(groupId: string, scope?: string): Promise<boolean> {
     return this.exclusive(async () => {
       await this.load();
       const group = key(groupId);
+      const workspace = scope === undefined ? undefined : key(scope);
       if (this.data.turns.some((turn) => turn.group === group && (turn.status === "queued" || turn.status === "running"))) {
         throw new Error("该群仍有任务运行或排队，不能重置 Session");
       }
       const before = this.data.sessions.length;
-      this.data.sessions = this.data.sessions.filter((item) => item.group !== group);
+      this.data.sessions = this.data.sessions.filter((item) => {
+        return !(item.group === group && (workspace === undefined || item.workspace === workspace));
+      });
       if (this.data.sessions.length !== before) await this.save();
       return this.data.sessions.length !== before;
     });

@@ -1,39 +1,61 @@
 #!/usr/bin/env node
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { existsSync } from "node:fs";
-import { mkdir, rename, rm, writeFile } from "node:fs/promises";
+import { existsSync, type Dirent } from "node:fs";
+import { mkdir, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
-import { emitKeypressEvents, type Key } from "node:readline";
 import { createInterface } from "node:readline/promises";
 import { createApp } from "./app.js";
 import { startAdminServer, type ConfigUpdater } from "./admin.js";
+import { authorizeHint, botConfigDir, botStatus, loadBotCredentials, validateAgentId, wecomEnv, type BotCredentials } from "./bots.js";
 import { listWecomGroups, searchWecomUsers, sendWecomReply, startWecomChannel } from "./channels/wecom.js";
-import { addAgent, loadConfig, onboardingDefaults, pairConfig, resolveWorkspace, saveConfig } from "./config.js";
+import {
+  addAgent,
+  adoptOwner,
+  agentView,
+  loadConfig,
+  pairConfig,
+  refreshAgentView,
+  resolveWorkspace,
+  saveConfig,
+} from "./config.js";
 import { fetchWecomHistory } from "./history/wecom-cli.js";
+import { describeIdentity, fetchWecomIdentity } from "./identity.js";
 import { runCommand } from "./process.js";
 import { runCodex } from "./runtimes/codex.js";
 import { runPi } from "./runtimes/pi.js";
-import { acquireHostLock, defaultStatePath, newErrorId, ThreadFerryState } from "./state.js";
-import type { GroupMessage, IncomingMention, RuntimeName, ThreadFerryConfig } from "./types.js";
+import { acquireHostLock, defaultStatePath, newErrorId, sessionScope, ThreadFerryState } from "./state.js";
+import {
+  agentDefinitionForPairing,
+  agentNameFromBot,
+  authAnnouncement,
+  DEFAULT_PAIR_TIMEOUT_MS,
+  onboardIntro,
+  ownerAdoptPrompt,
+  pairInstructions,
+  resolveSetupPlan,
+  waitForPair,
+  type SetupPlan,
+} from "./setup-wizard.js";
+import type { CommandRunner, GroupMessage, IncomingMention, RuntimeName, ThreadFerryConfig } from "./types.js";
 import { findUpdate, installUpdate } from "./update.js";
-import { loadWecomCliCredentials } from "./wecom-credentials.js";
 
-const VERSION = "0.14.1";
+const VERSION = "0.16.0";
 const UPDATE_INTERVAL_MS = 6 * 60 * 60 * 1_000;
 const USAGE = `ThreadFerry ${VERSION}
 
 Usage:
-  threadferry onboard [--config <path>]
-  threadferry setup --workspace <absolute-path> [--agent <name>] [--runtime codex|pi] [--model <id>] [--config <path>]
+  threadferry onboard [--config <path>] [--timeout <seconds>]
+  threadferry setup [--workspace <absolute-path>] [--agent <name>] [--runtime codex|pi] [--model <id>] [--config <path>] [--timeout <seconds>]
   threadferry agent add --name <name> --runtime codex|pi --workspace <absolute-path> [--model <id>] [--config <path>]
   threadferry agent list [--config <path>]
+  threadferry agent login <name> [--config <path>]
   threadferry doctor [--config <path>]
   threadferry status [--config <path>]
   threadferry update
   threadferry session reset --group <group-id> [--config <path>]
-  threadferry start [--config <path>] [--admin-port <port>] [--mock]
+  threadferry start [--config <path>] [--admin-port <port>] [--agents <a,b>] [--mock]
 `;
 
 function defaultConfigPath(): string {
@@ -76,6 +98,28 @@ async function autoUpdate(): Promise<string | undefined> {
   }
 }
 
+// 同一时刻只允许存在一个 readline 接口，原因有两个：
+// 1) 嵌套创建第二个接口会让两个接口争抢 stdin，按键被拆分或重复投递；
+// 2) wecom-cli auth init 以 stdio:"inherit" 继承 stdin，父进程若还挂着接口，
+//    扫码流程的输入会被父进程吃掉。
+// 所以每次提问都新建并立刻关闭，绝不跨越子进程或跨越另一次提问存活。
+// promptDepth 是守卫：把「静默的输入损坏」变成一次显式报错。
+let promptDepth = 0;
+
+async function askLine(question: string): Promise<string> {
+  if (promptDepth > 0) throw new Error("内部错误：嵌套读取终端输入会破坏按键投递");
+  promptDepth += 1;
+  const wasPaused = process.stdin.isPaused();
+  const prompt = createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    return await prompt.question(question);
+  } finally {
+    prompt.close();
+    if (wasPaused) process.stdin.pause();
+    promptDepth -= 1;
+  }
+}
+
 async function runUpdated(binary: string, args: string[]): Promise<void> {
   console.log("[update] 正在使用新版本重新启动...");
   await new Promise<void>((done, reject) => {
@@ -102,101 +146,8 @@ async function runUpdated(binary: string, args: string[]): Promise<void> {
   });
 }
 
-function validateCredential(value: string, name: string): string {
-  const normalized = value.trim();
-  if (!normalized || normalized.length > 1024 || /[\u0000-\u001f\u007f]/.test(normalized)) {
-    throw new Error(`${name} 无效`);
-  }
-  return normalized;
-}
-
-async function hiddenQuestion(prompt: string): Promise<string> {
-  if (!process.stdin.isTTY || !process.stdout.isTTY || !process.stdin.setRawMode) {
-    throw new Error("当前终端不支持安全隐藏输入");
-  }
-  process.stdout.write(prompt);
-  emitKeypressEvents(process.stdin);
-  const wasRaw = process.stdin.isRaw;
-  const wasPaused = process.stdin.isPaused();
-  process.stdin.setRawMode(true);
-  process.stdin.resume();
-  let answer = "";
-  return new Promise<string>((resolveAnswer, reject) => {
-    const finish = (error?: Error) => {
-      process.stdin.off("keypress", onKeypress);
-      process.stdin.setRawMode(Boolean(wasRaw));
-      if (wasPaused) process.stdin.pause();
-      process.stdout.write("\n");
-      if (error) reject(error);
-      else resolveAnswer(answer);
-    };
-    const onKeypress = (text: string, key: Key) => {
-      if (key.ctrl && key.name === "c") {
-        finish(new Error("凭据输入已取消"));
-      } else if (key.name === "return" || key.name === "enter") {
-        finish();
-      } else if (key.name === "backspace" || key.name === "delete") {
-        if (answer.length > 0) {
-          answer = answer.slice(0, -1);
-          process.stdout.write("\b \b");
-        }
-      } else if (!key.ctrl && !key.meta && text && !/[\r\n]/.test(text) && answer.length < 1024) {
-        answer += text;
-        process.stdout.write("*");
-      }
-    };
-    process.stdin.on("keypress", onKeypress);
-  });
-}
-
-async function botCredentials(): Promise<{ botId: string; secret: string }> {
-  let botId = process.env.THREADFERRY_WECOM_BOT_ID;
-  let secret = process.env.THREADFERRY_WECOM_BOT_SECRET;
-  if (botId && secret) return { botId, secret };
-  if (!process.stdin.isTTY || !process.stdout.isTTY) {
-    throw new Error("缺少 THREADFERRY_WECOM_BOT_ID 或 THREADFERRY_WECOM_BOT_SECRET；交互式终端可安全输入，非交互启动必须设置环境变量");
-  }
-  console.log("机器人凭据仅用于当前进程，不写入配置或日志。");
-  if (!botId && !secret) {
-    let configuredBotId: string | undefined;
-    try {
-      const { stdout } = await runCommand("wecom-cli", ["auth", "show"], { timeoutMs: 10_000 });
-      const value = stdout.match(/^Bot ID:\s*(.+)$/m)?.[1];
-      if (value) configuredBotId = validateCredential(value, "Bot ID");
-    } catch {
-      // Missing or unauthorized wecom-cli falls through to manual entry.
-    }
-    if (configuredBotId) {
-      const prompt = createInterface({ input: process.stdin, output: process.stdout });
-      try {
-        const answer = (await prompt.question(`检测到 wecom-cli 已配置 Bot ID ${configuredBotId}，是否直接读取并使用？[Y/n]: `)).trim().toLowerCase();
-        if (answer === "" || answer === "y" || answer === "yes") {
-          const saved = await loadWecomCliCredentials();
-          if (saved?.botId === configuredBotId) {
-            botId = saved.botId;
-            secret = saved.secret;
-            console.log("已复用 wecom-cli 凭据。");
-          } else {
-            console.log("无法读取 wecom-cli 保存的 Secret，请手动输入。");
-          }
-        }
-      } finally {
-        prompt.close();
-      }
-    }
-  }
-  if (!botId) {
-    const prompt = createInterface({ input: process.stdin, output: process.stdout });
-    try {
-      botId = validateCredential(await prompt.question("企业微信 Bot ID: "), "Bot ID");
-    } finally {
-      prompt.close();
-    }
-  }
-  if (!secret) secret = validateCredential(await hiddenQuestion("企业微信 Bot Secret: "), "Bot Secret");
-  process.env.THREADFERRY_WECOM_BOT_ID = botId;
-  process.env.THREADFERRY_WECOM_BOT_SECRET = secret;
-  return { botId, secret };
+function wecomRunner(configDir: string): CommandRunner {
+  return (command, args, options) => runCommand(command, args, { ...options, env: wecomEnv(configDir) });
 }
 
 function runtimeName(input: string | undefined): RuntimeName {
@@ -210,6 +161,53 @@ function adminPort(input: string | undefined): number {
   const port = Number(input);
   if (!Number.isInteger(port) || port < 1 || port > 65_535) throw new Error("--admin-port 必须是 1-65535 的端口");
   return port;
+}
+
+function pairTimeoutMs(input: string | undefined): number | undefined {
+  if (input === undefined) return undefined;
+  const seconds = Number(input);
+  if (!Number.isFinite(seconds) || seconds <= 0) throw new Error("--timeout 必须是大于 0 的秒数");
+  return Math.round(seconds * 1000);
+}
+
+// 已有配置时给「新增 Agent」路径一个不冲突的默认名。
+function suggestAgentName(existing: ThreadFerryConfig): string {
+  if (!existing.agents.reviewer) return "reviewer";
+  let suffix = 2;
+  while (existing.agents[`reviewer${suffix}`]) suffix += 1;
+  return `reviewer${suffix}`;
+}
+
+// 每个 Agent 的机器人凭据都由 wecom-cli 在自己的目录里加密保存（threadferry agent login）。
+// ThreadFerry 因此不再提示输入 Bot Secret，也不再把凭据写进环境变量——只在建立连接时读一次。
+export interface StartupAgent {
+  agentId: string;
+  botId: string;
+  secret: string;
+  configDir: string;
+}
+
+// 每个已授权 Agent 都会起一条自己的连接。没有凭据的 Agent 显式报出来后跳过——
+// 对齐 larkin 的 agents.filter(a => a.feishuProfile)，不静默忽略。
+async function startupAgents(config: ThreadFerryConfig, only?: Set<string>): Promise<StartupAgent[]> {
+  if (only) {
+    const unknown = [...only].filter((agentId) => !config.agents[agentId]);
+    if (unknown.length > 0) {
+      throw new Error(`--agents 指定了未配置的 Agent: ${unknown.join(", ")}\n已配置: ${Object.keys(config.agents).join(", ")}`);
+    }
+  }
+  const candidates = Object.entries(config.agents).filter(([agentId]) => !only || only.has(agentId));
+  const ready: StartupAgent[] = [];
+  for (const [agentId, agent] of candidates) {
+    const credentials = await loadBotCredentials(agentId, agent.configDir);
+    if (credentials) ready.push({ agentId, ...credentials });
+    else console.error(`[bot] 跳过 Agent ${agentId}：没有机器人凭据。执行 threadferry agent login ${agentId} 后可用`);
+  }
+  if (ready.length === 0) {
+    const [first] = candidates[0] ?? [];
+    throw new Error(`没有任何待启动的 Agent 拥有机器人凭据。\n${authorizeHint(first ?? "default", first ? config.agents[first]?.configDir : undefined)}`);
+  }
+  return ready;
 }
 
 async function preflightDependencies(runtimes: Set<RuntimeName>): Promise<void> {
@@ -250,135 +248,320 @@ async function preflightDependencies(runtimes: Set<RuntimeName>): Promise<void> 
   }
 }
 
-async function preflightReal(config: ThreadFerryConfig): Promise<{ botId: string; secret: string }> {
-  const credentials = await botCredentials();
-  await preflightDependencies(new Set(Object.values(config.agents).map((agent) => agent.runtime)));
-  return credentials;
+async function preflightReal(config: ThreadFerryConfig, only?: Set<string>): Promise<StartupAgent[]> {
+  const agents = await startupAgents(config, only);
+  await preflightDependencies(new Set(agents.map(({ agentId }) => config.agents[agentId]!.runtime)));
+  return agents;
 }
 
-async function setup(configPath: string, workspaceInput: string, agentId: string, runtime: RuntimeName, model?: string): Promise<void> {
+async function setup(configPath: string, options: {
+  agentId: string;
+  workspace?: string;
+  runtime?: RuntimeName;
+  model?: string;
+  timeoutMs?: number;
+}): Promise<void> {
   if (!process.stdin.isTTY || !process.stdout.isTTY) throw new Error("threadferry setup 需要交互式终端确认私聊身份");
   const target = resolve(configPath);
-  const workspace = await resolveWorkspace(workspaceInput);
-  if (existsSync(target)) await loadConfig(target);
-  const credentials = await botCredentials();
-  await preflightDependencies(new Set([runtime]));
-  const code = randomBytes(8).toString("hex");
-  console.log(`请私聊机器人发送：threadferry pair ${code}`);
-  console.log("等待私聊配对消息；收到后还需要在本机终端确认。配置不会保存机器人凭据。");
-
-  await new Promise<void>((done, reject) => {
-    let client: ReturnType<typeof startWecomChannel> | undefined;
-    let claimed = false;
-    const stop = () => {
-      client?.disconnect();
-      reject(new Error("setup 已取消"));
-    };
-    const finish = () => {
-      process.off("SIGINT", stop);
-      process.off("SIGTERM", stop);
-      client?.disconnect();
-      done();
-    };
-    client = startWecomChannel(credentials, async (event, reply) => {
-      if (event.chatType !== "single") {
-        await reply("请私聊机器人完成 ThreadFerry Owner 配对。", true).catch(() => undefined);
-        return;
-      }
-      const message = event.message;
-      if (!message.text.includes(`threadferry pair ${code}`)) {
-        console.log("[setup] 收到私聊消息，但配对码不匹配");
-        return;
-      }
-      if (claimed) return;
-      claimed = true;
-      try {
-        const confirmation = createInterface({ input: process.stdin, output: process.stdout });
-        let approved: boolean;
-        try {
-          const answer = (await confirmation.question(`收到 userid ${message.senderId} 的私聊配对请求，确认为 ThreadFerry Owner？[y/N]: `)).trim().toLowerCase();
-          approved = answer === "y" || answer === "yes";
-        } finally {
-          confirmation.close();
-        }
-        if (!approved) {
-          claimed = false;
-          await reply("本机终端未确认本次配对。", true).catch(() => undefined);
-          return;
-        }
-        const current = existsSync(target) ? await loadConfig(target) : undefined;
-        const content = pairConfig(agentId, { workspace, runtime, ...(model ? { model } : {}) }, message.senderId, current);
-        const directory = dirname(target);
-        await mkdir(directory, { recursive: true });
-        const temporary = join(directory, `.${basename(target)}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`);
-        try {
-          await writeFile(temporary, content, { flag: "wx", mode: 0o600 });
-          await rename(temporary, target);
-        } finally {
-          await rm(temporary, { force: true });
-        }
-        await reply("配对完成。请回到电脑终端继续启动 ThreadFerry。\n\n启动后：\n- 直接在这里发消息，即可私聊 Agent\n- 发送 `threadferry help`，查看群聊接入和管理方法").catch(() => undefined);
-        console.log(`配置已更新: ${target}`);
-        finish();
-      } catch (error) {
-        client?.disconnect();
-        reject(error);
-      }
-    });
-    process.once("SIGINT", stop);
-    process.once("SIGTERM", stop);
+  validateAgentId(options.agentId);
+  const existing = existsSync(target) ? await loadConfig(target) : undefined;
+  // 显式传入的 --workspace 也要走既有校验（绝对路径、真实目录、非符号链接跳转）。
+  const requestedWorkspace = options.workspace === undefined ? undefined : await resolveWorkspace(options.workspace);
+  // 已有配置时 --workspace 可以省略：沿用该 Agent 已配置的 Workspace/Runtime/Model。
+  const plan = resolveSetupPlan(existing, options.agentId, {
+    workspace: requestedWorkspace,
+    runtime: options.runtime,
+    model: options.model,
   });
+  const credentials = await authorizeBot(options.agentId, existing?.agents[options.agentId]?.configDir);
+  const adopted = await adoptAuthorizedOwner(target, options.agentId, credentials, plan, existing);
+  if (adopted) return;
+
+  await pairOwner(configPath, {
+    agentId: options.agentId,
+    workspace: plan.workspace,
+    runtime: plan.runtime,
+    ...(plan.model ? { model: plan.model } : {}),
+    timeoutMs: options.timeoutMs,
+  });
+  console.log(`Agent ${options.agentId} 配对完成（Workspace: ${plan.workspace}，Runtime: ${plan.runtime}）。`);
 }
 
-async function onboard(configOption?: string): Promise<void> {
+// 授权机器人时扫码的就是机器人创建者：直接读取其身份并认领为该 Agent 的 Owner。
+// 终端默认同意（扫码的人就在电脑前）；拒绝后返回 false，由调用方回退到手机配对。
+async function adoptAuthorizedOwner(
+  target: string,
+  agentId: string,
+  credentials: BotCredentials,
+  plan: SetupPlan,
+  existing: ThreadFerryConfig | undefined,
+): Promise<boolean> {
+  const identity = await fetchWecomIdentity(wecomRunner(credentials.configDir));
+  const authorized = identity.user;
+  const userId = authorized?.id;
+  if (!userId) {
+    console.log("未能识别授权用户身份，请通过手机私聊配对指定 Owner。");
+    return false;
+  }
+  const approved = await confirmOwnerAdopt(agentId, authorized);
+  if (!approved) {
+    console.log("已拒绝自动认领；请通过手机私聊配对指定其他 Owner。");
+    return false;
+  }
+  await writePairedConfig(target, agentId, agentDefinitionForPairing(
+    { workspace: plan.workspace, runtime: plan.runtime, ...(plan.model ? { model: plan.model } : {}) },
+    existing?.agents[agentId],
+  ), userId);
+  console.log(`Agent ${agentId} 的 Owner 已设为 ${describeIdentity(authorized)}（本机已确认）。`);
+  console.log(`配置已更新: ${target}`);
+  return true;
+}
+
+// 终端确认将授权用户认领为该 Agent 的 Owner。默认同意（扫码的人就在电脑前）。
+async function confirmOwnerAdopt(agentId: string, user: { name?: string; id?: string }): Promise<boolean> {
+  const answer = (await askLine(ownerAdoptPrompt(agentId, user))).trim().toLowerCase();
+  return answer === "" || answer === "y" || answer === "yes";
+}
+
+// 把配对的 Agent 写入配置文件（原子写：临时文件 + rename），沿用已有 Agent 的 config_dir。
+async function writePairedConfig(target: string, agentId: string, agentDef: { workspace: string; runtime: RuntimeName; model?: string; configDir?: string }, userId: string): Promise<void> {
+  const current = existsSync(target) ? await loadConfig(target) : undefined;
+  const content = pairConfig(agentId, agentDef, userId, current);
+  const directory = dirname(target);
+  await mkdir(directory, { recursive: true });
+  const temporary = join(directory, `.${basename(target)}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`);
+  try {
+    await writeFile(temporary, content, { flag: "wx", mode: 0o600 });
+    await rename(temporary, target);
+  } finally {
+    await rm(temporary, { force: true });
+  }
+}
+
+async function pairOwner(configPath: string, options: {
+  agentId: string;
+  workspace: string;
+  runtime: RuntimeName;
+  model?: string;
+  timeoutMs?: number;
+}): Promise<void> {
+  const target = resolve(configPath);
+  const existing = existsSync(target) ? await loadConfig(target) : undefined;
+  const credentials = await loadBotCredentials(options.agentId, existing?.agents[options.agentId]?.configDir);
+  if (!credentials) throw new Error(`Agent ${options.agentId} 还没有机器人凭据；请先授权再配对`);
+  await preflightDependencies(new Set([options.runtime]));
+  const timeoutMs = options.timeoutMs ?? DEFAULT_PAIR_TIMEOUT_MS;
+  const code = randomBytes(8).toString("hex");
+  console.log(pairInstructions(options.agentId, code));
+  console.log(`配对码在 ${Math.round(timeoutMs / 60_000)} 分钟内有效；等待期间会周期性提示，Ctrl+C 可取消。配置不会保存机器人凭据。`);
+
+  const result = await waitForPair({
+    code,
+    agentId: options.agentId,
+    workspace: options.workspace,
+    onLog: (message) => console.log(message),
+    confirm: async (senderId) => {
+      const answer = (await askLine(`收到 userid ${senderId} 的私聊配对请求，确认为 Agent ${options.agentId} 的 Owner？[y/N]: `)).trim().toLowerCase();
+      const approved = answer === "y" || answer === "yes";
+      if (!approved) console.log("[setup] 已拒绝本次配对，继续等待其他消息。");
+      return approved;
+    },
+    onApproved: async (senderId) => {
+      await writePairedConfig(target, options.agentId, agentDefinitionForPairing(
+        { workspace: options.workspace, runtime: options.runtime, ...(options.model ? { model: options.model } : {}) },
+        existing?.agents[options.agentId],
+      ), senderId);
+      console.log(`配置已更新: ${target}`);
+    },
+    startChannel: (handler) => startWecomChannel(credentials, handler),
+    timeoutMs,
+  });
+
+  if (result === "timeout") throw new Error(`等待超时：未收到 Agent ${options.agentId} 的私聊配对。请确认机器人已授权后重新执行。`);
+  if (result === "cancelled") throw new Error("setup 已取消");
+}
+
+const TEMP_CREDENTIAL_PREFIX = "tmp-";
+
+function wecomRoot(): string {
+  return join(homedir(), ".threadferry", "wecom");
+}
+
+// 清理历史遗留的临时授权目录。onboard 开头调用一次，覆盖以前中断留下的残留。
+async function pruneTempCredentials(): Promise<number> {
+  let entries: Dirent[];
+  try {
+    entries = await readdir(wecomRoot(), { withFileTypes: true });
+  } catch {
+    return 0;
+  }
+  let removed = 0;
+  for (const entry of entries) {
+    if (!entry.isDirectory() || !entry.name.startsWith(TEMP_CREDENTIAL_PREFIX)) continue;
+    try {
+      await rm(join(wecomRoot(), entry.name), { recursive: true, force: true });
+      removed += 1;
+    } catch {
+      // 删不掉就跳过，不影响引导本身。
+    }
+  }
+  return removed;
+}
+
+async function onboard(configOption?: string, timeoutMs?: number): Promise<void> {
   if (!process.stdin.isTTY || !process.stdout.isTTY) {
     throw new Error("threadferry onboard 需要交互式终端；无人值守环境请使用 setup/start 参数和环境变量");
   }
   const configPath = resolve(configOption ?? defaultConfigPath());
-  const current = existsSync(configPath) ? await loadConfig(configPath) : undefined;
-  const defaults = onboardingDefaults(current, process.cwd());
-  const prompt = createInterface({ input: process.stdin, output: process.stdout });
-  let agentId: string;
-  let runtime: RuntimeName;
-  let workspace: string;
-  let model: string | undefined;
-  console.log(`ThreadFerry 引导配置（配置文件: ${configPath}）`);
-  console.log("[1/4] 选择 Agent 和 Workspace");
+  const existing = existsSync(configPath) ? await loadConfig(configPath) : undefined;
+
+  const pruned = await pruneTempCredentials();
+  if (pruned > 0) console.log(`已清理 ${pruned} 个上次中断留下的临时授权目录。`);
+
+  console.log(onboardIntro(Boolean(existing)));
+
+  // 本次引导创建的临时目录；无论成功失败都不留残留。
+  const temporaryDirs = new Set<string>();
   try {
     const ask = async (label: string, fallback: string) => {
-      const answer = (await prompt.question(`${label} [${fallback}]: `)).trim();
+      const answer = (await askLine(`${label} [${fallback}]: `)).trim();
       return answer || fallback;
     };
-    agentId = await ask("Agent 名", defaults.agentId);
-    runtime = runtimeName((await ask("Runtime (codex/pi)", defaults.runtime)).toLowerCase());
-    workspace = await ask("Workspace 绝对路径", defaults.workspace);
-    const modelAnswer = (await prompt.question(`模型 ID（留空使用 Runtime 默认）${defaults.model ? ` [${defaults.model}]` : ""}: `)).trim();
-    model = modelAnswer || defaults.model;
+    const askModel = async (fallback?: string) => {
+      const answer = (await askLine(`模型 ID（留空使用 Runtime 默认）${fallback ? ` [${fallback}]` : ""}: `)).trim();
+      return answer || fallback;
+    };
+    const pickRuntimeWorkspaceModel = async (agentId: string) => {
+      const runtime = runtimeName((await ask("Runtime (codex/pi)", existing?.agents[agentId]?.runtime ?? "codex")).toLowerCase());
+      const workspace = await resolveWorkspace(await ask("Workspace 绝对路径", existing?.agents[agentId]?.workspace ?? process.cwd()));
+      const model = await askModel(existing?.agents[agentId]?.model);
+      return { runtime, workspace, ...(model ? { model } : {}) } as Omit<SetupPlan, "reused">;
+    };
+    // 先扫码授权机器人（凭据暂存到临时目录），再读取机器人名作为默认 Agent 名。
+    // 授权或读身份失败时必须删掉临时目录：里面可能有半写入的凭据，留着既是垃圾也是风险。
+    const authorizeTemp = async (): Promise<{ tempDir: string; botName?: string }> => {
+      const tempDir = join(wecomRoot(), `${TEMP_CREDENTIAL_PREFIX}${randomBytes(6).toString("hex")}`);
+      await mkdir(tempDir, { recursive: true, mode: 0o700 });
+      temporaryDirs.add(tempDir);
+      console.log(authAnnouncement("待授权机器人", tempDir));
+      console.log();
+      await runAuthInit(tempDir);
+      const identity = await fetchWecomIdentity(wecomRunner(tempDir));
+      return { tempDir, botName: identity.bot?.name?.trim() };
+    };
+    const moveCredentials = async (fromDir: string, toDir: string): Promise<void> => {
+      if (fromDir === toDir) return;
+      await mkdir(dirname(toDir), { recursive: true, mode: 0o700 });
+      await rename(fromDir, toDir);
+      temporaryDirs.delete(fromDir);
+    };
+    const proposeName = (botName: string | undefined): string => {
+      if (botName) {
+        try {
+          return validateAgentId(botName);
+        } catch {
+          // 机器人名不合目录名规则时退回默认名。
+        }
+      }
+      return existing ? suggestAgentName(existing) : "default";
+    };
+    // Agent 名直接取自机器人名：1:1 架构下两者本就该一致，避免用户手敲出和机器人对不上的名字。
+    const autoName = (botName: string | undefined): string | undefined =>
+      agentNameFromBot(botName, Object.keys(existing?.agents ?? {}));
+    const nameFromBot = async (botName: string | undefined, label: string): Promise<string> => {
+      const auto = autoName(botName);
+      if (auto) {
+        console.log(`${label}名: ${auto}（取自机器人名）`);
+        return auto;
+      }
+      return await ask(`${label}名（机器人名不可用，请手动指定）`, proposeName(botName));
+    };
+
+    if (existing && Object.keys(existing.agents).length > 0) {
+      const choice = (await askLine(
+        `已有配置，Agent：${Object.keys(existing.agents).join(", ")}。要做什么？
+  1) 新增一个 Agent + 一个机器人
+  2) 为已有 Agent 重新配对 Owner
+  3) 取消
+请选择 [1/2/3]: `,
+      )).trim();
+      if (choice === "2") {
+        const names = Object.keys(existing.agents);
+        const picked = (await askLine(`选择要重新配对的 Agent ${names.join(" / ")} [${names[0]}]: `)).trim();
+        const agentId = picked || names[0]!;
+        if (!existing.agents[agentId]) throw new Error(`Agent ${agentId} 未配置`);
+        console.log("\n[2/5] 授权企业微信机器人（已有凭据则跳过）");
+        const credentials = await authorizeBot(agentId, existing.agents[agentId].configDir);
+        const plan = resolveSetupPlan(existing, agentId);
+        await claimOwner(configPath, agentId, credentials, plan, existing, timeoutMs);
+      } else if (choice === "3" || choice.toLowerCase() === "q" || choice.toLowerCase() === "cancel") {
+        console.log("已取消。");
+        return;
+      } else {
+        // 新增 Agent：先授权机器人，再用机器人名作 Agent 名（自动，无需输入）。
+        console.log("\n[2/5] 授权企业微信机器人（扫码）");
+        const { tempDir, botName } = await authorizeTemp();
+        const agentId = await nameFromBot(botName, "新 Agent");
+        validateAgentId(agentId);
+        await moveCredentials(tempDir, botConfigDir(agentId));
+        const credentials = await loadBotCredentials(agentId, botConfigDir(agentId));
+        if (!credentials) throw new Error(authorizeHint(agentId));
+        const plan = { ...(await pickRuntimeWorkspaceModel(agentId)), reused: false };
+        await claimOwner(configPath, agentId, credentials, plan, existing, timeoutMs);
+      }
+    } else {
+      // 首次配置：先授权机器人，再用机器人名作 Agent 名（自动，无需输入）。
+      console.log("\n[2/5] 授权企业微信机器人（扫码）");
+      const { tempDir, botName } = await authorizeTemp();
+      const agentId = await nameFromBot(botName, "Agent");
+      validateAgentId(agentId);
+      await moveCredentials(tempDir, botConfigDir(agentId));
+      const credentials = await loadBotCredentials(agentId, botConfigDir(agentId));
+      if (!credentials) throw new Error(authorizeHint(agentId));
+      const plan = { ...(await pickRuntimeWorkspaceModel(agentId)), reused: false };
+      await claimOwner(configPath, agentId, credentials, plan, existing, timeoutMs);
+    }
   } finally {
-    prompt.close();
+    for (const dir of temporaryDirs) await rm(dir, { recursive: true, force: true }).catch(() => undefined);
+    temporaryDirs.clear();
   }
 
-  console.log("[2/4] 检查依赖并通过私聊配对 Owner");
-  await setup(configPath, workspace, agentId, runtime, model);
-  console.log("[3/4] 运行环境诊断");
+  console.log("\n[4/5] 运行环境诊断");
   if (!(await doctor(configPath))) {
-    throw new Error(`环境诊断未通过；修复后运行 threadferry doctor --config ${configPath}`);
+    console.error(
+      "\n[error] 环境诊断未通过。请根据上面的 [error] 条目修复问题。\n" +
+      "修复后重新运行 threadferry onboard 即可（它会复用已有配置和配对），也可以直接运行 threadferry start。",
+    );
+    throw new Error(`环境诊断未通过；修复后运行 threadferry doctor --config ${configPath} 复查。`);
   }
 
-  console.log("[4/4] 启动 ThreadFerry");
-  const confirmation = createInterface({ input: process.stdin, output: process.stdout });
-  let shouldStart: boolean;
-  try {
-    const answer = (await confirmation.question("现在启动并保持当前终端运行？[Y/n]: ")).trim().toLowerCase();
-    shouldStart = answer === "" || answer === "y" || answer === "yes";
-  } finally {
-    confirmation.close();
-  }
+  console.log("\n[5/5] 启动 ThreadFerry");
+  const startAnswer = (await askLine("现在启动并保持当前终端运行？[Y/n]: ")).trim().toLowerCase();
+  const shouldStart = startAnswer === "" || startAnswer === "y" || startAnswer === "yes";
   if (shouldStart) {
     const updatedBinary = await start(configPath, false, 17_638);
     if (updatedBinary) await runUpdated(updatedBinary, ["start", "--config", configPath]);
   }
   else console.log(`配置完成。稍后运行: threadferry start --config ${configPath}`);
+}
+
+// 认领 Owner：默认直接采用授权用户（终端确认），拒绝时回退到手机配对。
+async function claimOwner(configPath: string, agentId: string, credentials: BotCredentials, plan: SetupPlan, existing: ThreadFerryConfig | undefined, timeoutMs?: number): Promise<void> {
+  console.log("\n[3/5] 认领 Owner（默认使用授权用户，也可手机配对指定）");
+  const adopted = await adoptAuthorizedOwner(configPath, agentId, credentials, plan, existing);
+  if (!adopted) {
+    await pairOwner(configPath, { agentId, workspace: plan.workspace, runtime: plan.runtime, ...(plan.model ? { model: plan.model } : {}), timeoutMs });
+  }
+}
+
+// 运行 wecom-cli auth init 扫码授权，凭据写入指定目录（由 WECOM_CLI_CONFIG_DIR 决定）。
+async function runAuthInit(configDir: string): Promise<void> {
+  const code = await new Promise<number | null>((resolve, reject) => {
+    const child = spawn("wecom-cli", ["auth", "init"], { stdio: "inherit", env: wecomEnv(configDir), shell: false });
+    child.on("error", (error) => reject(new Error(`无法启动 wecom-cli: ${error.message}`)));
+    child.on("close", resolve);
+  });
+  if (code !== 0) throw new Error(`wecom-cli auth init 未成功（退出码 ${code ?? "unknown"}）`);
 }
 
 async function doctor(configPath?: string): Promise<boolean> {
@@ -408,37 +591,51 @@ async function doctor(configPath?: string): Promise<boolean> {
     checks.push({ ok: false, message: "本地状态存储无效；请检查 ~/.threadferry 的权限和 state-v3.json 格式" });
   }
 
-  const environmentCredentials = Boolean(process.env.THREADFERRY_WECOM_BOT_ID && process.env.THREADFERRY_WECOM_BOT_SECRET);
-  const savedCredentials = environmentCredentials ? undefined : await loadWecomCliCredentials();
-  checks.push({
-    ok: environmentCredentials || Boolean(savedCredentials),
-    message: environmentCredentials
-      ? "企业微信机器人凭据可用（环境变量，值未显示）"
-      : savedCredentials
-        ? "企业微信机器人凭据可用（wecom-cli 加密存储，值未显示）"
-        : "缺少企业微信机器人凭据；请运行 threadferry onboard 或设置 THREADFERRY_WECOM_BOT_ID/THREADFERRY_WECOM_BOT_SECRET",
-  });
+  // 凭据按 Agent 隔离，逐个报告。值始终不显示。
+  let authorizedAgents = 0;
+  for (const [agentId, agent] of Object.entries(loadedConfig?.agents ?? {})) {
+    const status = await botStatus(agentId, agent.configDir);
+    if (status.authorized) authorizedAgents += 1;
+    checks.push({
+      ok: status.authorized,
+      message: status.authorized
+        ? `Agent ${agentId} 机器人凭据可用（wecom-cli 加密存储，值未显示）`
+        : `Agent ${agentId} 缺少机器人凭据；请执行 threadferry agent login ${agentId}`,
+    });
+  }
+
+  // 身份和群历史都必须用该 Agent 自己的凭据目录来查；用默认目录会检查到别的机器人。
+  let probeAgent: string | undefined;
+  for (const [agentId, agent] of Object.entries(loadedConfig?.agents ?? {})) {
+    if (await loadBotCredentials(agentId, agent.configDir)) { probeAgent = agentId; break; }
+  }
+  const probeRunner = probeAgent
+    ? wecomRunner(botConfigDir(probeAgent, loadedConfig?.agents[probeAgent]?.configDir))
+    : undefined;
 
   let wecomAuthorized = false;
   try {
     const { stdout } = await runCommand("wecom-cli", ["--version"], { timeoutMs: 10_000 });
     const supported = atLeast(stdout, [1, 1, 0]);
     checks.push({ ok: supported, message: supported ? stdout.trim() : `${stdout.trim()}；ThreadFerry 要求 1.1.0+` });
-    try {
-      await runCommand("wecom-cli", ["identity", "whoami", "--json", "{}"], { timeoutMs: 30_000 });
-      wecomAuthorized = true;
-      checks.push({ ok: true, message: "wecom-cli 身份授权有效（详情未显示）" });
-    } catch {
-      checks.push({ ok: false, message: "wecom-cli 未授权或身份检查失败；请先执行 wecom-cli auth init" });
+    if (probeRunner && probeAgent) {
+      try {
+        await probeRunner("wecom-cli", ["identity", "whoami", "--json", "{}"], { timeoutMs: 30_000 });
+        wecomAuthorized = true;
+        checks.push({ ok: true, message: `Agent ${probeAgent} 的机器人身份授权有效（详情未显示）` });
+      } catch {
+        checks.push({ ok: false, message: `Agent ${probeAgent} 的机器人身份检查失败；请重新执行 threadferry agent login ${probeAgent}` });
+      }
     }
   } catch {
     checks.push({ ok: false, message: "找不到 wecom-cli；请安装企业微信官方 wecom-cli 1.1.0+ 并加入 PATH" });
   }
 
-  const firstGroupId = loadedConfig && Object.keys(loadedConfig.groups)[0];
-  if (wecomAuthorized && firstGroupId) {
+  const probeGroup = probeAgent
+    && Object.entries(loadedConfig?.groups ?? {}).find(([, group]) => group.agent === probeAgent)?.[0];
+  if (wecomAuthorized && probeGroup && probeRunner) {
     try {
-      await fetchWecomHistory(firstGroupId, { lookbackHours: 1 / 60, maxMessages: 1, endTime: new Date() });
+      await fetchWecomHistory(probeGroup, { lookbackHours: 1 / 60, maxMessages: 1, endTime: new Date() }, probeRunner);
       checks.push({ ok: true, message: "企业微信群消息历史权限有效" });
     } catch (error) {
       checks.push({ ok: false, message: error instanceof Error ? error.message : "企业微信群消息历史检查失败" });
@@ -526,22 +723,107 @@ async function resetSession(configPath: string | undefined, groupId: string): Pr
   const lock = await acquireHostLock();
   try {
     const config = await loadConfig(resolve(configPath ?? defaultConfigPath()));
-    if (!config.groups[groupId]) throw new Error("指定群未配置");
-    const removed = await new ThreadFerryState(defaultStatePath()).clearSession(groupId);
+    const group = config.groups[groupId];
+    if (!group) throw new Error("指定群未配置");
+    // 只重置该群所属 Agent 的 Session：两个机器人同在一个群时不能清掉对方的。
+    const agent = config.agents[group.agent]!;
+    const removed = await new ThreadFerryState(defaultStatePath())
+      .clearSession(groupId, sessionScope(group.agent, agent));
     console.log(removed ? "该群 Runtime Session 已重置。" : "该群当前没有已保存的 Runtime Session。");
   } finally {
     await lock.release();
   }
 }
 
-async function start(configPath: string, mock: boolean, port: number): Promise<string | undefined> {
+// 换企业或重建机器人后，本机 wecom-cli 授权的真人 userid 会变，而配置里的 Owner
+// 还是旧值，表现为「只有机器人创建者可以私聊 Agent」。启动时先亮明双方身份，
+// 不一致就在本机终端询问——信任根仍是本机，与 setup 配对确认保持一致。
+async function confirmOwnerIdentity(config: ThreadFerryConfig, agentId: string, updateConfig: ConfigUpdater): Promise<void> {
+  const agent = config.agents[agentId]!;
+  const identity = await fetchWecomIdentity(wecomRunner(botConfigDir(agentId, agent.configDir)));
+  const bot = describeIdentity(identity.bot);
+  const user = describeIdentity(identity.user);
+  if (bot) console.log(`企业微信机器人: ${bot}`);
+  console.log(`当前授权用户: ${user ?? "未能识别"}`);
+  // 一致时直接展示「名字（ID）」，不一致时只能展示配置里存的原始 ID。
+  const ownerLabel = agent.ownerUser === identity.user?.id && user ? user : agent.ownerUser;
+  console.log(`Agent ${agentId} 配置的 Owner: ${ownerLabel}`);
+  const currentUser = identity.user?.id;
+  if (!currentUser || currentUser === agent.ownerUser) return;
+
+  console.warn(`[owner] Agent ${agentId} 的当前授权用户与配置 Owner 不一致；在更正之前，私聊该 Agent 会被拒绝。`);
+  if (!process.stdin.isTTY || !process.stdout.isTTY) {
+    console.warn("[owner] 非交互式启动不会自动更改；请在交互式终端执行 threadferry setup 重新确认 Owner。");
+    return;
+  }
+  const answer = (await askLine("是否把 Owner 更新为当前授权用户？[y/N]: ")).trim().toLowerCase();
+  const approved = answer === "y" || answer === "yes";
+  if (!approved) {
+    console.log("[owner] 保持原有 Owner；可随时执行 threadferry setup 重新确认。");
+    return;
+  }
+  await updateConfig((latest) => {
+    const adopted = adoptOwner(latest, agentId, currentUser);
+    latest.ownerUser = adopted.ownerUser;
+    latest.agents = adopted.agents;
+    latest.groups = adopted.groups;
+  });
+  console.log(`[owner] Agent ${agentId} 的 Owner 已更新为 ${user}`);
+}
+
+async function loginAgentBot(agentId: string, override?: string): Promise<void> {
+  const configDir = botConfigDir(agentId, override);
+  await mkdir(configDir, { recursive: true, mode: 0o700 });
+  console.log(authAnnouncement(agentId, configDir));
+  console.log();
+  const code = await new Promise<number | null>((resolve, reject) => {
+    const child = spawn("wecom-cli", ["auth", "init"], {
+      stdio: "inherit",
+      env: wecomEnv(configDir),
+      shell: false,
+    });
+    child.on("error", (error) => reject(new Error(`无法启动 wecom-cli: ${error.message}`)));
+    child.on("close", resolve);
+  });
+  if (code !== 0) throw new Error(`wecom-cli auth init 未成功（退出码 ${code ?? "unknown"}）`);
+  const status = await botStatus(agentId, override);
+  if (!status.authorized) throw new Error(`授权流程结束但 ${configDir} 下仍没有可用凭据`);
+  console.log(`\nAgent ${agentId} 已绑定机器人 ${status.botId}。`);
+}
+
+// 保证该 Agent 有机器人凭据：已有则跳过，没有则先预告再扫码授权。
+async function authorizeBot(agentId: string, configDir?: string): Promise<BotCredentials> {
+  const existing = await loadBotCredentials(agentId, configDir);
+  if (existing) {
+    console.log(`Agent ${agentId} 已有机器人凭据，跳过扫码授权。`);
+    return existing;
+  }
+  await loginAgentBot(agentId, configDir);
+  const after = await loadBotCredentials(agentId, configDir);
+  if (!after) throw new Error(authorizeHint(agentId, configDir));
+  return after;
+}
+
+function selectedAgents(input: string | undefined): Set<string> | undefined {
+  if (input === undefined) return undefined;
+  const names = new Set(input.split(",").map((name) => name.trim()).filter(Boolean));
+  if (names.size === 0) throw new Error("--agents 至少需要一个 Agent 名");
+  return names;
+}
+
+async function start(
+  configPath: string,
+  mock: boolean,
+  port: number,
+  only?: Set<string>,
+): Promise<string | undefined> {
   const configFile = resolve(configPath);
   const config = await loadConfig(configFile);
   if (mock) {
     await runMock(config);
     return undefined;
   }
-  const credentials = await preflightReal(config);
+  const startup = await preflightReal(config, only);
   const lock = await acquireHostLock();
   let restartBinary: string | undefined;
   try {
@@ -554,23 +836,28 @@ async function start(configPath: string, mock: boolean, port: number): Promise<s
         config.ownerUser = latest.ownerUser;
         config.agents = latest.agents;
         config.groups = latest.groups;
+        // 就地刷新每个 Agent 的视图，让已运行的 app 立刻看到新配置。
+        for (const [agentId, view] of views) refreshAgentView(view, latest, agentId);
       });
       configTail = operation.then(() => undefined, () => undefined);
       return operation;
     };
+    const views = new Map<string, ThreadFerryConfig>();
     const state = new ThreadFerryState(defaultStatePath());
-    const app = createApp(config, {
-      history: (groupId, options) => fetchWecomHistory(groupId, options),
+
+    // 每个 Agent 一套：配置视图 + 绑定自己凭据目录的 runner + 独立 app 实例 + 独立连接。
+    const hosts = await Promise.all(startup.map(async ({ agentId, botId, secret, configDir }) => {
+      const view = agentView(config, agentId);
+      views.set(agentId, view);
+      const runner = wecomRunner(configDir);
+      await confirmOwnerIdentity(config, agentId, updateConfig);
+      const app = createApp(view, {
+      history: (groupId, options) => fetchWecomHistory(groupId, options, runner),
       runtime: (request) => request.runtime === "codex" ? runCodex(request) : runPi(request),
       updateAllowUsers: (groupId, users) => updateConfig((latest) => {
         const group = latest.groups[groupId];
         if (!group) throw new Error("指定群未配置");
         group.allowUsers = users;
-      }),
-      updateGroupAgent: (groupId, agentId) => updateConfig((latest) => {
-        const group = latest.groups[groupId];
-        if (!group || !latest.agents[agentId]) throw new Error("指定群或 Agent 未配置");
-        group.agent = agentId;
       }),
       updateGroupAccess: (groupId, allowAll) => updateConfig((latest) => {
         const group = latest.groups[groupId];
@@ -578,43 +865,74 @@ async function start(configPath: string, mock: boolean, port: number): Promise<s
         if (allowAll) group.allowAll = true;
         else delete group.allowAll;
       }),
-      bindGroup: (groupId, agentId) => updateConfig((latest) => {
-        if (latest.groups[groupId] || !latest.agents[agentId]) throw new Error("指定群已配置或 Agent 不存在");
-        latest.groups[groupId] = { agent: agentId, allowUsers: [latest.ownerUser], context: { lookbackHours: 6, maxMessages: 80 } };
+      // 绑定到「这个 host 的 Agent」，Agent 由闭包捕获，不从用户输入来。
+      bindGroup: (groupId) => updateConfig((latest) => {
+        const owner = latest.agents[agentId]?.ownerUser;
+        if (!owner) throw new Error(`Agent ${agentId} 未配置`);
+        if (latest.groups[groupId]) throw new Error("指定群已配置");
+        latest.groups[groupId] = { agent: agentId, allowUsers: [owner], context: { lookbackHours: 6, maxMessages: 80 } };
       }),
-      listGroups: () => listWecomGroups(),
-      searchUsers: (keywords) => searchWecomUsers(keywords),
-      onError: ({ errorId, phase, reason }) => console.error(`[wecom] 处理失败 error=${errorId} phase=${phase}${reason ? ` reason=${reason}` : ""}`),
-    }, state);
+      listGroups: () => listWecomGroups(runner),
+      searchUsers: (keywords) => searchWecomUsers(keywords, runner),
+      onError: ({ errorId, phase, reason }) => console.error(`[wecom] Agent ${agentId} 处理失败 error=${errorId} phase=${phase}${reason ? ` reason=${reason}` : ""}`),
+      }, state);
+      return { agentId, view, runner, app, credentials: { botId, secret } };
+    }));
+
+    // 管理台看全量配置，但所有企业微信查询都按 Agent 走它自己的机器人。
+    const runnerFor = (agentId: string) => hosts.find((host) => host.agentId === agentId)?.runner;
     const admin = await startAdminServer(config, {
       updateConfig,
-      listGroups: () => listWecomGroups(),
-      searchUsers: (keywords) => searchWecomUsers(keywords),
+      listGroups: async (agentId) => {
+        const runner = runnerFor(agentId);
+        return runner ? listWecomGroups(runner) : [];
+      },
+      searchUsers: (keywords) => searchWecomUsers(keywords, hosts[0]!.runner),
+      botStatus: async (agentId) => {
+        const status = await botStatus(agentId, config.agents[agentId]?.configDir);
+        return {
+          authorized: status.authorized,
+          ...(status.botId ? { botId: status.botId } : {}),
+          ...(status.authorized ? {} : { hint: authorizeHint(agentId, config.agents[agentId]?.configDir) }),
+        };
+      },
       snapshot: () => state.snapshot(),
-      resetSession: (groupId) => state.clearSession(groupId),
+      resetSession: (groupId) => {
+        const group = config.groups[groupId];
+        if (!group) throw new Error("指定群未配置");
+        return state.clearSession(groupId, sessionScope(group.agent, config.agents[group.agent]!));
+      },
     }, port);
     console.log(`ThreadFerry 管理台: ${admin.url}`);
     try {
-      const client = startWecomChannel(credentials, async (event, reply) => {
+      const clients = hosts.map(({ agentId, app, credentials }) => startWecomChannel(credentials, async (event, reply) => {
         const status = event.chatType === "single"
           ? await app.handleDirect(event.message, reply)
           : await app.handle(event.message, reply);
-        console.log(`[wecom] 收到${event.chatType === "single" ? "单聊" : "群内 @"}消息，处理状态: ${status}`);
-      });
-      console.log(`ThreadFerry 已启动，监听 ${Object.keys(config.groups).length} 个已配置企业微信群。`);
+        console.log(`[wecom] Agent ${agentId} 收到${event.chatType === "single" ? "单聊" : "群内 @"}消息，处理状态: ${status}`);
+      }));
+      for (const { agentId, view } of hosts) {
+        console.log(`[bot] Agent ${agentId} 已连接，监听 ${Object.keys(view.groups).length} 个已配置群`);
+      }
+      console.log(`ThreadFerry 已启动，${hosts.length} 个 Agent 各自一条企业微信机器人连接。`);
 
+      const hostForGroup = (groupId: string) => {
+        const agentId = config.groups[groupId]?.agent;
+        return agentId ? hosts.find((host) => host.agentId === agentId) : undefined;
+      };
       const recovery = (async () => {
-        const deliveries = await state.pendingDeliveries();
-        for (const delivery of deliveries) {
-          if (!config.groups[delivery.groupId]) {
+        for (const delivery of await state.pendingDeliveries()) {
+          // 必须用该群所属 Agent 的机器人补发；用别的机器人会从错误身份发出去。
+          const host = hostForGroup(delivery.groupId);
+          if (!host) {
             await state.completeDelivery(delivery.id);
-            console.error("[state] 已丢弃未配置群的待发送回复");
+            console.error("[state] 已丢弃未配置群或所属 Agent 未启动的待发送回复");
             continue;
           }
           try {
-            await sendWecomReply(delivery.groupId, delivery.content);
+            await sendWecomReply(delivery.groupId, delivery.content, host.runner);
             await state.completeDelivery(delivery.id);
-            console.log("[state] 已补发 1 条上次未投递的回复");
+            console.log(`[state] Agent ${host.agentId} 已补发 1 条上次未投递的回复`);
           } catch {
             const errorId = newErrorId();
             await state.deliveryFailed(delivery.id, errorId).catch(() => undefined);
@@ -625,10 +943,15 @@ async function start(configPath: string, mock: boolean, port: number): Promise<s
         const pending = await state.recoverPending();
         if (pending.length > 0) console.log(`[state] 正在恢复 ${pending.length} 个上次中断的任务`);
         await Promise.all(pending.map(async (message) => {
-          const result = await app.replay(message, async (content, finish = true) => {
-            if (finish) await sendWecomReply(message.groupId, content);
+          const host = hostForGroup(message.groupId);
+          if (!host) {
+            console.error("[state] 跳过恢复：该群未配置或所属 Agent 未启动");
+            return;
+          }
+          const result = await host.app.replay(message, async (content, finish = true) => {
+            if (finish) await sendWecomReply(message.groupId, content, host.runner);
           });
-          console.log(`[state] 恢复任务处理状态: ${result}`);
+          console.log(`[state] Agent ${host.agentId} 恢复任务处理状态: ${result}`);
         }));
       })().catch(() => {
         const errorId = newErrorId();
@@ -643,9 +966,9 @@ async function start(configPath: string, mock: boolean, port: number): Promise<s
           if (stopping) return;
           stopping = true;
           clearInterval(updateTimer);
-          client.disconnect();
+          for (const client of clients) client.disconnect();
           void admin.close();
-          void Promise.all([app.shutdown(cancel), recovery, updateCheck]).finally(done);
+          void Promise.all([...hosts.map(({ app }) => app.shutdown(cancel)), recovery, updateCheck]).finally(done);
         };
         updateTimer = setInterval(() => {
           if (stopping || updateCheck) return;
@@ -681,7 +1004,7 @@ async function main(): Promise<void> {
     return;
   }
   if (command === "onboard") {
-    await onboard(option(args, "--config"));
+    await onboard(option(args, "--config"), pairTimeoutMs(option(args, "--timeout")));
     return;
   }
   if (command === "doctor") {
@@ -704,15 +1027,14 @@ async function main(): Promise<void> {
     return;
   }
   if (command === "setup") {
-    const workspace = option(args, "--workspace");
-    if (!workspace) throw new Error("threadferry setup 必须提供 --workspace <absolute-path>");
-    await setup(
-      option(args, "--config") ?? defaultConfigPath(),
-      workspace,
-      option(args, "--agent") ?? "default",
-      runtimeName(option(args, "--runtime")),
-      option(args, "--model"),
-    );
+    const runtimeInput = option(args, "--runtime");
+    await setup(option(args, "--config") ?? defaultConfigPath(), {
+      agentId: option(args, "--agent") ?? "default",
+      workspace: option(args, "--workspace"),
+      runtime: runtimeInput === undefined ? undefined : runtimeName(runtimeInput),
+      model: option(args, "--model"),
+      timeoutMs: pairTimeoutMs(option(args, "--timeout")),
+    });
     return;
   }
   if (command === "agent") {
@@ -720,12 +1042,25 @@ async function main(): Promise<void> {
     const configPath = resolve(option(args, "--config") ?? defaultConfigPath());
     const config = await loadConfig(configPath);
     if (action === "list") {
+      const pending: string[] = [];
       for (const [id, agent] of Object.entries(config.agents)) {
-        console.log(`${id}\t${agent.runtime}\t${agent.model ?? "default"}\t${agent.workspace}`);
+        const status = await botStatus(id, agent.configDir);
+        console.log(`${id}\t${agent.runtime}\t${agent.model ?? "default"}\t${agent.workspace}\t${status.botId ?? "未授权"}`);
+        if (!status.authorized) pending.push(id);
       }
+      // 未授权的 Agent 不会启动入站，这里直接给出可执行的下一步。
+      for (const id of pending) console.log(`\n${authorizeHint(id, config.agents[id]?.configDir)}`);
       return;
     }
-    if (action !== "add") throw new Error("threadferry agent 仅支持 add 或 list");
+    if (action === "login") {
+      // args[1] 可能是紧跟的选项（threadferry agent login --config x），不能当成 Agent 名。
+      const name = args[1]?.startsWith("-") ? undefined : args[1];
+      if (!name) throw new Error("threadferry agent login 必须提供 Agent 名");
+      if (!config.agents[name]) throw new Error(`Agent ${name} 未配置；先运行 threadferry agent add`);
+      await loginAgentBot(name, config.agents[name]?.configDir);
+      return;
+    }
+    if (action !== "add") throw new Error("threadferry agent 仅支持 add、list 或 login");
     const name = option(args, "--name");
     const workspaceInput = option(args, "--workspace");
     if (!name || !workspaceInput) throw new Error("threadferry agent add 必须提供 --name 和 --workspace");
@@ -742,12 +1077,30 @@ async function main(): Promise<void> {
   if (command === "start") {
     const configPath = option(args, "--config") ?? defaultConfigPath();
     const mock = args.includes("--mock");
+    // 完全没初始化时，start 不该报错让用户自己去猜下一步——直接转入引导。
+    if (!existsSync(resolve(configPath))) {
+      if (!process.stdin.isTTY || !process.stdout.isTTY) {
+        throw new Error(
+          `配置不存在: ${resolve(configPath)}\n`
+          + "ThreadFerry 还没有初始化。请先在交互式终端运行 threadferry onboard 完成引导配置。",
+        );
+      }
+      console.log(`未找到配置 ${resolve(configPath)}，ThreadFerry 还没有初始化。`);
+      console.log("转入引导配置（完成后可以直接启动）。\n");
+      await onboard(option(args, "--config"));
+      return;
+    }
     const binary = mock ? undefined : await autoUpdate();
     if (binary) {
       await runUpdated(binary, [command, ...args]);
       return;
     }
-    const restartBinary = await start(configPath, mock, adminPort(option(args, "--admin-port")));
+    const restartBinary = await start(
+      configPath,
+      mock,
+      adminPort(option(args, "--admin-port")),
+      selectedAgents(option(args, "--agents")),
+    );
     if (restartBinary) await runUpdated(restartBinary, [command, ...args]);
     return;
   }

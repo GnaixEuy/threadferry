@@ -1,11 +1,11 @@
 import assert from "node:assert/strict";
-import { mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { createApp } from "../src/app.js";
 import { listWecomGroups, searchWecomUsers, sendWecomReply } from "../src/channels/wecom.js";
-import { loadConfig, onboardingDefaults, pairConfig, resolveWorkspace, saveConfig, setupConfig } from "../src/config.js";
+import { agentView, loadConfig, onboardingDefaults, pairConfig, refreshAgentView, resolveWorkspace, saveConfig, setupConfig } from "../src/config.js";
 import { fetchWecomHistory } from "../src/history/wecom-cli.js";
 import { CommandExecutionError, runCommand } from "../src/process.js";
 import { runCodex } from "../src/runtimes/codex.js";
@@ -16,9 +16,9 @@ import type { CommandRunner, GroupMessage, IncomingMention, ThreadFerryConfig } 
 
 function testConfig(workspace = "/workspace", ownerUser = "user", groupId = "group"): ThreadFerryConfig {
   return {
-    version: 5,
+    version: 6,
     ownerUser,
-    agents: { default: { workspace, runtime: "codex" } },
+    agents: { default: { workspace, runtime: "codex", ownerUser } },
     groups: { [groupId]: { agent: "default", allowUsers: [ownerUser], context: { lookbackHours: 6, maxMessages: 80 } } },
     security: { requireMention: true, readOnly: true },
   };
@@ -97,10 +97,9 @@ test("mock WeCom -> history -> context -> Codex -> reply vertical slice", async 
 
 test("robot owner manages per-group users in direct chat", async () => {
   const config = testConfig("/workspace", "owner");
-  config.agents.reviewer = { workspace: "/review-workspace", runtime: "pi", model: "provider/reviewer" };
+  config.agents.reviewer = { workspace: "/review-workspace", runtime: "pi", model: "provider/reviewer", ownerUser: "owner" };
   const persisted: Array<{ groupId: string; users: string[] }> = [];
-  const persistedAgents: Array<{ groupId: string; agentId: string }> = [];
-  const boundGroups: Array<{ groupId: string; agentId: string }> = [];
+  const boundGroups: string[] = [];
   const runtimeAgents: string[] = [];
   const runtimeSessions: Array<string | undefined> = [];
   const runtimePrompts: string[] = [];
@@ -116,8 +115,7 @@ test("robot owner manages per-group users in direct chat", async () => {
       return { text: "分析结果", sessionId: `${request.agentId}-session` };
     },
     updateAllowUsers: async (groupId, users) => { persisted.push({ groupId, users: [...users] }); },
-    updateGroupAgent: async (groupId, agentId) => { persistedAgents.push({ groupId, agentId }); },
-    bindGroup: async (groupId, agentId) => { boundGroups.push({ groupId, agentId }); },
+    bindGroup: async (groupId) => { boundGroups.push(groupId); },
     listGroups: async () => [
       { id: "group", name: "AI Coding" },
       { id: "group-unconfigured", name: "未配置群" },
@@ -154,24 +152,34 @@ test("robot owner manages per-group users in direct chat", async () => {
   }, async (content) => { replies.push(content); });
 
   assert.equal(await direct("owner", "threadferry help"), "command");
-  assert.match(replies.at(-1) ?? "", /接入群聊.*数据访问权限.*threadferry groups.*threadferry agents.*threadferry bind/s);
+  assert.match(replies.at(-1) ?? "", /接入群聊.*数据访问权限.*threadferry groups.*threadferry bind/s);
+  // 1:1 之后 help 不再提 Agent 参数，也不再有 use 命令。
+  assert.doesNotMatch(replies.at(-1) ?? "", /threadferry use </);
+  assert.doesNotMatch(replies.at(-1) ?? "", /bind <群名或ID> <Agent名>/);
   assert.equal(await direct("new-user", "threadferry groups"), "command");
   assert.match(replies.at(-1) ?? "", /只有.*Owner/);
-  assert.equal(await direct("new-user", "threadferry use AI Coding reviewer"), "command");
-  assert.equal(persistedAgents.length, 0);
   assert.equal(await direct("owner", "threadferry groups"), "command");
   assert.match(replies.at(-1) ?? "", /AI Coding/);
   assert.match(replies.at(-1) ?? "", /\[default\].*\[未配置 Agent\]/s);
   assert.equal(await direct("owner", "threadferry agents"), "command");
   assert.match(replies.at(-1) ?? "", /reviewer.*pi.*provider\/reviewer/s);
-  assert.equal(await direct("owner", "threadferry bind 未配置群 reviewer"), "command");
-  assert.deepEqual(boundGroups, [{ groupId: "group-unconfigured", agentId: "reviewer" }]);
-  assert.equal(config.groups["group-unconfigured"]?.agent, "reviewer");
-  assert.equal(searchCalls, 0);
+  // bind 不接受 Agent 参数：绑定到「正在对话的这个 Agent」。
+  assert.equal(await direct("owner", "threadferry bind 未配置群"), "command");
+  assert.deepEqual(boundGroups, ["group-unconfigured"]);
+  assert.equal(config.groups["group-unconfigured"]?.agent, "default");
+  assert.match(replies.at(-1) ?? "", /已绑定到我/);
+  // 已绑定的群不能重复绑定。
+  assert.equal(await direct("owner", "threadferry bind 未配置群"), "command");
+  assert.match(replies.at(-1) ?? "", /已经配置/);
+  // 机器人看不见的群要说清楚，而不是含糊报错。
+  assert.equal(await direct("owner", "threadferry bind 不存在的群"), "command");
+  assert.match(replies.at(-1) ?? "", /我看不到群/);
+  // 非 Owner 的私聊被拒绝时，回调 userid 会映射到目录 ID 以判断是否 Owner（缓存后不再搜索）。
+  assert.equal(searchCalls, 1);
   assert.equal(await group("owner", "@机器人 先用默认 Agent 分析"), "handled");
   assert.equal(runtimeAgents[0], "default:codex:/workspace");
-  assert.equal(await direct("owner", "threadferry use AI Coding reviewer"), "command");
-  assert.deepEqual(persistedAgents, [{ groupId: "group", agentId: "reviewer" }]);
+  // 群改绑到别的 Agent 现在只能通过配置/管理台完成（1:1 后私聊没有 use 命令）。
+  config.groups.group!.agent = "reviewer";
   assert.equal(await direct("owner", "threadferry invite AI Coding"), "command");
   const code = replies.at(-1)?.match(/邀请码：`([A-F0-9]{12})`/)?.[1];
   assert.ok(code);
@@ -219,6 +227,60 @@ test("robot owner manages per-group users in direct chat", async () => {
   assert.equal(await direct("owner", "threadferry groups", "duplicate-direct"), "command");
   assert.equal(await direct("owner", "threadferry groups", "duplicate-direct"), "duplicate");
   assert.equal(runtimeCalls, 5);
+});
+
+test("owner is recognized when the callback uses a different userid namespace than the config", async () => {
+  const config = testConfig("/workspace", "wow-owner-directory-id");
+  let runtimeCalls = 0;
+  const app = createApp(config, {
+    history: async () => [],
+    runtime: async () => { runtimeCalls += 1; return { text: "分析结果", sessionId: "s" }; },
+    searchUsers: async (keywords) => keywords
+      .filter((keyword) => keyword === "SuYueXiang" || keyword === "wow-owner-directory-id")
+      .map((keyword) => ({ id: "wow-owner-directory-id", name: "苏粤翔", matchedKeywords: [keyword] })),
+  });
+  const replies: string[] = [];
+  const send = (msgId: string, senderId: string, text: string) => app.handleDirect({
+    msgId, senderId, time: new Date(), text,
+  }, async (content) => { replies.push(content); });
+
+  // 回调给明文 userid（SuYueXiang），配置存的是目录 ID（wow-...），映射后应识别为 Owner。
+  assert.equal(await send("m1", "SuYueXiang", "帮我分析一下"), "handled");
+  assert.equal(runtimeCalls, 1);
+  assert.equal(replies[0], "ThreadFerry 已收到，正在分析。");
+  // whoami 展示统一为目录 ID，和配置/管理台一致，不再一会儿拼音一会儿官方 ID。
+  assert.equal(await send("m2", "SuYueXiang", "threadferry whoami"), "command");
+  assert.match(replies.at(-1) ?? "", /wow-owner-directory-id/);
+  // 非 Owner 的明文回调 ID 映射后仍被拒绝。
+  assert.equal(await send("m3", "OtherUser", "threadferry groups"), "command");
+  assert.match(replies.at(-1) ?? "", /只有.*Owner/);
+});
+
+test("a non-owner direct message explains the fix without leaking the configured owner", async () => {
+  const config = testConfig("/workspace", "owner-from-old-corp");
+  const app = createApp(config, { history: async () => [], runtime: async () => ({ text: "不应执行" }) });
+  const replies: string[] = [];
+  const send = (text: string, msgId: string) => app.handleDirect({
+    msgId, senderId: "owner-from-new-corp", time: new Date(), text,
+  }, async (content) => { replies.push(content); });
+
+  assert.equal(await send("你好", "chat"), "command");
+  assert.equal(await send("threadferry groups", "manage"), "command");
+  for (const reply of replies) {
+    assert.match(reply, /ThreadFerry Owner/);
+    // 告诉对方自己的 userid（与公开的 whoami 一致）和恢复办法。
+    assert.match(reply, /owner-from-new-corp/);
+    assert.match(reply, /threadferry setup/);
+    assert.match(reply, /更换了企业/);
+    // 但绝不回显配置里的 Owner。
+    assert.doesNotMatch(reply, /owner-from-old-corp/);
+  }
+  assert.match(replies[0] ?? "", /私聊 Agent/);
+  assert.match(replies[1] ?? "", /管理群权限/);
+
+  // whoami 仍对任何人开放，是使用者自助拿到新 userid 的入口。
+  assert.equal(await send("threadferry whoami", "who"), "command");
+  assert.match(replies.at(-1) ?? "", /owner-from-new-corp/);
 });
 
 test("owner toggles all-member access in direct chat", async () => {
@@ -314,7 +376,7 @@ test("workspace paths cannot be relative or escape through a symlink", async (t)
   await assert.rejects(resolveWorkspace(link), /符号链接/);
 
   const configPath = join(root, "bad.yaml");
-  await writeFile(configPath, `version: 5\nowner_user: user\nagents:\n  default:\n    runtime: codex\n    workspace: ../outside\ngroups:\n  group:\n    agent: default\n    allow_users: [user]\n`);
+  await writeFile(configPath, `version: 6\nagents:\n  default:\n    runtime: codex\n    workspace: ../outside\n    owner_user: user\n    groups:\n      group:\n        allow_users: [user]\n`);
   await assert.rejects(loadConfig(configPath), /绝对路径/);
 
   const compactPath = join(root, "compact.yaml");
@@ -355,7 +417,7 @@ test("workspace paths cannot be relative or escape through a symlink", async (t)
   assert.equal((await loadConfig(compactPath)).groups.group?.allowAll, undefined);
 });
 
-test("agent names support Chinese and spaces while onboarding uses the invocation directory", () => {
+test("agent names must be directory-safe while onboarding uses the invocation directory", () => {
   const current = testConfig("/saved/workspace");
   const defaults = onboardingDefaults(current, "/current/invocation");
 
@@ -365,18 +427,132 @@ test("agent names support Chinese and spaces while onboarding uses the invocatio
     workspace: "/current/invocation",
     model: undefined,
   });
+  assert.doesNotThrow(() => setupConfig("group", "code-review_2", {
+    workspace: "/current/invocation",
+    runtime: "codex",
+  }, "user"));
+  // 中文和空格是合法目录名，v5 起支持；路径分隔符、`.`/`..`、开头结尾空格和超长才拒绝。
   assert.doesNotThrow(() => setupConfig("group", "代码审查 Agent", {
     workspace: "/current/invocation",
     runtime: "codex",
   }, "user"));
-  assert.throws(() => setupConfig("group", " Agent", {
-    workspace: "/current/invocation",
-    runtime: "codex",
-  }, "user"), /Agent 名/);
-  assert.throws(() => setupConfig("group", "超".repeat(65), {
-    workspace: "/current/invocation",
-    runtime: "codex",
-  }, "user"), /1-64/);
+  for (const bad of [" Agent", "a/b", "../escape", ".", "..", "超".repeat(129)]) {
+    assert.throws(() => setupConfig("group", bad, {
+      workspace: "/current/invocation",
+      runtime: "codex",
+    }, "user"), /Agent 名/);
+  }
+});
+
+test("the v6 disk format round-trips agents, their groups and credential overrides", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "threadferry-v6-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const workspace = await realpath(root);
+  const source = join(root, "source.yaml");
+  await writeFile(source, [
+    "version: 6",
+    "agents:",
+    "  default:",
+    "    runtime: codex",
+    `    workspace: ${JSON.stringify(workspace)}`,
+    "    owner_user: woOWNER",
+    "    groups:",
+    "      g1:",
+    "        allow_users: [woOWNER, woTEAM]",
+    "  reviewer:",
+    "    runtime: pi",
+    `    workspace: ${JSON.stringify(workspace)}`,
+    "    model: provider/model",
+    "    owner_user: woOWNER",
+    "    groups:",
+    "      g2:",
+    "        allow_users: [woOWNER]",
+    "        allow_all: true",
+    "",
+  ].join("\n"));
+
+  const fromV5 = await loadConfig(source);
+  const upgraded = join(root, "written.yaml");
+  await saveConfig(upgraded, fromV5);
+  const text = await readFile(upgraded, "utf8");
+  assert.match(text, /^version: 6$/m);
+  assert.doesNotMatch(text, /^owner_user:/m);
+  assert.doesNotMatch(text, /^groups:/m);
+  assert.match(text, /default:[\s\S]*owner_user: woOWNER[\s\S]*groups:[\s\S]*g1:/);
+  assert.match(text, /reviewer:[\s\S]*model: provider\/model[\s\S]*g2:[\s\S]*allow_all: true/);
+
+  // 再读回来语义必须完全一致。
+  const fromV6 = await loadConfig(upgraded);
+  assert.deepEqual(fromV6, fromV5);
+  assert.equal(fromV6.version, 6);
+  assert.equal(fromV6.ownerUser, "woOWNER");
+  assert.equal(fromV6.groups.g1?.agent, "default");
+  assert.equal(fromV6.groups.g2?.agent, "reviewer");
+  assert.equal(fromV6.groups.g2?.allowAll, true);
+  assert.equal(fromV6.agents.reviewer?.model, "provider/model");
+
+  // config_dir 往返保留。
+  fromV6.agents.reviewer!.configDir = join(workspace, "creds");
+  await saveConfig(upgraded, fromV6);
+  assert.match(await readFile(upgraded, "utf8"), /config_dir: /);
+  assert.equal((await loadConfig(upgraded)).agents.reviewer?.configDir, join(workspace, "creds"));
+});
+
+test("v6 configuration rejects shapes the runtime cannot honour", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "threadferry-v6-invalid-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const workspace = await realpath(root);
+  const agent = (id: string, body: string[]) => [`  ${id}:`, "    runtime: codex", `    workspace: ${JSON.stringify(workspace)}`, ...body];
+  const write = async (name: string, lines: string[]) => {
+    const target = join(root, name);
+    await writeFile(target, ["version: 6", "agents:", ...lines, ""].join("\n"));
+    return target;
+  };
+
+  // 同一个群挂在两个 Agent 下：摊平时会静默丢掉一个，必须拒绝。
+  const duplicated = await write("duplicate.yaml", [
+    ...agent("a", ["    owner_user: woOWNER", "    groups:", "      shared:", "        allow_users: [woOWNER]"]),
+    ...agent("b", ["    owner_user: woOWNER", "    groups:", "      shared:", "        allow_users: [woOWNER]"]),
+  ]);
+  await assert.rejects(loadConfig(duplicated), /只能归属一个 Agent/);
+
+  // 每个 Agent 独立 Owner 是本改造的目标能力（跨企业时同一个人 userid 不同）。
+  const perAgentOwners = await write("per-agent-owner.yaml", [
+    ...agent("a", ["    owner_user: woOWNER"]),
+    ...agent("b", ["    owner_user: woOTHER"]),
+  ]);
+  const loaded = await loadConfig(perAgentOwners);
+  assert.equal(loaded.agents.a?.ownerUser, "woOWNER");
+  assert.equal(loaded.agents.b?.ownerUser, "woOTHER");
+
+  const noOwner = await write("no-owner.yaml", agent("a", []));
+  await assert.rejects(loadConfig(noOwner), /缺少有效的 owner_user/);
+  const badOwner = await write("bad-owner.yaml", agent("a", ["    owner_user: \"has space\""]));
+  await assert.rejects(loadConfig(badOwner), /缺少有效的 owner_user/);
+
+  // 群的授权名单必须包含**所属 Agent 自己**的 Owner，不是别的 Agent 的。
+  const wrongOwnerInGroup = await write("wrong-owner.yaml", [
+    ...agent("a", ["    owner_user: woA", "    groups:", "      g1:", "        allow_users: [woB]"]),
+    ...agent("b", ["    owner_user: woB"]),
+  ]);
+  await assert.rejects(loadConfig(wrongOwnerInGroup), /必须包含所属 Agent 的 owner_user/);
+
+  const relativeDir = await write("relative.yaml", agent("a", ["    owner_user: woOWNER", "    config_dir: relative/dir"]));
+  await assert.rejects(loadConfig(relativeDir), /config_dir 必须是绝对路径/);
+
+  const strayRoot = await write("stray.yaml", [...agent("a", ["    owner_user: woOWNER"]), "owner_user: woOWNER"]);
+  await assert.rejects(loadConfig(strayRoot), /不支持字段: owner_user/);
+
+  const strayGroupKey = await write("stray-group.yaml", [
+    ...agent("a", ["    owner_user: woOWNER", "    groups:", "      g1:", "        allow_users: [woOWNER]", "        agent: a"]),
+  ]);
+  await assert.rejects(loadConfig(strayGroupKey), /不支持字段: agent/);
+
+  // 群的授权名单仍然必须包含 Owner。
+  const ownerMissing = await write("owner-missing.yaml", [
+    ...agent("a", ["    owner_user: woOWNER", "    groups:", "      g1:", "        allow_users: [woTEAM]"]),
+  ]);
+  await assert.rejects(loadConfig(ownerMissing), /必须包含所属 Agent 的 owner_user/);
 });
 
 test("legacy and extra configuration fields are rejected", async (t) => {
@@ -384,14 +560,14 @@ test("legacy and extra configuration fields are rejected", async (t) => {
   t.after(() => rm(root, { recursive: true, force: true }));
   const legacyPath = join(root, "legacy.yaml");
   await writeFile(legacyPath, "version: 1\nchannels: {}\n");
-  await assert.rejects(loadConfig(legacyPath), /旧版配置不再兼容/);
+  await assert.rejects(loadConfig(legacyPath), /version 必须为 6/);
 
   const extraPath = join(root, "extra.yaml");
-  await writeFile(extraPath, `version: 5\nowner_user: user\nagents:\n  default:\n    runtime: codex\n    workspace: ${JSON.stringify(await realpath(root))}\ngroups:\n  group:\n    agent: default\n    allow_users: [user]\n    runtime: codex\n`);
+  await writeFile(extraPath, `version: 6\nagents:\n  default:\n    runtime: codex\n    workspace: ${JSON.stringify(await realpath(root))}\n    owner_user: user\n    groups:\n      group:\n        allow_users: [user]\n        runtime: codex\n`);
   await assert.rejects(loadConfig(extraPath), /不支持字段: runtime/);
 
   const badAccessPath = join(root, "bad-access.yaml");
-  await writeFile(badAccessPath, `version: 5\nowner_user: user\nagents:\n  default:\n    runtime: codex\n    workspace: ${JSON.stringify(await realpath(root))}\ngroups:\n  group:\n    agent: default\n    allow_users: [user]\n    allow_all: 1\n`);
+  await writeFile(badAccessPath, `version: 6\nagents:\n  default:\n    runtime: codex\n    workspace: ${JSON.stringify(await realpath(root))}\n    owner_user: user\n    groups:\n      group:\n        allow_users: [user]\n        allow_all: 1\n`);
   await assert.rejects(loadConfig(badAccessPath), /allow_all 必须是布尔值/);
 });
 
@@ -468,7 +644,9 @@ test("runtime failures return and persist a redacted error id", async () => {
 
   assert.equal(result, "failed");
   assert.match(replies.at(-1) ?? "", /错误编号 TF-[A-F0-9]{8}/);
-  assert.doesNotMatch(replies.join("\n"), /secret detail/);
+  // 产品决策变更（2026-08-19）：失败原因直接回给用户。只给错误编号让人再去跑
+  // threadferry status 实测毫无帮助——原因本来就来自 Runtime CLI 的固定文案。
+  assert.match(replies.at(-1) ?? "", /原因：.*secret detail must not escape/);
   assert.equal(errors[0]?.phase, "runtime");
   assert.equal(errors[0]?.reason, "secret detail must not escape");
   assert.equal((await state.snapshot()).turns[0]?.errorId, errors[0]?.errorId);
@@ -494,7 +672,9 @@ test("a history failure reports its cause to the operator but never to the group
   assert.equal(errors[0]?.phase, "history");
   assert.match(errors[0]?.reason ?? "", /errcode 853006/);
   assert.match(replies.at(-1) ?? "", /错误编号 TF-[A-F0-9]{8}/);
-  assert.doesNotMatch(replies.join("\n"), /853006/);
+  // 853006 这种「企业未开通某能力」正是最该让群里看到的原因。
+  assert.match(replies.at(-1) ?? "", /原因：.*errcode 853006/);
+  // 但本地状态库仍然只存 errorId + phase，不落原因。
   assert.doesNotMatch(JSON.stringify(await state.snapshot()), /853006/);
 });
 
@@ -755,4 +935,148 @@ test("command runner aborts the child process", async () => {
   });
   setTimeout(() => controller.abort(), 20);
   await assert.rejects(running, (error: unknown) => error instanceof Error && error.name === "AbortError");
+});
+
+test("per-agent config views isolate groups, owners and runtime scope", async () => {
+  const config: ThreadFerryConfig = {
+    version: 6,
+    ownerUser: "owner-a",
+    agents: {
+      frontend: { workspace: "/ws-a", runtime: "codex", ownerUser: "owner-a" },
+      backend: { workspace: "/ws-b", runtime: "pi", ownerUser: "owner-b" },
+    },
+    groups: {
+      "group-a": { agent: "frontend", allowUsers: ["owner-a"], context: { lookbackHours: 6, maxMessages: 80 } },
+      "group-b": { agent: "backend", allowUsers: ["owner-b"], context: { lookbackHours: 6, maxMessages: 80 } },
+    },
+    security: { requireMention: true, readOnly: true },
+  };
+
+  const front = agentView(config, "frontend");
+  const back = agentView(config, "backend");
+  assert.deepEqual(Object.keys(front.agents), ["frontend"]);
+  assert.deepEqual(Object.keys(front.groups), ["group-a"]);
+  assert.equal(front.ownerUser, "owner-a");
+  assert.deepEqual(Object.keys(back.groups), ["group-b"]);
+  assert.equal(back.ownerUser, "owner-b");
+  assert.throws(() => agentView(config, "missing"), /Agent missing 未配置/);
+
+  // 每个视图起一个 app：私聊必定落到该视图唯一的 Agent 上，跨 Agent 的群一律拒绝。
+  const runtimeCalls: Array<{ agentId: string; workspace: string }> = [];
+  const makeApp = (view: ThreadFerryConfig) => createApp(view, {
+    history: async () => [],
+    runtime: async ({ agentId, workspace }) => {
+      runtimeCalls.push({ agentId, workspace });
+      return { text: "ok" };
+    },
+  });
+  const frontApp = makeApp(front);
+  const backApp = makeApp(back);
+
+  // frontend 的机器人收到 group-b 的消息 → 不是自己的群。
+  const mention = (groupId: string, senderId: string, msgId: string) => ({
+    msgId, groupId, senderId, time: new Date(), text: "@机器人 分析", mentioned: true,
+  });
+  assert.equal(await frontApp.handle(mention("group-b", "owner-b", "x1"), async () => undefined), "unauthorized_group");
+  assert.equal(await backApp.handle(mention("group-a", "owner-a", "x2"), async () => undefined), "unauthorized_group");
+  assert.equal(await frontApp.handle(mention("group-a", "owner-a", "x3"), async () => undefined), "handled");
+  assert.equal(await backApp.handle(mention("group-b", "owner-b", "x4"), async () => undefined), "handled");
+
+  // Owner 也按 Agent 隔离：A 的 Owner 不能私聊 B 的 Agent。
+  const direct = (app: ReturnType<typeof createApp>, senderId: string, msgId: string) => {
+    const replies: string[] = [];
+    return app.handleDirect({ msgId, senderId, time: new Date(), text: "分析一下" }, async (content) => {
+      replies.push(content);
+    }).then((status) => ({ status, replies }));
+  };
+  const crossOwner = await direct(backApp, "owner-a", "d1");
+  assert.equal(crossOwner.status, "command");
+  assert.match(crossOwner.replies[0] ?? "", /只有机器人创建者/);
+  assert.equal((await direct(backApp, "owner-b", "d2")).status, "handled");
+
+  // 私聊必定用该视图自己的 Workspace，不会取到别的 Agent。
+  assert.deepEqual(runtimeCalls.filter((call) => call.agentId === "backend").map((call) => call.workspace), ["/ws-b", "/ws-b"]);
+  assert.deepEqual(runtimeCalls.filter((call) => call.agentId === "frontend").map((call) => call.workspace), ["/ws-a"]);
+});
+
+test("refreshing a view propagates config changes and disables a removed agent", () => {
+  const config: ThreadFerryConfig = {
+    version: 6,
+    ownerUser: "owner-a",
+    agents: { frontend: { workspace: "/ws-a", runtime: "codex", ownerUser: "owner-a" } },
+    groups: { "group-a": { agent: "frontend", allowUsers: ["owner-a"], context: { lookbackHours: 6, maxMessages: 80 } } },
+    security: { requireMention: true, readOnly: true },
+  };
+  const view = agentView(config, "frontend");
+
+  const updated: ThreadFerryConfig = {
+    ...config,
+    agents: { frontend: { workspace: "/ws-a", runtime: "codex", ownerUser: "owner-new" } },
+    groups: {
+      ...config.groups,
+      "group-c": { agent: "frontend", allowUsers: ["owner-new"], context: { lookbackHours: 6, maxMessages: 80 } },
+      "group-d": { agent: "other", allowUsers: ["x"], context: { lookbackHours: 6, maxMessages: 80 } },
+    },
+  };
+  refreshAgentView(view, updated, "frontend");
+  assert.equal(view.ownerUser, "owner-new");
+  assert.deepEqual(Object.keys(view.groups).sort(), ["group-a", "group-c"]);
+
+  // Agent 被删掉后视图清空，该 app 随即拒绝所有群消息。
+  refreshAgentView(view, { ...updated, agents: {} }, "frontend");
+  assert.deepEqual(view.agents, {});
+  assert.deepEqual(view.groups, {});
+});
+
+test("failure replies carry the reason, with local paths masked in group chats", async () => {
+  const config = testConfig("/workspace", "owner");
+  const quota = new Error("Codex：You've hit your usage limit. Visit https://example.test/usage");
+  const withPath = new Error("Workspace 不存在: /Users/somebody/Desktop/SecretProject/sub");
+  const build = (error: Error) => {
+    const replies: string[] = [];
+    const app = createApp(config, {
+      history: async () => [],
+      runtime: async () => { throw error; },
+    }, new ThreadFerryState());
+    return { app, replies, push: async (content: string) => { replies.push(content); } };
+  };
+
+  // 私聊对象只可能是 Owner，原因给全，不做任何遮掩。
+  const direct = build(withPath);
+  await direct.app.handleDirect({ msgId: "d1", senderId: "owner", time: new Date(), text: "分析" }, direct.push);
+  assert.match(direct.replies.at(-1) ?? "", /原因：Workspace 不存在: \/Users\/somebody\/Desktop\/SecretProject\/sub/);
+
+  // 群里有非 Owner 的同事，本机路径要遮掉，其余原因照给。
+  const group = build(withPath);
+  await group.app.handle({
+    msgId: "g1", groupId: "group", senderId: "owner", time: new Date(), text: "@bot 分析", mentioned: true,
+  }, group.push);
+  assert.match(group.replies.at(-1) ?? "", /原因：Workspace 不存在: <本机路径>/);
+  assert.doesNotMatch(group.replies.at(-1) ?? "", /SecretProject/);
+
+  // 额度耗尽这类外部限制，群里也应该看到完整原话（不含路径，无需遮掩）。
+  const limited = build(quota);
+  await limited.app.handle({
+    msgId: "g2", groupId: "group", senderId: "owner", time: new Date(), text: "@bot 分析", mentioned: true,
+  }, limited.push);
+  assert.match(limited.replies.at(-1) ?? "", /原因：Codex：You've hit your usage limit/);
+  assert.match(limited.replies.at(-1) ?? "", /https:\/\/example\.test\/usage/);
+});
+
+test("a direct-chat failure is persisted so threadferry status can find it", async () => {
+  const config = testConfig("/workspace", "owner");
+  const state = new ThreadFerryState();
+  const app = createApp(config, {
+    history: async () => [],
+    runtime: async () => { throw new Error("Codex：额度用完"); },
+  }, state);
+  assert.equal(await app.handleDirect({
+    msgId: "direct-fail", senderId: "owner", time: new Date(), text: "分析",
+  }, async () => undefined), "failed");
+
+  // 原先私聊失败只回复不落盘，回复里却叫用户去跑 threadferry status。
+  const turn = (await state.snapshot()).turns.at(-1);
+  assert.equal(turn?.status, "failed");
+  assert.equal(turn?.failurePhase, "runtime");
+  assert.match(turn?.errorId ?? "", /^TF-[A-F0-9]{8}$/);
 });

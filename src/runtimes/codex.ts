@@ -1,5 +1,6 @@
 import { resolveWorkspace } from "../config.js";
 import { CommandExecutionError, runCommand } from "../process.js";
+import { runtimeFailure, structuredRuntimeError } from "./runtime-error.js";
 import type { CommandRunner, RuntimeRequest, RuntimeResult } from "../types.js";
 
 function safeEnvironment(): NodeJS.ProcessEnv {
@@ -71,9 +72,13 @@ export async function runCodex(
   } catch (error) {
     const detail = error instanceof CommandExecutionError ? error.stderr : error instanceof Error ? error.message : "";
     const invalidSession = /(?:session|thread|rollout).{0,40}(?:not found|does not exist|invalid)|no (?:saved )?(?:session|thread|rollout)|failed to (?:load|resume)/i.test(detail);
-    if (!request.sessionId || request.signal?.aborted || !invalidSession) throw error;
+    if (!request.sessionId || request.signal?.aborted || !invalidSession) throw runtimeFailure("Codex", error);
     resumedSessionId = undefined;
-    ({ stdout } = await execute());
+    try {
+      ({ stdout } = await execute());
+    } catch (retryError) {
+      throw runtimeFailure("Codex", retryError);
+    }
   }
 
   let finalMessage: string | undefined;
@@ -90,6 +95,9 @@ export async function runCodex(
     const text = messageText(event.item);
     if (text) finalMessage = text;
   }
-  if (!finalMessage) throw new Error("Codex 未返回可解析的最终消息");
+  if (!finalMessage) {
+    const reported = structuredRuntimeError(stdout);
+    throw new Error(reported ? `Codex：${reported}` : "Codex 未返回可解析的最终消息");
+  }
   return { text: finalMessage, ...(sessionId ? { sessionId } : resumedSessionId ? { sessionId: resumedSessionId } : {}) };
 }

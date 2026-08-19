@@ -4,9 +4,9 @@ import { authorize } from "../src/authorization.js";
 import type { IncomingMention, ThreadFerryConfig } from "../src/types.js";
 
 const config: ThreadFerryConfig = {
-  version: 5,
+  version: 6,
   ownerUser: "user_allowed",
-  agents: { default: { workspace: process.cwd(), runtime: "codex" } },
+  agents: { default: { workspace: process.cwd(), runtime: "codex", ownerUser: "user_allowed" } },
   groups: {
     group_allowed: {
       agent: "default",

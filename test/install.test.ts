@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { createCipheriv, randomBytes } from "node:crypto";
 import {
   chmodSync,
   mkdtempSync,
   mkdirSync,
   readFileSync,
+  realpathSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -204,6 +206,162 @@ fi
   }
 });
 
+test("agent list reports each agent's bot authorization and guides the unauthorized ones", () => {
+  const root = mkdtempSync(join(tmpdir(), "threadferry-agent-list-"));
+  try {
+    const workspace = realpathSync(root);
+    const configPath = join(root, "threadferry.yaml");
+    writeFileSync(configPath, [
+      "version: 6",
+      "agents:",
+      "  default:",
+      "    runtime: codex",
+      `    workspace: ${JSON.stringify(workspace)}`,
+      "    owner_user: owner",
+      "  reviewer:",
+      "    runtime: pi",
+      `    workspace: ${JSON.stringify(workspace)}`,
+      "    owner_user: owner",
+      "",
+    ].join("\n"));
+
+    // HOME 指向临时目录，避免读到本机真实凭据导致结果随机器变化。
+    // 只给 default 造一份凭据，reviewer 保持未授权。
+    const home = join(root, "home");
+    const defaultDir = join(home, ".threadferry", "wecom", "default");
+    mkdirSync(defaultDir, { recursive: true });
+    const key = randomBytes(32);
+    const nonce = randomBytes(12);
+    const cipher = createCipheriv("aes-256-gcm", key, nonce);
+    const sealed = Buffer.concat([
+      cipher.update(Buffer.from(JSON.stringify({ bot: { id: "aib-default", secret: "s3cr3t" } }), "utf8")),
+      cipher.final(),
+    ]);
+    writeFileSync(join(defaultDir, ".encryption_key"), key.toString("base64"));
+    writeFileSync(join(defaultDir, "credentials.enc"), Buffer.concat([nonce, sealed, cipher.getAuthTag()]));
+
+    const environment: NodeJS.ProcessEnv = { ...process.env, HOME: home };
+    delete environment.WECOM_CLI_CONFIG_DIR;
+
+    const listed = spawnSync(process.execPath, [cli, "agent", "list", "--config", configPath], {
+      encoding: "utf8",
+      env: environment,
+    });
+    assert.equal(listed.status, 0, listed.stderr);
+    const rows = listed.stdout.split("\n").filter((line) => line.includes("\t"));
+    assert.equal(rows.length, 2);
+    assert.match(rows[0] ?? "", /^default\tcodex\tdefault\t.*\taib-default$/);
+    // reviewer 没有独立凭据目录，必须报未授权并给出可执行的下一步。
+    assert.match(rows[1] ?? "", /^reviewer\tpi\tdefault\t.*\t未授权$/);
+    assert.match(listed.stdout, /WECOM_CLI_CONFIG_DIR=.*wecom-cli auth init/s);
+    assert.match(listed.stdout, /threadferry agent login reviewer/);
+    // 已授权的 default 不该再出现引导文案。
+    assert.doesNotMatch(listed.stdout, /agent login default/);
+    // 授权状态里绝不能出现 Secret。
+    assert.doesNotMatch(listed.stdout, /s3cr3t/);
+
+    const unknown = spawnSync(process.execPath, [cli, "agent", "login", "nope", "--config", configPath], { encoding: "utf8" });
+    assert.equal(unknown.status, 1);
+    assert.match(unknown.stderr, /Agent nope 未配置/);
+
+    const missing = spawnSync(process.execPath, [cli, "agent", "login", "--config", configPath], { encoding: "utf8" });
+    assert.equal(missing.status, 1);
+    assert.match(missing.stderr, /必须提供 Agent 名/);
+
+    // 中文 Agent 名（含空格）是合法目录名，v5 起支持，配置可以正常加载并按未授权列出。
+    const chinesePath = join(root, "chinese.yaml");
+    writeFileSync(chinesePath, [
+      "version: 6",
+      "agents:",
+      "  代码审查:",
+      "    runtime: codex",
+      `    workspace: ${JSON.stringify(workspace)}`,
+      "    owner_user: owner",
+      "",
+    ].join("\n"));
+    const chinese = spawnSync(process.execPath, [cli, "agent", "list", "--config", chinesePath], {
+      encoding: "utf8",
+      env: environment,
+    });
+    assert.equal(chinese.status, 0, chinese.stderr);
+    assert.match(chinese.stdout, /^代码审查\tcodex/);
+    assert.match(chinese.stdout, /未授权/);
+
+    // 但路径穿越、路径分隔符和控制字符仍然被拒绝。
+    const badPath = join(root, "bad.yaml");
+    writeFileSync(badPath, [
+      "version: 6",
+      "agents:",
+      "  ../escape:",
+      "    runtime: codex",
+      `    workspace: ${JSON.stringify(workspace)}`,
+      "    owner_user: owner",
+      "",
+    ].join("\n"));
+    const badPathResult = spawnSync(process.execPath, [cli, "agent", "list", "--config", badPath], {
+      encoding: "utf8",
+      env: environment,
+    });
+    assert.equal(badPathResult.status, 1);
+    assert.match(badPathResult.stderr, /不能包含路径分隔符/);
+
+    const bad = spawnSync(process.execPath, [cli, "agent", "nope", "--config", configPath], { encoding: "utf8" });
+    assert.equal(bad.status, 1);
+    assert.match(bad.stderr, /仅支持 add、list 或 login/);
+  } finally {
+    rmSync(root, { force: true, recursive: true });
+  }
+});
+
+test("start reports which agents lack bot credentials instead of failing silently", () => {
+  const root = mkdtempSync(join(tmpdir(), "threadferry-start-agents-"));
+  try {
+    const workspace = realpathSync(root);
+    const configPath = join(root, "threadferry.yaml");
+    writeFileSync(configPath, [
+      "version: 6",
+      "agents:",
+      "  frontend:",
+      "    runtime: codex",
+      `    workspace: ${JSON.stringify(workspace)}`,
+      "    owner_user: owner-a",
+      "  backend:",
+      "    runtime: codex",
+      `    workspace: ${JSON.stringify(workspace)}`,
+      "    owner_user: owner-b",
+      "",
+    ].join("\n"));
+    // HOME 指向空目录：两个 Agent 都没有凭据，启动必须逐个报出来再失败。
+    const environment: NodeJS.ProcessEnv = { ...process.env, HOME: join(root, "home") };
+    delete environment.WECOM_CLI_CONFIG_DIR;
+    const run = (extra: string[]) => spawnSync(process.execPath, [cli, "start", "--config", configPath, ...extra], {
+      encoding: "utf8",
+      env: environment,
+    });
+
+    const all = run([]);
+    assert.equal(all.status, 1);
+    assert.match(all.stderr, /跳过 Agent frontend/);
+    assert.match(all.stderr, /跳过 Agent backend/);
+    assert.match(all.stderr, /threadferry agent login frontend/);
+    assert.match(all.stderr, /没有任何待启动的 Agent 拥有机器人凭据/);
+
+    // --agents 只启动被选中的，未选中的不该被提及。
+    const one = run(["--agents", "backend"]);
+    assert.equal(one.status, 1);
+    assert.match(one.stderr, /跳过 Agent backend/);
+    assert.doesNotMatch(one.stderr, /跳过 Agent frontend/);
+
+    // 选了不存在的 Agent 要直说，而不是报「没有凭据」。
+    const unknown = run(["--agents", "nope"]);
+    assert.equal(unknown.status, 1);
+    assert.match(unknown.stderr, /--agents 指定了未配置的 Agent: nope/);
+    assert.match(unknown.stderr, /已配置: frontend, backend/);
+  } finally {
+    rmSync(root, { force: true, recursive: true });
+  }
+});
+
 test("CLI exposes package version and rejects non-interactive onboarding", () => {
   const version = spawnSync(process.execPath, [cli, "--version"], { encoding: "utf8" });
   assert.equal(version.status, 0, version.stderr);
@@ -212,4 +370,24 @@ test("CLI exposes package version and rejects non-interactive onboarding", () =>
   const onboard = spawnSync(process.execPath, [cli, "onboard"], { encoding: "utf8" });
   assert.equal(onboard.status, 1);
   assert.match(onboard.stderr, /需要交互式终端/);
+});
+
+test("setup and onboard reject invalid timeout values before touching the terminal", () => {
+  for (const command of ["setup", "onboard"]) {
+    for (const value of ["abc", "0", "-5"]) {
+      const result = spawnSync(process.execPath, [cli, command, "--timeout", value], { encoding: "utf8" });
+      assert.equal(result.status, 1, `${command} --timeout ${value} should fail`);
+      assert.match(result.stderr, /--timeout 必须是大于 0 的秒数/);
+    }
+  }
+});
+
+test("setup requires an interactive terminal and help documents the optional workspace", () => {
+  const setup = spawnSync(process.execPath, [cli, "setup"], { encoding: "utf8" });
+  assert.equal(setup.status, 1);
+  assert.match(setup.stderr, /需要交互式终端/);
+
+  const help = spawnSync(process.execPath, [cli, "--help"], { encoding: "utf8" });
+  assert.equal(help.status, 0, help.stderr);
+  assert.match(help.stdout, /threadferry setup \[--workspace <absolute-path>\]/);
 });

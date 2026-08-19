@@ -1,20 +1,30 @@
-version: 5
+version: 6
 
-owner_user: "user_owner"
-
+# 一个 Agent 对应一个企业微信机器人，严格 1:1。
+# 每个 Agent 独立拥有自己的机器人凭据、Owner、群与授权名单、Workspace、Runtime 和 Session。
+#
+# Agent 名同时用作机器人凭据目录名，只允许 1-64 个字母、数字、下划线或连字符。
+# 机器人凭据不在这里：由 `threadferry agent login <名称>` 交给官方 wecom-cli
+# 加密保存在 ~/.threadferry/wecom/<Agent名>/，本文件绝不存 Bot Secret。
 agents:
   default:
     runtime: "codex"
     workspace: "/absolute/path/to/project"
+    # 该 Agent 机器人下 Owner 的回调 userid。换企业后同一个人的 userid 会变，所以按 Agent 存。
+    owner_user: "user_owner"
+    groups:
+      "group_xxx":
+        allow_users:
+          - "user_owner"
+        # 打开后该群所有成员都可以 @ 机器人使用，allow_users 在关闭后重新生效。
+        # allow_all: true
+
   reviewer:
     runtime: "pi"
     workspace: "/absolute/path/to/another-project"
     model: "provider/model"
-
-groups:
-  "group_xxx":
-    agent: "default"
-    allow_users:
-      - "user_owner"
-    # 打开后群内所有成员都可以 @ 机器人使用，allow_users 在关闭后重新生效。
-    # allow_all: true
+    # 可以是另一个企业的机器人，此时 owner_user 与上面不同。
+    owner_user: "user_owner_in_other_corp"
+    # 覆盖凭据目录（可选，必须是绝对路径）
+    # config_dir: "/absolute/path/to/credentials"
+    groups: {}

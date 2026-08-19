@@ -4,6 +4,165 @@ ThreadFerry 的每个 GitHub Release 都使用这里对应版本的内容，不�
 
 ## Unreleased
 
+## 0.16.0
+
+本次版本把 ThreadFerry 改成**一个 Agent 对应一个企业微信机器人（严格 1:1）**，多个 Agent 的
+连接并发跑在同一个进程里，彼此完全独立——各自的机器人凭据、Owner、群与授权名单、Workspace
+和 Session。想用哪个 Workspace，就和那个机器人聊。
+
+### 💥 破坏性变更（内部测试阶段，不提供兼容层）
+
+- **配置只接受 `version: 6`**，v5 配置不再自动升级。
+- **Agent 名支持中文和空格（最多 128 字符）**：agentId 同时是机器人凭据目录名，因此挡掉路径分隔符、
+  控制字符、`.`/`..` 和超长，但中文等常见字符不受限制（v5 即支持，恢复）。
+- **移除 `THREADFERRY_WECOM_BOT_ID` / `THREADFERRY_WECOM_BOT_SECRET` 环境变量**，
+  也移除启动时交互式输入 Bot ID / Secret 的流程。机器人凭据统一由
+  `threadferry agent login <name>` 交给 wecom-cli 加密保存。
+- **`default` Agent 不再复用 `~/.config/wecom`**：所有 Agent 统一使用
+  `~/.threadferry/wecom/<agentId>`，需要重新授权一次。
+
+**安全收益**：ThreadFerry 现在完全不经手 Bot Secret——不提示输入、不写入环境变量，
+只在建立连接时从 wecom-cli 的加密存储读取。`doctor` 也改为按 Agent 分别检查凭据与身份。
+
+### 主要变化
+
+- `threadferry start` 启动时亮明当前机器人、当前授权真人用户和配置里的 Owner。
+- 当前授权用户与配置 Owner 不一致时警告，并在本机终端询问是否更新（默认否）；非交互式启动只警告。
+- 私聊被拒的回复带上对方自己的 userid 和恢复办法，但不回显配置里的 Owner。
+- 新增 `src/identity.ts`：解析 `wecom-cli identity whoami` 的 `extra_identity_context`，容错降级。
+
+### 引导体验重做（onboard / setup）
+
+- **开场先讲清 1:1 心智模型**：一个 Agent 对应一个企业微信机器人，想加第二个 Workspace 就再加
+  一个 Agent + 一个机器人。
+- **扫码授权有预告**：进入 `wecom-cli auth init` 前先说明"接下来会打开浏览器扫码"，不再让用户
+  从表单里被突然丢进第三方流程。
+- **步骤计数修正**：`onboard` 从 4 步改为 5 步，把「扫码授权机器人」和「私聊配对 Owner」拆成
+  两个独立编号步骤。
+- **`onboard` 支持已有配置**：识别已有配置后给出「新增一个 Agent」/「重新配对已有 Agent 的
+  Owner」/「取消」三种选择，覆盖 1:1 架构下最常见的"再加一个机器人"需求。
+- **配对码提示完整**：说明去哪找机器人、必须用希望成为 Owner 的账号发送、发完要回终端确认。
+- **配对等待不再无限挂住**：默认 5 分钟超时（`--timeout <秒>` 可调），等待期间每 30 秒提示一次
+  剩余时间；配对码错误会**回复用户**而不只是写本机终端（回复不回显正确配对码）。
+- **`threadferry setup` 的 `--workspace` 改为可选**：已有配置且该 Agent 存在时，沿用其
+  Workspace/Runtime/Model；没有配置或 Agent 不存在时才要求提供。
+- **配对成功回复更新**：明确告诉用户「你现在私聊的这个机器人 = Agent X / Workspace Y」。
+- **授权后直接认领 Owner**：扫码授权机器人的人就是创建者，`wecom-cli identity whoami` 直接读取其身份，
+  终端一键确认（默认同意）即设为本 Agent 的 Owner，不再需要手机配对；想指定别人当 Owner 时才走手机配对。
+- **Agent 名自动取自机器人名**：onboard 先扫码授权机器人，再从机器人配置读取名字直接用作 Agent 名，
+  用户不再手敲，杜绝名字与机器人对不上的混乱；撞名自动追加序号，机器人名不合法才兜底询问。
+- **Owner 私聊授权适配双 userid 体系**：企业微信存在两套 ID——事件回调用明文 corp userid（如
+  `SuYueXiang`），目录/identity 用加密 userid（如 `wowBknbg...`）。此前配置存的是目录 ID 而私聊检查
+  直接比回调 ID，导致创建者本人私聊被当成陌生人拒绝。现在私聊授权、`whoami`、邀请码授权都会先做
+  回调→目录 ID 映射，`whoami` 和拒绝消息统一展示目录 ID，不再一会儿拼音一会儿官方 ID。
+- **Owner 展示统一显示名字 + 官方 ID**：不再一会儿拼音一会儿微信官方 ID，身份展示格式一致。
+- **诊断失败给出去路**：修复后重新运行 `threadferry onboard` 会复用已有配置和配对，或直接
+  `threadferry start`，不需要从头再来。
+
+### 多机器人并发运行
+
+- `threadferry start` 为**每个已授权 Agent** 各建立一条机器人连接和一个独立处理实例。
+  没有机器人凭据的 Agent 会被逐个报出来再跳过，不静默忽略。
+- 新增 `threadferry start --agents a,b` 只启动指定 Agent。
+- 每个 Agent 的所有 wecom-cli 调用（群历史、群列表、成员搜索、发送回复、身份查询）
+  都使用它自己的凭据目录。
+- **私聊直达**：跟哪个机器人私聊，就用那个 Agent 的 Workspace。不再固定使用第一个 Agent。
+- **群与 Owner 按 Agent 隔离**：A 机器人收到 B 的群消息会被拒绝；A 的 Owner 不能私聊 B 的 Agent。
+- 崩溃恢复的补发和重放都使用该群所属 Agent 的机器人，不会从错误的机器人身份发出。
+- 配置热更新会就地刷新每个 Agent 的视图，立即生效；Agent 被删除后其连接随即拒绝所有消息。
+
+⚠️ **尚未在双机器人环境实测**。逻辑与隔离已有测试覆盖，但两条真实连接并发需要第二个
+企业微信机器人才能验证。
+
+### Owner 下沉到 Agent
+
+- **每个 Agent 有自己的 `owner_user`**。换企业后同一个人的回调 userid 不同，Owner 因此必须
+  跟着 Agent 走——这也是「换企业后私聊被拒」那个问题的结构性解法。
+- 群的授权名单校验改为必须包含**所属 Agent 自己**的 Owner。
+- `threadferry start` 的身份核对改为按 Agent：用该 Agent 自己的凭据目录查询当前授权用户，
+  与该 Agent 配置的 Owner 比对。
+- 新增 Agent 时其机器人尚未授权，Owner 先继承主 Agent 的；该 Agent 授权后启动时会提示更正。
+
+### 配置格式 v6
+
+- 配置磁盘格式升级到 `version: 6`：**群和 Owner 都挂到各自 Agent 下**，顶层不再有
+  `owner_user` 和 `groups`。Agent 成为配置里的隔离单元。
+- **v5 配置自动升级，不需要手工迁移**：`loadConfig` 同时接受 v5 和 v6，v5 在读取时升级；
+  下次写盘统一输出 v6。
+- Agent 新增可选 `config_dir`，用于覆盖机器人凭据目录。
+- 校验收紧：同一个群不能挂在两个 Agent 下；Agent 缺少 `owner_user` 会被拒绝；
+  `config_dir` 必须是绝对路径。
+- 当前运行时仍是单机器人模式，因此**各 Agent 的 `owner_user` 必须一致**，不一致会明确报错
+  而不是静默取其中一个。多机器人落地后会放开。
+
+### 凭据按 Agent 隔离
+
+- 新增 `src/bots.ts`：每个 Agent 一个 `WECOM_CLI_CONFIG_DIR`（默认
+  `~/.threadferry/wecom/<agentId>`）。名为 `default` 的 Agent 沿用 `~/.config/wecom`，
+  现有单机器人安装升级后不必重新授权。
+- Agent 名会拼进凭据目录路径，因此收紧校验为 `^[A-Za-z0-9_-]{1,64}$`，挡住路径穿越。
+- 只有 `default` Agent 继续认 `THREADFERRY_WECOM_BOT_*` 环境变量，避免多机器人下
+  一组环境变量被所有 Agent 误用。
+- `threadferry agent list` 增列机器人授权状态，未授权的 Agent 直接给出授权命令。
+- 新增 `threadferry agent login <name>`：在该 Agent 的凭据目录直连终端跑
+  `wecom-cli auth init`。**Secret 从终端直接进 wecom-cli 的加密存储，ThreadFerry 全程不经手。**
+- 配置文件只记目录，绝不存 Secret。
+- 中文或含空格的 Agent 名（v5 起支持）是合法目录名，可以正常拥有独立机器人和凭据目录。
+
+### 管理台与命令按 Agent 重构
+
+- 管理台「Agent 工作区」页显示每个 Agent 的**机器人授权状态、Bot ID 和它自己的 Owner**。
+- 绑定待绑定群时，下拉**只列出机器人确实在该群的 Agent**；绑给不在群里的机器人会静默失效，
+  因此直接挡住。服务端也按目标 Agent 自己的机器人校验。
+- 移除管理台的「切换群 Agent」操作与私聊 `threadferry use` 命令：1:1 之后换 Agent 等于换机器人，
+  而那台机器人未必在该群。要换 Agent，解绑后用目标机器人重新绑定。
+- `threadferry bind <群名或ID>` 不再接受 Agent 参数——你在跟哪个机器人说话就是哪个 Agent。
+- `threadferry session reset` 与管理台重置只清该群**所属 Agent** 的 Session；两个机器人同在一个群
+  时不会清掉对方的。
+
+### 安装与升级
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/GnaixEuy/threadferry/main/install.sh | bash
+```
+
+**本次为破坏性变更，需要重新配置**（详见上方「破坏性变更」）：配置必须是 v6、Agent 名只允许
+ASCII、凭据目录迁移到 `~/.threadferry/wecom/<Agent名>`。升级后执行：
+
+```sh
+threadferry agent login <Agent名>
+threadferry doctor
+threadferry start
+```
+
+### 安全边界
+
+- **ThreadFerry 完全不经手 Bot Secret**：不提示输入、不写配置、不写环境变量。凭据由官方
+  `wecom-cli` 在各 Agent 自己的目录里加密保存，只在建立连接时读取。
+- **Agent 之间相互隔离**：A 的机器人拒绝 B 的群消息，A 的 Owner 不能私聊 B 的 Agent。
+- 每个 Agent 的所有企业微信调用都使用它自己的凭据目录，不会串到别的机器人。
+- 崩溃恢复的补发与重放使用该群所属 Agent 的机器人，不会从错误身份发出。
+- 其余边界不变：只处理 @ 消息、Runtime 固定在 Workspace 内只读、群历史是不可信输入。
+
+### 尚未验证
+
+⚠️ **多机器人并发尚未在双机器人环境实测**，需要第二个企业微信机器人。逻辑与隔离已有自动化
+测试覆盖（64 项全绿），但两条真实连接并发必须真机验收，见 `POC.md` 第 29-33 项。
+
+### 发布资产
+
+- `threadferry.tgz`：包含已经编译的 CLI，可直接由 npm 全局安装。
+- `SHA256SUMS`：用于校验发布包完整性。
+
+### 运行要求
+
+- macOS 或 Linux
+- Node.js 22+
+- 企业微信官方 `wecom-cli 1.1.0+`
+- Codex CLI `0.138.0+` 或 Pi CLI `0.84.2+`
+
+[查看 v0.14.1...v0.16.0 的完整变更](https://github.com/GnaixEuy/threadferry/compare/v0.14.1...v0.16.0)
+
 ## 0.14.1
 
 本次版本修复运维排查困难：群消息处理失败时，本机控制台只有错误编号和阶段，真正可操作的原因被丢弃，必须再跑一次 `threadferry doctor` 才能看到。
