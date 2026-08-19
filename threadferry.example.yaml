@@ -16,3 +16,5 @@ groups:
     agent: "default"
     allow_users:
       - "user_owner"
+    # 打开后群内所有成员都可以 @ 机器人使用，allow_users 在关闭后重新生效。
+    # allow_all: true

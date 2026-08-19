@@ -221,6 +221,52 @@ test("robot owner manages per-group users in direct chat", async () => {
   assert.equal(runtimeCalls, 5);
 });
 
+test("owner toggles all-member access in direct chat", async () => {
+  const config = testConfig("/workspace", "owner");
+  const access: Array<{ groupId: string; allowAll: boolean }> = [];
+  const app = createApp(config, {
+    history: async () => [],
+    runtime: async () => ({ text: "分析结果" }),
+    updateGroupAccess: async (groupId, allowAll) => { access.push({ groupId, allowAll }); },
+    listGroups: async () => [{ id: "group", name: "AI Coding" }],
+  });
+  const replies: string[] = [];
+  let sequence = 0;
+  const direct = (senderId: string, text: string) => app.handleDirect({
+    msgId: `direct-${sequence += 1}`,
+    senderId,
+    time: new Date(),
+    text,
+  }, async (content) => { replies.push(content); });
+  const group = (senderId: string, text: string) => app.handle({
+    msgId: `group-${sequence += 1}`,
+    groupId: "group",
+    senderId,
+    time: new Date(),
+    text,
+    mentioned: true,
+  }, async () => undefined);
+
+  assert.equal(await group("guest", "@机器人 分析"), "unauthorized_user");
+  assert.equal(await direct("guest", "threadferry open AI Coding"), "command");
+  assert.equal(access.length, 0);
+  assert.equal(await direct("owner", "threadferry open AI Coding"), "command");
+  assert.match(replies.at(-1) ?? "", /所有成员/);
+  assert.deepEqual(access, [{ groupId: "group", allowAll: true }]);
+  assert.equal(config.groups.group?.allowAll, true);
+  assert.equal(await group("guest", "@机器人 分析"), "handled");
+  assert.equal(await direct("owner", "threadferry users AI Coding"), "command");
+  assert.match(replies.at(-1) ?? "", /已开启全员可用/);
+  assert.equal(await direct("owner", "threadferry groups"), "command");
+  assert.match(replies.at(-1) ?? "", /全员可用 AI Coding/);
+  assert.equal(await direct("owner", "threadferry close AI Coding"), "command");
+  assert.match(replies.at(-1) ?? "", /仅授权成员/);
+  assert.deepEqual(access.at(-1), { groupId: "group", allowAll: false });
+  assert.equal(await group("guest", "@机器人 再分析"), "unauthorized_user");
+  assert.equal(await direct("owner", "threadferry users AI Coding"), "command");
+  assert.doesNotMatch(replies.at(-1) ?? "", /全员可用/);
+});
+
 test("wecom group session listing uses the official message command", async () => {
   let received: { command: string; args: string[] } | undefined;
   const groups = await listWecomGroups(async (command, args) => {
@@ -300,6 +346,13 @@ test("workspace paths cannot be relative or escape through a symlink", async (t)
   compact.groups.group!.allowUsers.push("user-2");
   await saveConfig(compactPath, compact);
   assert.deepEqual((await loadConfig(compactPath)).groups.group?.allowUsers, ["user", "user-2"]);
+
+  compact.groups.group!.allowAll = true;
+  await saveConfig(compactPath, compact);
+  assert.equal((await loadConfig(compactPath)).groups.group?.allowAll, true);
+  delete compact.groups.group!.allowAll;
+  await saveConfig(compactPath, compact);
+  assert.equal((await loadConfig(compactPath)).groups.group?.allowAll, undefined);
 });
 
 test("agent names support Chinese and spaces while onboarding uses the invocation directory", () => {
@@ -336,6 +389,10 @@ test("legacy and extra configuration fields are rejected", async (t) => {
   const extraPath = join(root, "extra.yaml");
   await writeFile(extraPath, `version: 5\nowner_user: user\nagents:\n  default:\n    runtime: codex\n    workspace: ${JSON.stringify(await realpath(root))}\ngroups:\n  group:\n    agent: default\n    allow_users: [user]\n    runtime: codex\n`);
   await assert.rejects(loadConfig(extraPath), /不支持字段: runtime/);
+
+  const badAccessPath = join(root, "bad-access.yaml");
+  await writeFile(badAccessPath, `version: 5\nowner_user: user\nagents:\n  default:\n    runtime: codex\n    workspace: ${JSON.stringify(await realpath(root))}\ngroups:\n  group:\n    agent: default\n    allow_users: [user]\n    allow_all: 1\n`);
+  await assert.rejects(loadConfig(badAccessPath), /allow_all 必须是布尔值/);
 });
 
 test("a newer group message makes the completed analysis stale", async () => {

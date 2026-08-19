@@ -107,9 +107,17 @@ The Owner can send these commands directly to the bot:
 | `threadferry add <group-name> <name>` | Authorize a member by directory name |
 | `threadferry remove <group-name> <name>` | Remove authorization |
 | `threadferry invite <group-name>` | Generate a one-time invitation code |
+| `threadferry open <group-name>` | Let every member of the group use the bot |
+| `threadferry close <group-name>` | Go back to authorized members only |
 | `threadferry whoami` | Show your callback userid |
 
 If multiple groups or members have the same name, ThreadFerry returns candidate IDs. Retry with `id:<userid>` or the group ID as instructed. Management commands and ordinary direct Agent messages only work for the locally confirmed Owner. Directory permission is only needed for resolving member names in `add` and `remove`; pairing, direct Agent use, and group binding do not use it.
+
+### All-member Access Switch
+
+After `threadferry open <group-name>`, every member of that group can @ the bot without being authorized one by one. `threadferry close <group-name>` restores authorized-members-only access immediately, and the `allow_users` list stays untouched while the switch is on. The same toggle sits on each configured group card in the admin console's groups page. Both write `allow_all` to the config file and take effect on the next @ message.
+
+The switch only widens who may use the bot; nothing else changes. The bot still only answers messages that mention it, still only reads history from bound groups, and agents still run read-only.
 
 After receiving an invitation code, a user can send this command directly to the bot:
 
@@ -125,7 +133,7 @@ Or send it in the relevant group:
 
 ## Manage Agents
 
-The admin console has three pages: an overview with runtime status and pending actions, an AI spaces (agents) page for adding agents, reviewing group bindings, and removing unused agents, and a groups page for binding or unbinding groups, switching agents, managing authorized users, and resetting group sessions. Changes take effect immediately.
+The admin console has three pages: an overview with runtime status and pending actions, an agent workspaces page for adding agents (the workspace field can be filled by browsing local directories), reviewing group bindings, and removing unused workspaces, and a groups page for binding or unbinding groups, switching agent workspaces, toggling all-member access, managing authorized users, and resetting group sessions. Changes take effect immediately.
 
 You can also use the CLI:
 
@@ -170,7 +178,7 @@ Normal use does not require manually configuring environment variables. `wecom-c
 ## Security Boundaries
 
 - In direct chat, only messages from the locally confirmed Owner start a Runtime. In groups, only the current message that mentions `@bot` is treated as a user instruction. Message history, quoted messages, and attachment metadata are untrusted context.
-- Messages from unconfigured groups or unauthorized users, and messages that do not mention `@bot`, do not start a runtime.
+- Messages from unconfigured groups or unauthorized users, and messages that do not mention `@bot`, do not start a runtime. A group with all-member access (`allow_all`) widens "unauthorized users" to every member of that group; every other limit stays in place.
 - The runtime is confined to the agent's workspace and cannot read files outside it.
 - Codex has network and file writes disabled. Pi exposes only path-guarded `read` and `ls` operations.
 - Agent runtimes cannot commit, push, delete, deploy, or perform other write operations. Automatic updates only replace the globally installed ThreadFerry package from the official GitHub Release.

@@ -32,3 +32,13 @@ test("authorization requires configured group, mention, and allowlisted user", (
   assert.deepEqual(authorize(config, { ...message, mentioned: false }), { allowed: false, reason: "mention" });
   assert.deepEqual(authorize(config, { ...message, senderId: "user_other" }), { allowed: false, reason: "user" });
 });
+
+test("authorization allows any mentioned group member when allowAll is enabled", () => {
+  const openConfig: ThreadFerryConfig = {
+    ...config,
+    groups: { group_allowed: { ...config.groups.group_allowed!, allowAll: true } },
+  };
+  assert.equal(authorize(openConfig, { ...message, senderId: "user_other" }).allowed, true);
+  assert.deepEqual(authorize(openConfig, { ...message, senderId: "user_other", mentioned: false }), { allowed: false, reason: "mention" });
+  assert.deepEqual(authorize(openConfig, { ...message, groupId: "group_other", senderId: "user_other" }), { allowed: false, reason: "group" });
+});

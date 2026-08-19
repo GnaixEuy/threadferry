@@ -53,6 +53,7 @@ export interface AgentConfig {
 export interface GroupConfig {
   agent: string;
   allowUsers: string[];
+  allowAll?: boolean;
   context: {
     lookbackHours: number;
     maxMessages: number;
