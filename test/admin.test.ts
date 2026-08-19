@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtemp, realpath, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rm } from "node:fs/promises";
 import { request as httpRequest } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -50,7 +50,7 @@ test("localhost admin manages agents, groups, and users with CSRF protection", a
   assert.match(overview, /TF-12345678/);
 
   const agentsPage = await (await fetch(`${admin.url}/agents`)).text();
-  assert.match(agentsPage, /AI 空间/);
+  assert.match(agentsPage, /Agent 工作区/);
   assert.match(agentsPage, /default/);
   assert.match(agentsPage, /AI Coding/);
 
@@ -62,6 +62,8 @@ test("localhost admin manages agents, groups, and users with CSRF protection", a
   assert.match(page, /待绑定/);
   assert.match(page, /重置 Session/);
   assert.match(page, /解绑群/);
+  assert.match(page, /仅授权成员/);
+  assert.match(page, /开启全员可用/);
   const hostileStatus = await new Promise<number | undefined>((resolve, reject) => {
     const target = new URL(admin.url);
     const request = httpRequest({ hostname: target.hostname, port: target.port, headers: { host: "evil.example" } }, (response) => resolve(response.statusCode));
@@ -97,6 +99,16 @@ test("localhost admin manages agents, groups, and users with CSRF protection", a
   const ownerRemoval = await post("/groups/users/remove", { groupId: "group", userId: "owner" });
   assert.match(ownerRemoval.headers.get("location") ?? "", /error=/);
   assert.deepEqual(config.groups.group?.allowUsers, ["owner"]);
+
+  const accessOn = await post("/groups/access", { groupId: "group", allowAll: "on" });
+  assert.match(accessOn.headers.get("location") ?? "", /^\/groups\?ok=.*#group$/);
+  assert.equal(config.groups.group?.allowAll, true);
+  assert.match(await (await fetch(`${admin.url}/groups`)).text(), /全员可用/);
+  const accessOff = await post("/groups/access", { groupId: "group", allowAll: "off" });
+  assert.equal(accessOff.status, 303);
+  assert.equal(config.groups.group?.allowAll, undefined);
+  const badAccess = await post("/groups/access", { groupId: "group", allowAll: "yes" });
+  assert.match(badAccess.headers.get("location") ?? "", /error=/);
 
   await post("/groups/bind", { groupId: "new-group", agentId: "default" });
   assert.deepEqual(config.groups["new-group"], {
@@ -136,4 +148,49 @@ test("localhost admin manages agents, groups, and users with CSRF protection", a
   const escaped = await post("/agents/add", { agentId: "escape", runtime: "codex", workspace: "../outside" });
   assert.match(escaped.headers.get("location") ?? "", /error=/);
   assert.equal(config.agents.escape, undefined);
+});
+
+test("workspace browser lists local directories and prefills the add form", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "threadferry-browse-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  await mkdir(join(root, "project-a"));
+  await mkdir(join(root, "project-b"));
+  await mkdir(join(root, ".hidden"));
+  const workspace = await realpath(root);
+  const config: ThreadFerryConfig = {
+    version: 5,
+    ownerUser: "owner",
+    agents: { default: { runtime: "codex", workspace } },
+    groups: {},
+    security: { requireMention: true, readOnly: true },
+  };
+  const admin = await startAdminServer(config, {
+    updateConfig: async (change) => { await change(config); },
+    listGroups: async () => [],
+    searchUsers: async () => [],
+  }, 0);
+  t.after(() => admin.close());
+
+  const params = new URLSearchParams({ path: workspace, name: " reviewer ", runtime: "pi" });
+  const browse = await (await fetch(`${admin.url}/agents/browse?${params}`)).text();
+  assert.match(browse, /选择 Workspace 目录/);
+  assert.match(browse, /project-a\//);
+  assert.match(browse, /project-b\//);
+  assert.doesNotMatch(browse, /\.hidden/);
+  const choose = browse.match(/href="(\/agents\?[^"]*workspace=[^"]*)"/)?.[1];
+  assert.ok(choose);
+  assert.ok(choose.includes(`workspace=${encodeURIComponent(workspace)}`));
+  assert.ok(choose.includes("runtime=pi"));
+  assert.ok(choose.includes("name=reviewer"));
+  const parentLink = browse.match(/href="(\/agents\/browse\?[^"]*)"[^>]*>↑ 上级目录/)?.[1];
+  assert.ok(parentLink);
+
+  const relative = await (await fetch(`${admin.url}/agents/browse?path=some/relative`)).text();
+  assert.match(relative, /绝对路径/);
+
+  const prefilled = await (await fetch(`${admin.url}/agents?${new URLSearchParams({ workspace, name: "reviewer", runtime: "pi" })}`)).text();
+  assert.ok(prefilled.includes(`value="${workspace}"`));
+  assert.ok(prefilled.includes('value="reviewer"'));
+  assert.match(prefilled, /<option value="pi" selected>/);
+  assert.match(prefilled, /浏览本机目录选择/);
 });

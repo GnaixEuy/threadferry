@@ -12,17 +12,18 @@ export interface AppDependencies {
   runtime: (request: RuntimeRequest) => Promise<RuntimeResult>;
   updateAllowUsers?: (groupId: string, users: string[]) => Promise<void>;
   updateGroupAgent?: (groupId: string, agentId: string) => Promise<void>;
+  updateGroupAccess?: (groupId: string, allowAll: boolean) => Promise<void>;
   bindGroup?: (groupId: string, agentId: string) => Promise<void>;
   listGroups?: () => Promise<Array<{ id: string; name?: string }>>;
   searchUsers?: (keywords: string[]) => Promise<DirectoryUser[]>;
   onError?: (error: { errorId: string; phase: FailurePhase }) => void;
 }
 
-type ManagementCommand = "help" | "whoami" | "groups" | "agents" | "users" | "invite" | "join" | "add" | "remove" | "use" | "bind";
+type ManagementCommand = "help" | "whoami" | "groups" | "agents" | "users" | "invite" | "join" | "add" | "remove" | "use" | "bind" | "open" | "close";
 const USER_ID = /^[A-Za-z0-9_@.-]{1,512}$/;
 
 function managementCommand(text: string): { name: ManagementCommand; arguments: string[] } | undefined {
-  const match = text.match(/(?:^|[\s@])threadferry\s+(help|whoami|groups|agents|users|invite|join|add|remove|use|bind)(?:\s+(.+?))?\s*$/i);
+  const match = text.match(/(?:^|[\s@])threadferry\s+(help|whoami|groups|agents|users|invite|join|add|remove|use|bind|open|close)(?:\s+(.+?))?\s*$/i);
   if (!match) return undefined;
   return { name: match[1]!.toLowerCase() as ManagementCommand, arguments: match[2]?.trim().split(/\s+/) ?? [] };
 }
@@ -87,6 +88,17 @@ export function createApp(config: ThreadFerryConfig, dependencies: AppDependenci
       if (!config.agents[agentId]) throw new Error(`Agent \`${agentId}\` 不存在。请先发送 \`threadferry agents\`。`);
       await dependencies.updateGroupAgent(groupId, agentId);
       group.agent = agentId;
+    });
+    accessTail = operation.then(() => undefined, () => undefined);
+    return operation;
+  }
+
+  function updateAccess(groupId: string, allowAll: boolean): Promise<void> {
+    const operation = accessTail.then(async () => {
+      const group = config.groups[groupId];
+      if (!group || !dependencies.updateGroupAccess) throw new Error("当前启动方式不支持访问开关管理");
+      await dependencies.updateGroupAccess(groupId, allowAll);
+      group.allowAll = allowAll;
     });
     accessTail = operation.then(() => undefined, () => undefined);
     return operation;
@@ -258,7 +270,7 @@ export function createApp(config: ThreadFerryConfig, dependencies: AppDependenci
     if (command.name === "join") return join(message.senderId, command.arguments[0], reply);
     if (message.senderId !== config.ownerUser) return respond(reply, "只有机器人创建者（ThreadFerry Owner）可以在私聊中管理群权限。");
     if (command.name === "help") {
-      return respond(reply, "直接发送普通消息即可私聊默认 Agent。\n\n接入群聊：\n1. 请企业管理员批准机器人的数据访问权限，并把机器人加入目标内部群\n2. 发送 `threadferry groups` 查看群名或群 ID\n3. 发送 `threadferry agents` 查看 Agent 名\n4. 发送 `threadferry bind <群名或ID> <Agent名>` 完成绑定\n\n其他管理命令：\n- `threadferry use <群名> <Agent名>` 切换群 Agent\n- `threadferry users <群名>` 查看可使用用户\n- `threadferry invite <群名>` 生成一次性邀请码\n- `threadferry add <群名> <姓名>` 直接授权\n- `threadferry remove <群名> <姓名>` 移除授权\n- `threadferry whoami` 查看自己的 userid\n\n群或成员重名时，按机器人返回的 ID 重新发送即可。");
+      return respond(reply, "直接发送普通消息即可私聊默认 Agent。\n\n接入群聊：\n1. 请企业管理员批准机器人的数据访问权限，并把机器人加入目标内部群\n2. 发送 `threadferry groups` 查看群名或群 ID\n3. 发送 `threadferry agents` 查看 Agent 名\n4. 发送 `threadferry bind <群名或ID> <Agent名>` 完成绑定\n\n其他管理命令：\n- `threadferry use <群名> <Agent名>` 切换群 Agent\n- `threadferry users <群名>` 查看可使用用户\n- `threadferry invite <群名>` 生成一次性邀请码\n- `threadferry add <群名> <姓名>` 直接授权\n- `threadferry remove <群名> <姓名>` 移除授权\n- `threadferry open <群名>` 允许群内所有成员使用\n- `threadferry close <群名>` 恢复仅授权成员可用\n- `threadferry whoami` 查看自己的 userid\n\n群或成员重名时，按机器人返回的 ID 重新发送即可。");
     }
     if (command.name === "agents") {
       const lines = Object.entries(config.agents).map(([id, agent]) => `- \`${id}\`：${agent.runtime}${agent.model ? ` / ${agent.model}` : ""}\n  ${agent.workspace}`);
@@ -277,7 +289,8 @@ export function createApp(config: ThreadFerryConfig, dependencies: AppDependenci
         const session = byId.get(id);
         const configured = Boolean(config.groups[id]);
         const agent = config.groups[id]?.agent;
-        return `- ${configured ? `[${agent}]` : "[未配置 Agent]"} ${session?.name ?? "未获取群名"}\n  \`${id}\``;
+        const openTag = config.groups[id]?.allowAll ? " 全员可用" : "";
+        return `- ${configured ? `[${agent}]` : "[未配置 Agent]"}${openTag} ${session?.name ?? "未获取群名"}\n  \`${id}\``;
       });
       return respond(reply, `机器人最近群会话：\n${lines.length ? lines.join("\n") : "暂无可见群会话"}`);
     }
@@ -305,13 +318,27 @@ export function createApp(config: ThreadFerryConfig, dependencies: AppDependenci
     }
     const configured = config.groups[group.id]!;
     if (command.name === "users") {
-      return respond(reply, `群“${groupLabel}”可使用用户：\n${await formatUsers(configured.allowUsers)}`);
+      const heading = configured.allowAll
+        ? `群“${groupLabel}”已开启全员可用，群内所有成员都可以 @机器人 使用。\n关闭后仍然生效的授权用户：`
+        : `群“${groupLabel}”可使用用户：`;
+      return respond(reply, `${heading}\n${await formatUsers(configured.allowUsers)}`);
     }
     if (command.name === "invite") {
       for (const [code, item] of invites) if (item.groupId === group.id) invites.delete(code);
       const code = randomBytes(6).toString("hex").toUpperCase();
       invites.set(code, { groupId: group.id, expiresAt: Date.now() + 10 * 60_000 });
       return respond(reply, `群“${groupLabel}”的一次性邀请码：\`${code}\`\n\n目标用户可私聊机器人发送 \`threadferry join ${code}\`，或在该群发送 \`@机器人 threadferry join ${code}\`。10 分钟内有效。`);
+    }
+    if (command.name === "open" || command.name === "close") {
+      const allowAll = command.name === "open";
+      try {
+        await updateAccess(group.id, allowAll);
+        return respond(reply, allowAll
+          ? `已开启：群“${groupLabel}”的所有成员都可以 @机器人 使用，关闭请发送 \`threadferry close <群名>\`。`
+          : `已关闭：群“${groupLabel}”恢复为仅授权成员可使用。`);
+      } catch (error) {
+        return respond(reply, error instanceof Error ? error.message : "访问开关更新失败。");
+      }
     }
     if (command.name === "use") {
       try {

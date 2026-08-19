@@ -4,6 +4,41 @@ ThreadFerry 的每个 GitHub Release 都使用这里对应版本的内容，不�
 
 ## Unreleased
 
+## 0.14.0
+
+本次版本新增群聊「全员可用」开关：打开后该群所有成员都可以 @ 机器人使用，不必再逐个授权；私聊命令和管理台都能切换。
+
+### 主要变化
+
+- 新增群配置项 `allow_all`。打开后该群成员只要 @ 机器人就能使用，`allow_users` 名单原样保留，关闭后立即恢复生效。
+- 新增私聊命令 `threadferry open <群名>` 和 `threadferry close <群名>`，`threadferry help` 已同步；仅 Owner 可执行，与其他权限命令共用同一条串行更新链。
+- 管理台「群聊管理」页的每个已配置群卡片新增开关，并显示「全员可用」或「仅授权成员」当前状态；开启期间提示授权列表在关闭后生效。
+- `threadferry users <群名>` 在开启期间说明当前是全员可用，`threadferry groups` 在对应群标出「全员可用」。
+- 管理台「AI 空间」更名为「Agent 工作区」，添加表单的 Workspace 可以先浏览本机目录选择，再回填其余字段。
+- 安全边界不变：仍然只处理 @ 机器人的消息，只读取已绑定群历史，Agent 仍以只读方式运行；开关只放宽“谁可以使用”。
+
+### 安装与升级
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/GnaixEuy/threadferry/main/install.sh | bash
+```
+
+本次变更不需要迁移配置：`allow_all` 是可选项，缺省即为原有的仅授权成员可用。升级后运行 `threadferry start` 即可使用新开关。
+
+### 发布资产
+
+- `threadferry.tgz`：包含已经编译的 CLI，可直接由 npm 全局安装。
+- `SHA256SUMS`：用于校验发布包完整性。
+
+### 运行要求
+
+- macOS 或 Linux
+- Node.js 22+
+- 企业微信官方 `wecom-cli 1.1.0+`
+- Codex CLI `0.138.0+` 或 Pi CLI `0.84.2+`
+
+[查看 v0.13.0...v0.14.0 的完整变更](https://github.com/GnaixEuy/threadferry/compare/v0.13.0...v0.14.0)
+
 ## 0.13.0
 
 本次版本重构本机管理台，把原先的单页拆分为概览、AI 空间、群聊管理三个页面，并补齐删除 AI 空间、解绑群、重置 Session 等常用管理能力。
