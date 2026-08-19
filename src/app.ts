@@ -16,7 +16,7 @@ export interface AppDependencies {
   bindGroup?: (groupId: string, agentId: string) => Promise<void>;
   listGroups?: () => Promise<Array<{ id: string; name?: string }>>;
   searchUsers?: (keywords: string[]) => Promise<DirectoryUser[]>;
-  onError?: (error: { errorId: string; phase: FailurePhase }) => void;
+  onError?: (error: { errorId: string; phase: FailurePhase; reason?: string }) => void;
 }
 
 type ManagementCommand = "help" | "whoami" | "groups" | "agents" | "users" | "invite" | "join" | "add" | "remove" | "use" | "bind" | "open" | "close";
@@ -26,6 +26,15 @@ function managementCommand(text: string): { name: ManagementCommand; arguments: 
   const match = text.match(/(?:^|[\s@])threadferry\s+(help|whoami|groups|agents|users|invite|join|add|remove|use|bind|open|close)(?:\s+(.+?))?\s*$/i);
   if (!match) return undefined;
   return { name: match[1]!.toLowerCase() as ManagementCommand, arguments: match[2]?.trim().split(/\s+/) ?? [] };
+}
+
+// 仅用于本机控制台日志：Runtime 与 wecom-cli 的 Error.message 都是固定诊断文案，
+// 不含群消息内容；这里再压成单行并截断，避免污染日志。reason 不入库也不进群回复。
+function failureReason(error: unknown): string | undefined {
+  if (!(error instanceof Error) || !error.message) return undefined;
+  const single = error.message.replace(/\s+/g, " ").trim();
+  if (!single) return undefined;
+  return single.length > 200 ? `${single.slice(0, 200)}…` : single;
 }
 
 function limitUtf8(input: string, maxBytes = 12_000): string {
@@ -245,9 +254,10 @@ export function createApp(config: ThreadFerryConfig, dependencies: AppDependenci
     try {
       await updateUsers(invite.groupId, (users) => [...users, senderId]);
       return respond(reply, `授权成功。你现在可以在群 \`${invite.groupId}\` 使用 ThreadFerry。`);
-    } catch {
+    } catch (error) {
       const errorId = newErrorId();
-      dependencies.onError?.({ errorId, phase: "host" });
+      const reason = failureReason(error);
+      dependencies.onError?.({ errorId, phase: "host", ...(reason ? { reason } : {}) });
       return respond(reply, `权限更新失败（错误编号 ${errorId}）。请联系机器人 Owner。`);
     }
   }
@@ -374,9 +384,10 @@ export function createApp(config: ThreadFerryConfig, dependencies: AppDependenci
       return respond(reply, command.name === "add"
         ? `已在群“${groupLabel}”授权 ${user.name}。当前 ${users.length} 人。`
         : `已从群“${groupLabel}”移除 ${user.name}。当前 ${users.length} 人。`);
-    } catch {
+    } catch (error) {
       const errorId = newErrorId();
-      dependencies.onError?.({ errorId, phase: "host" });
+      const reason = failureReason(error);
+      dependencies.onError?.({ errorId, phase: "host", ...(reason ? { reason } : {}) });
       return respond(reply, `权限更新失败（错误编号 ${errorId}）。请执行 \`threadferry status\`。`);
     }
   }
@@ -425,9 +436,10 @@ export function createApp(config: ThreadFerryConfig, dependencies: AppDependenci
       if (result.sessionId) await state.setSession(scope, sessionScope, result.sessionId);
       await reply(limitUtf8(result.text), true);
       return "handled";
-    } catch {
+    } catch (error) {
       const errorId = newErrorId();
-      dependencies.onError?.({ errorId, phase: "runtime" });
+      const reason = failureReason(error);
+      dependencies.onError?.({ errorId, phase: "runtime", ...(reason ? { reason } : {}) });
       await reply(`ThreadFerry 处理失败（错误编号 ${errorId}）。请在运行 ThreadFerry 的机器上执行 \`threadferry status\`。`, true).catch(() => undefined);
       return "failed";
     }
@@ -445,17 +457,19 @@ export function createApp(config: ThreadFerryConfig, dependencies: AppDependenci
       await reply(content, true);
       await state.completeDelivery(deliveryId);
       return status;
-    } catch {
+    } catch (error) {
       const errorId = newErrorId();
       await state.deliveryFailed(deliveryId, errorId).catch(() => undefined);
-      dependencies.onError?.({ errorId, phase: "reply" });
+      const reason = failureReason(error);
+      dependencies.onError?.({ errorId, phase: "reply", ...(reason ? { reason } : {}) });
       return status === "failed" ? "failed" : "delivery_pending";
     }
   }
 
-  async function fail(message: IncomingMention, reply: Reply, phase: FailurePhase): Promise<HandleResult> {
+  async function fail(message: IncomingMention, reply: Reply, phase: FailurePhase, error?: unknown): Promise<HandleResult> {
     const errorId = newErrorId();
-    dependencies.onError?.({ errorId, phase });
+    const reason = failureReason(error);
+    dependencies.onError?.({ errorId, phase, ...(reason ? { reason } : {}) });
     const content = "ThreadFerry 处理失败（错误编号 " + errorId + "）。请在运行 ThreadFerry 的机器上执行 `threadferry status` 和 `threadferry doctor`。";
     try {
       return await complete(message, reply, "failed", content, { errorId, phase });
@@ -497,8 +511,8 @@ export function createApp(config: ThreadFerryConfig, dependencies: AppDependenci
 
       phase = "reply";
       return complete(message, reply, "handled", limitUtf8(result.text));
-    } catch {
-      return fail(message, reply, phase);
+    } catch (error) {
+      return fail(message, reply, phase, error);
     }
   }
 
@@ -535,8 +549,8 @@ export function createApp(config: ThreadFerryConfig, dependencies: AppDependenci
       const queued = groupTails.has(message.groupId);
       try {
         await reply(queued ? "ThreadFerry 已收到，当前群有任务处理中，已排队。" : "ThreadFerry 已收到，正在分析。", false);
-      } catch {
-        return fail(message, reply, "ack");
+      } catch (error) {
+        return fail(message, reply, "ack", error);
       }
       const agentId = authorization.group.agent;
       return serial(message.groupId, () => process(message, reply, agentId, authorization.group.context));

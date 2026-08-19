@@ -455,7 +455,7 @@ test("same-group turns run serially and queued users get immediate feedback", as
 test("runtime failures return and persist a redacted error id", async () => {
   const config = testConfig();
   const state = new ThreadFerryState();
-  const errors: Array<{ errorId: string; phase: string }> = [];
+  const errors: Array<{ errorId: string; phase: string; reason?: string }> = [];
   const app = createApp(config, {
     history: async () => [],
     runtime: async () => { throw new Error("secret detail must not escape"); },
@@ -470,7 +470,51 @@ test("runtime failures return and persist a redacted error id", async () => {
   assert.match(replies.at(-1) ?? "", /错误编号 TF-[A-F0-9]{8}/);
   assert.doesNotMatch(replies.join("\n"), /secret detail/);
   assert.equal(errors[0]?.phase, "runtime");
+  assert.equal(errors[0]?.reason, "secret detail must not escape");
   assert.equal((await state.snapshot()).turns[0]?.errorId, errors[0]?.errorId);
+});
+
+test("a history failure reports its cause to the operator but never to the group", async () => {
+  const config = testConfig();
+  const state = new ThreadFerryState();
+  const errors: Array<{ errorId: string; phase: string; reason?: string }> = [];
+  const app = createApp(config, {
+    history: async () => {
+      throw new Error("企业未授权群消息历史能力（errcode 853006）；请让企业管理员批准机器人数据访问权限");
+    },
+    runtime: async () => ({ text: "不应该执行 Runtime" }),
+    onError: (error) => { errors.push(error); },
+  }, state);
+  const replies: string[] = [];
+  const result = await app.handle({
+    msgId: "history-failure", groupId: "group", senderId: "user", time: new Date(), text: "@ThreadFerry 分析", mentioned: true,
+  }, async (content) => { replies.push(content); });
+
+  assert.equal(result, "failed");
+  assert.equal(errors[0]?.phase, "history");
+  assert.match(errors[0]?.reason ?? "", /errcode 853006/);
+  assert.match(replies.at(-1) ?? "", /错误编号 TF-[A-F0-9]{8}/);
+  assert.doesNotMatch(replies.join("\n"), /853006/);
+  assert.doesNotMatch(JSON.stringify(await state.snapshot()), /853006/);
+});
+
+test("a failure reason is flattened to one line and length-capped", async () => {
+  const config = testConfig();
+  const errors: Array<{ errorId: string; phase: string; reason?: string }> = [];
+  const app = createApp(config, {
+    history: async () => { throw new Error(`第一行\n\t第二行  ${"很长".repeat(200)}`); },
+    runtime: async () => ({ text: "未使用" }),
+    onError: (error) => { errors.push(error); },
+  }, new ThreadFerryState());
+  await app.handle({
+    msgId: "long-failure", groupId: "group", senderId: "user", time: new Date(), text: "@ThreadFerry 分析", mentioned: true,
+  }, async () => undefined);
+
+  const reason = errors[0]?.reason ?? "";
+  assert.doesNotMatch(reason, /[\n\t]/);
+  assert.match(reason, /^第一行 第二行 /);
+  assert.equal(reason.length, 201);
+  assert.ok(reason.endsWith("…"));
 });
 
 test("wecom history uses chat.messages.list arguments and keeps attachment metadata", async () => {
