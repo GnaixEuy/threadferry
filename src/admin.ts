@@ -1,6 +1,9 @@
 import { randomBytes } from "node:crypto";
+import { readdir, realpath, stat } from "node:fs/promises";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
+import { homedir } from "node:os";
+import { dirname, isAbsolute, join } from "node:path";
 import { addAgent, resolveWorkspace } from "./config.js";
 import { resolveDirectoryUser } from "./directory.js";
 import type { StateSnapshot } from "./state.js";
@@ -86,6 +89,16 @@ function groupAnchor(groupId: string): string {
   return `/groups#${encodeURIComponent(groupId)}`;
 }
 
+function carryParams(url: URL, extra?: Record<string, string>): string {
+  const params = new URLSearchParams();
+  for (const key of ["name", "runtime", "model"]) {
+    const value = url.searchParams.get(key)?.trim();
+    if (value) params.set(key, value);
+  }
+  for (const [key, value] of Object.entries(extra ?? {})) params.set(key, value);
+  return params.toString();
+}
+
 async function fetchSessions(dependencies: AdminDependencies): Promise<Array<{ id: string; name?: string }>> {
   try {
     return await dependencies.listGroups();
@@ -126,7 +139,7 @@ function bindCard(config: ThreadFerryConfig, token: string, id: string, label: s
     <article class="card">
       <div class="row"><div><h3>${html(label)}</h3><code>${html(id)}</code></div><span class="badge warning">待绑定</span></div>
       <form method="post" action="/groups/bind">${field(token)}<input type="hidden" name="groupId" value="${html(id)}">
-        <select name="agentId" aria-label="AI 空间">${agentOptions(config)}</select><button>绑定 AI 空间</button>
+        <select name="agentId" aria-label="Agent 工作区">${agentOptions(config)}</select><button>绑定</button>
       </form>
     </article>`;
 }
@@ -134,11 +147,11 @@ function bindCard(config: ThreadFerryConfig, token: string, id: string, label: s
 function shell(active: "overview" | "agents" | "groups", config: ThreadFerryConfig, url: URL, content: string): string {
   const notice = url.searchParams.get("ok");
   const error = url.searchParams.get("error");
-  const tabs: Array<[string, typeof active, string]> = [["/", "overview", "概览"], ["/agents", "agents", "AI 空间"], ["/groups", "groups", "群聊管理"]];
+  const tabs: Array<[string, typeof active, string]> = [["/", "overview", "概览"], ["/agents", "agents", "Agent 工作区"], ["/groups", "groups", "群聊管理"]];
   const nav = tabs.map(([href, key, label]) => `<a href="${href}"${key === active ? ` class="active"` : ""}>${label}</a>`).join("");
   return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
   <title>ThreadFerry 管理台</title><style>
-  :root{color-scheme:dark;font:15px/1.5 ui-sans-serif,system-ui,-apple-system;color:#e7e9ee;background:#0c0e13}*{box-sizing:border-box}body{margin:0}main{width:min(1080px,calc(100% - 32px));margin:28px auto 80px}header{display:flex;justify-content:space-between;align-items:end;gap:16px;margin-bottom:18px}h1{font-size:30px;margin:0}h2{margin:30px 0 14px;font-size:20px}h3,h4,p{margin:0 0 10px}.sub,.muted{color:#9ca3af}.tabs{display:flex;gap:4px;border-bottom:1px solid #272b36;margin-bottom:24px}.tabs a{color:#9ca3af;text-decoration:none;padding:10px 14px;border-bottom:2px solid transparent;margin-bottom:-1px;font-weight:650}.tabs a:hover{color:#e7e9ee}.tabs a.active{color:#eef1f6;border-bottom-color:#3975eb}.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px}.stat{display:block;background:#151821;border:1px solid #272b36;border-radius:14px;padding:14px 16px;text-decoration:none;color:inherit}.stat b{display:block;font-size:26px;margin-bottom:2px}.stat span{color:#9ca3af;font-size:13px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:14px}.card{background:#151821;border:1px solid #272b36;border-radius:14px;padding:18px}.row{display:flex;justify-content:space-between;gap:16px;align-items:start}.badge,.owner{font-size:12px;border-radius:999px;padding:3px 9px;background:#2b3140}.badge.ok{color:#7ee787}.badge.warning{color:#f2cc60}.owner{color:#8cb4ff;margin-left:8px}code{font-family:ui-monospace,SFMono-Regular,Menlo;overflow-wrap:anywhere;color:#b8c2d9}form{display:flex;gap:8px;align-items:end;margin-top:14px;flex-wrap:wrap}label{color:#9ca3af}input,select,button{font:inherit;border-radius:9px;border:1px solid #343a49;background:#0f1218;color:#eef1f6;padding:9px 11px}input{min-width:190px;flex:1}button{cursor:pointer;background:#2f67d8;border-color:#3975eb;font-weight:650}button.ghost{background:transparent;border-color:#343a49;color:#cdd5e4}button.danger{background:transparent;border-color:#7f3340;color:#ff9aa7}li button.danger{padding:4px 8px}ul{list-style:none;padding:0;margin:8px 0}li{display:flex;align-items:center;justify-content:space-between;gap:8px;border-top:1px solid #272b36;padding:9px 0}li form{margin:0}ul.links li{border:none;padding:4px 0;justify-content:flex-start}ul.links a{color:#8cb4ff;text-decoration:none}.notice{padding:11px 14px;border-radius:10px;margin:0 0 16px;background:#143321;color:#8de6a9}.notice.error{background:#3b171d;color:#ffabb4}.agent-form{display:grid;grid-template-columns:1fr 140px 1.6fr 1fr auto;align-items:end}.agent-form label{display:flex;flex-direction:column;gap:5px}.agent-form input{min-width:0;width:100%}.mt{margin-top:14px}.actions{display:flex;gap:8px;flex-wrap:wrap;border-top:1px solid #272b36;margin-top:14px;padding-top:14px}.actions form{margin:0}@media(max-width:760px){header{align-items:start;flex-direction:column}.agent-form{display:flex}}
+  :root{color-scheme:dark;font:15px/1.5 ui-sans-serif,system-ui,-apple-system;color:#e7e9ee;background:#0c0e13}*{box-sizing:border-box}body{margin:0}main{width:min(1080px,calc(100% - 32px));margin:28px auto 80px}header{display:flex;justify-content:space-between;align-items:end;gap:16px;margin-bottom:18px}h1{font-size:30px;margin:0}h2{margin:30px 0 14px;font-size:20px}h3,h4,p{margin:0 0 10px}.sub,.muted{color:#9ca3af}.tabs{display:flex;gap:4px;border-bottom:1px solid #272b36;margin-bottom:24px}.tabs a{color:#9ca3af;text-decoration:none;padding:10px 14px;border-bottom:2px solid transparent;margin-bottom:-1px;font-weight:650}.tabs a:hover{color:#e7e9ee}.tabs a.active{color:#eef1f6;border-bottom-color:#3975eb}.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px}.stat{display:block;background:#151821;border:1px solid #272b36;border-radius:14px;padding:14px 16px;text-decoration:none;color:inherit}.stat b{display:block;font-size:26px;margin-bottom:2px}.stat span{color:#9ca3af;font-size:13px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:14px}.card{background:#151821;border:1px solid #272b36;border-radius:14px;padding:18px}.row{display:flex;justify-content:space-between;gap:16px;align-items:start}.badge,.owner{font-size:12px;border-radius:999px;padding:3px 9px;background:#2b3140}.badge.ok{color:#7ee787}.badge.warning{color:#f2cc60}.owner{color:#8cb4ff;margin-left:8px}code{font-family:ui-monospace,SFMono-Regular,Menlo;overflow-wrap:anywhere;color:#b8c2d9}form{display:flex;gap:8px;align-items:end;margin-top:14px;flex-wrap:wrap}label{color:#9ca3af}input,select,button{font:inherit;border-radius:9px;border:1px solid #343a49;background:#0f1218;color:#eef1f6;padding:9px 11px}input{min-width:190px;flex:1}button{cursor:pointer;background:#2f67d8;border-color:#3975eb;font-weight:650}button.ghost{background:transparent;border-color:#343a49;color:#cdd5e4}button.danger{background:transparent;border-color:#7f3340;color:#ff9aa7}li button.danger{padding:4px 8px}ul{list-style:none;padding:0;margin:8px 0}li{display:flex;align-items:center;justify-content:space-between;gap:8px;border-top:1px solid #272b36;padding:9px 0}li form{margin:0}ul.links li{border:none;padding:4px 0;justify-content:flex-start}ul.links a{color:#8cb4ff;text-decoration:none}a.button{display:inline-block;background:#2f67d8;border:1px solid #3975eb;border-radius:9px;color:#eef1f6;padding:9px 14px;text-decoration:none;font-weight:650}.notice{padding:11px 14px;border-radius:10px;margin:0 0 16px;background:#143321;color:#8de6a9}.notice.error{background:#3b171d;color:#ffabb4}.agent-form{display:grid;grid-template-columns:1fr 140px 1.6fr 1fr auto;align-items:end}.agent-form label{display:flex;flex-direction:column;gap:5px}.agent-form input{min-width:0;width:100%}.mt{margin-top:14px}.actions{display:flex;gap:8px;flex-wrap:wrap;border-top:1px solid #272b36;margin-top:14px;padding-top:14px}.actions form{margin:0}@media(max-width:760px){header{align-items:start;flex-direction:column}.agent-form{display:flex}}
   </style></head><body><main><header><div><h1>ThreadFerry</h1><div class="sub">本机管理台 · 仅监听 127.0.0.1</div></div><code>Owner: ${html(config.ownerUser)}</code></header>
   <nav class="tabs">${nav}</nav>
   ${notice ? `<div class="notice">${html(notice)}</div>` : ""}${error ? `<div class="notice error">${html(error)}</div>` : ""}
@@ -156,7 +169,7 @@ async function overviewPage(config: ThreadFerryConfig, dependencies: AdminDepend
   const active = (counts.get("queued") ?? 0) + (counts.get("running") ?? 0);
   const lastFailure = snapshot?.turns.slice().reverse().find((turn) => turn.status === "failed");
   const stats: Array<[string, string, string]> = [
-    [String(Object.keys(config.agents).length), "AI 空间", "/agents"],
+    [String(Object.keys(config.agents).length), "Agent 工作区", "/agents"],
     [String(boundIds.size), "已绑定群", "/groups"],
     [String(unbound.length), "待绑定群", "/groups"],
   ];
@@ -175,7 +188,7 @@ async function overviewPage(config: ThreadFerryConfig, dependencies: AdminDepend
     <div class="stats">${stats.map(([value, label, href]) => href
       ? `<a class="stat" href="${href}"><b>${value}</b><span>${label}</span></a>`
       : `<div class="stat"><b>${value}</b><span>${label}</span></div>`).join("")}</div>
-    ${snapshot ? "" : `<p class="sub mt">运行状态暂不可用；AI 空间和群配置管理不受影响。</p>`}
+    ${snapshot ? "" : `<p class="sub mt">运行状态暂不可用；Agent 工作区和群配置管理不受影响。</p>`}
     <h2>待处理</h2>${todos.length ? `<div class="grid">${todos.join("")}</div>` : `<p class="sub">没有待处理事项。</p>`}`);
 }
 
@@ -189,6 +202,13 @@ async function agentsPage(config: ThreadFerryConfig, dependencies: AdminDependen
     boundByAgent.set(group.agent, list);
   }
   const total = Object.keys(config.agents).length;
+  const prefill = {
+    name: url.searchParams.get("name")?.trim() ?? "",
+    runtime: url.searchParams.get("runtime")?.trim() === "pi" ? "pi" : "codex",
+    model: url.searchParams.get("model")?.trim() ?? "",
+    workspace: url.searchParams.get("workspace")?.trim() ?? "",
+  };
+  const browseLink = `/agents/browse?${carryParams(url, prefill.workspace ? { path: prefill.workspace } : {})}`;
   const cards = Object.entries(config.agents).map(([id, agent]) => {
     const bound = boundByAgent.get(id) ?? [];
     const removable = bound.length === 0 && total > 1;
@@ -201,18 +221,63 @@ async function agentsPage(config: ThreadFerryConfig, dependencies: AdminDependen
         ? `<ul class="links">${bound.map((group) => `<li><a href="${groupAnchor(group.id)}">${html(group.label)}</a><code>${html(group.id)}</code></li>`).join("")}</ul>`
         : `<p class="muted">未被任何群使用</p>`}
       ${removable
-        ? `<div class="actions"><form method="post" action="/agents/remove">${field(token)}<input type="hidden" name="agentId" value="${html(id)}"><button class="danger">删除 AI 空间</button></form></div>`
+        ? `<div class="actions"><form method="post" action="/agents/remove">${field(token)}<input type="hidden" name="agentId" value="${html(id)}"><button class="danger">删除 Agent 工作区</button></form></div>`
         : ""}
     </article>`;
   }).join("");
   return shell("agents", config, url, `
     <div class="grid">${cards}</div>
-    <article class="card mt"><h3>添加 AI 空间</h3><form class="agent-form" method="post" action="/agents/add">${field(token)}
-      <label>名称<input name="agentId" required></label>
-      <label>Runtime<select name="runtime"><option value="codex">Codex</option><option value="pi">Pi</option></select></label>
-      <label>Workspace<input name="workspace" placeholder="/absolute/path" required></label>
-      <label>模型（可选）<input name="model" placeholder="provider/model"></label><button>添加</button></form>
-      <p class="muted mt">名称 1-64 个字符，支持中文和空格；Workspace 必须是已存在目录的绝对路径。</p></article>`);
+    <article class="card mt"><h3>添加 Agent 工作区</h3><form class="agent-form" method="post" action="/agents/add">${field(token)}
+      <label>名称<input name="agentId" value="${html(prefill.name)}" required></label>
+      <label>Runtime<select name="runtime"><option value="codex"${prefill.runtime === "codex" ? " selected" : ""}>Codex</option><option value="pi"${prefill.runtime === "pi" ? " selected" : ""}>Pi</option></select></label>
+      <label>Workspace<input name="workspace" placeholder="/absolute/path" value="${html(prefill.workspace)}" required></label>
+      <label>模型（可选）<input name="model" placeholder="provider/model" value="${html(prefill.model)}"></label><button>添加</button></form>
+      <p class="muted mt">名称 1-64 个字符，支持中文和空格；Workspace 必须是已存在目录的绝对路径，可以先<a href="${html(browseLink)}">浏览本机目录选择</a>再填写其他信息。</p></article>`);
+}
+
+async function browsePage(config: ThreadFerryConfig, url: URL): Promise<string> {
+  const requested = url.searchParams.get("path")?.trim() || homedir();
+  let current = homedir();
+  let note = "";
+  if (!isAbsolute(requested)) {
+    note = `“${requested}”不是绝对路径，已回到用户主目录。`;
+  } else {
+    try {
+      const canonical = await realpath(requested);
+      if (!(await stat(canonical)).isDirectory()) {
+        note = `“${requested}”不是目录，已回到用户主目录。`;
+      } else {
+        current = canonical;
+      }
+    } catch {
+      note = `无法读取“${requested}”，已回到用户主目录。`;
+    }
+  }
+  let entries: string[] = [];
+  let truncated = false;
+  try {
+    const all = (await readdir(current, { withFileTypes: true }))
+      .filter((entry) => entry.isDirectory() && !entry.name.startsWith("."))
+      .map((entry) => entry.name)
+      .sort((left, right) => left.localeCompare(right));
+    truncated = all.length > 500;
+    entries = all.slice(0, 500);
+  } catch {
+    note = note || "此目录无法读取。";
+  }
+  const parent = dirname(current);
+  const browse = (path: string) => `/agents/browse?${carryParams(url, { path })}`;
+  const choose = `/agents?${carryParams(url, { workspace: current })}`;
+  return shell("agents", config, url, `
+    <article class="card">
+      <h3>选择 Workspace 目录</h3>
+      ${note ? `<p class="muted">${html(note)}</p>` : ""}
+      <p>当前目录：<code>${html(current)}</code></p>
+      <p><a class="button" href="${html(choose)}">使用此目录</a> <a href="/agents">返回 Agent 工作区</a></p>
+      ${parent !== current ? `<p><a href="${html(browse(parent))}">↑ 上级目录</a></p>` : ""}
+      <ul class="links">${entries.map((name) => `<li><a href="${html(browse(join(current, name)))}">${html(name)}/</a></li>`).join("") || `<li class="muted">没有可进入的子目录</li>`}</ul>
+      ${truncated ? `<p class="muted">子目录过多，仅显示前 500 个。</p>` : ""}
+    </article>`);
 }
 
 async function groupsPage(config: ThreadFerryConfig, dependencies: AdminDependencies, token: string, url: URL): Promise<string> {
@@ -236,9 +301,14 @@ async function groupsPage(config: ThreadFerryConfig, dependencies: AdminDependen
       <article class="card" id="${html(id)}">
         <div class="row"><div><h3>${html(label)}</h3><code>${html(id)}</code></div><span class="badge ok">已配置</span></div>
         <form method="post" action="/groups/agent">${field(token)}<input type="hidden" name="groupId" value="${html(id)}">
-          <label>当前 AI 空间 <select name="agentId">${agentOptions(config, group.agent)}</select></label><button>切换</button>
+          <label>当前 Agent 工作区 <select name="agentId">${agentOptions(config, group.agent)}</select></label><button>切换</button>
         </form>
-        <h4>可使用用户</h4><ul>${users}</ul>
+        <form method="post" action="/groups/access">${field(token)}<input type="hidden" name="groupId" value="${html(id)}"><input type="hidden" name="allowAll" value="${group.allowAll ? "off" : "on"}">
+          <span class="badge${group.allowAll ? " ok" : ""}">${group.allowAll ? "全员可用" : "仅授权成员"}</span><button class="ghost">${group.allowAll ? "关闭全员可用" : "开启全员可用"}</button>
+        </form>
+        <h4>可使用用户</h4>
+        ${group.allowAll ? `<p class="muted">全员可用已开启，群内所有成员都可以使用；以下授权列表在关闭后生效。</p>` : ""}
+        <ul>${users}</ul>
         <form method="post" action="/groups/users/add">${field(token)}<input type="hidden" name="groupId" value="${html(id)}">
           <input name="user" aria-label="用户姓名、别名或 userid" placeholder="姓名、别名或 id:userid" maxlength="512" required><button>添加用户</button>
         </form>
@@ -266,6 +336,7 @@ export async function startAdminServer(
       try {
         if (url.pathname === "/") return send(response, 200, await overviewPage(config, dependencies, token, url));
         if (url.pathname === "/agents") return send(response, 200, await agentsPage(config, dependencies, token, url));
+        if (url.pathname === "/agents/browse") return send(response, 200, await browsePage(config, url));
         if (url.pathname === "/groups") return send(response, 200, await groupsPage(config, dependencies, token, url));
         return send(response, 404, "Not found");
       } catch {
@@ -294,19 +365,19 @@ export async function startAdminServer(
           latest.agents = addAgent(latest, agentId, { runtime, workspace, ...(model ? { model } : {}) }).agents;
         });
         target = "/agents";
-        message = `AI 空间 ${agentId} 已添加`;
+        message = `Agent 工作区 ${agentId} 已添加`;
       } else if (url.pathname === "/agents/remove") {
         const agentId = required(input, "agentId");
         await dependencies.updateConfig((latest) => {
-          if (!latest.agents[agentId]) throw new Error("AI 空间不存在");
+          if (!latest.agents[agentId]) throw new Error("Agent 工作区不存在");
           if (Object.values(latest.groups).some((group) => group.agent === agentId)) {
-            throw new Error("仍有群绑定此 AI 空间，请先切换或解绑这些群");
+            throw new Error("仍有群绑定此 Agent 工作区，请先切换或解绑这些群");
           }
-          if (Object.keys(latest.agents).length <= 1) throw new Error("至少保留一个 AI 空间");
+          if (Object.keys(latest.agents).length <= 1) throw new Error("至少保留一个 Agent 工作区");
           delete latest.agents[agentId];
         });
         target = "/agents";
-        message = `AI 空间 ${agentId} 已删除`;
+        message = `Agent 工作区 ${agentId} 已删除`;
       } else if (url.pathname === "/groups/bind") {
         const groupId = required(input, "groupId");
         const agentId = required(input, "agentId");
@@ -314,11 +385,23 @@ export async function startAdminServer(
         if (!(await dependencies.listGroups()).some((group) => group.id === groupId)) throw new Error("机器人当前不可见该群");
         await dependencies.updateConfig((latest) => {
           if (latest.groups[groupId]) throw new Error("该群已经配置");
-          if (!latest.agents[agentId]) throw new Error("AI 空间不存在");
+          if (!latest.agents[agentId]) throw new Error("Agent 工作区不存在");
           latest.groups[groupId] = { agent: agentId, allowUsers: [latest.ownerUser], context: { lookbackHours: 6, maxMessages: 80 } };
         });
         target = groupAnchor(groupId);
         message = "群已绑定并立即生效";
+      } else if (url.pathname === "/groups/access") {
+        const groupId = required(input, "groupId");
+        const allowAll = required(input, "allowAll");
+        if (allowAll !== "on" && allowAll !== "off") throw new Error("访问开关取值无效");
+        await dependencies.updateConfig((latest) => {
+          const group = latest.groups[groupId];
+          if (!group) throw new Error("群不存在");
+          if (allowAll === "on") group.allowAll = true;
+          else delete group.allowAll;
+        });
+        target = groupAnchor(groupId);
+        message = allowAll === "on" ? "已开启：群内所有成员都可以使用机器人" : "已关闭：恢复为仅授权成员可使用";
       } else if (url.pathname === "/groups/unbind") {
         const groupId = required(input, "groupId");
         await dependencies.updateConfig((latest) => {
@@ -326,16 +409,16 @@ export async function startAdminServer(
           delete latest.groups[groupId];
         });
         target = "/groups";
-        message = "群已解绑，该群的消息将不再触发 AI 空间";
+        message = "群已解绑，该群的消息将不再触发 Agent 工作区";
       } else if (url.pathname === "/groups/agent") {
         const groupId = required(input, "groupId");
         const agentId = required(input, "agentId");
         await dependencies.updateConfig((latest) => {
-          if (!latest.groups[groupId] || !latest.agents[agentId]) throw new Error("群或 AI 空间不存在");
+          if (!latest.groups[groupId] || !latest.agents[agentId]) throw new Error("群或 Agent 工作区不存在");
           latest.groups[groupId].agent = agentId;
         });
         target = groupAnchor(groupId);
-        message = "群 AI 空间已切换";
+        message = "群 Agent 工作区已切换";
       } else if (url.pathname === "/groups/users/add") {
         const groupId = required(input, "groupId");
         target = groupAnchor(groupId);

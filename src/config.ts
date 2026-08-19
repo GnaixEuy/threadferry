@@ -125,6 +125,7 @@ export function configText(config: ThreadFerryConfig): string {
   const groups = Object.fromEntries(Object.entries(config.groups).map(([id, group]) => [id, {
     agent: group.agent,
     allow_users: group.allowUsers,
+    ...(group.allowAll ? { allow_all: true } : {}),
   }]));
   return stringify({ version: 5, owner_user: config.ownerUser, agents, groups });
 }
@@ -197,9 +198,10 @@ export async function loadConfig(path: string): Promise<ThreadFerryConfig> {
   const groups: Record<string, GroupConfig> = {};
   for (const [groupId, value] of Object.entries(rawGroups)) {
     const group = object(value, `群 ${groupId}`);
-    const unsupportedGroupKeys = Object.keys(group).filter((key) => !["agent", "allow_users"].includes(key));
+    const unsupportedGroupKeys = Object.keys(group).filter((key) => !["agent", "allow_users", "allow_all"].includes(key));
     if (unsupportedGroupKeys.length > 0) throw new Error(`群 ${groupId} 包含不支持字段: ${unsupportedGroupKeys.join(", ")}`);
     if (typeof group.agent !== "string" || !agents[group.agent]) throw new Error(`群 ${groupId} 引用了不存在的 Agent`);
+    if (group.allow_all !== undefined && typeof group.allow_all !== "boolean") throw new Error(`群 ${groupId} 的 allow_all 必须是布尔值`);
     if (!Array.isArray(group.allow_users) || !group.allow_users.every((user) => typeof user === "string" && USER_ID.test(user))) {
       throw new Error(`群 ${groupId} 的 allow_users 必须是非空字符串数组`);
     }
@@ -209,6 +211,7 @@ export async function loadConfig(path: string): Promise<ThreadFerryConfig> {
     groups[groupId] = {
       agent: group.agent,
       allowUsers: [...new Set(group.allow_users as string[])],
+      ...(group.allow_all === true ? { allowAll: true } : {}),
       context: { lookbackHours: 6, maxMessages: 80 },
     };
   }

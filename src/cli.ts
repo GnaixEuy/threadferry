@@ -20,7 +20,7 @@ import type { GroupMessage, IncomingMention, RuntimeName, ThreadFerryConfig } fr
 import { findUpdate, installUpdate } from "./update.js";
 import { loadWecomCliCredentials } from "./wecom-credentials.js";
 
-const VERSION = "0.13.0";
+const VERSION = "0.14.0";
 const UPDATE_INTERVAL_MS = 6 * 60 * 60 * 1_000;
 const USAGE = `ThreadFerry ${VERSION}
 
@@ -571,6 +571,12 @@ async function start(configPath: string, mock: boolean, port: number): Promise<s
         const group = latest.groups[groupId];
         if (!group || !latest.agents[agentId]) throw new Error("指定群或 Agent 未配置");
         group.agent = agentId;
+      }),
+      updateGroupAccess: (groupId, allowAll) => updateConfig((latest) => {
+        const group = latest.groups[groupId];
+        if (!group) throw new Error("指定群未配置");
+        if (allowAll) group.allowAll = true;
+        else delete group.allowAll;
       }),
       bindGroup: (groupId, agentId) => updateConfig((latest) => {
         if (latest.groups[groupId] || !latest.agents[agentId]) throw new Error("指定群已配置或 Agent 不存在");
