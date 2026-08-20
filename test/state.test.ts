@@ -29,8 +29,8 @@ test("state durably recovers inbox and outbox without retaining completed conten
   const restarted = new ThreadFerryState(path);
   const recovered = await restarted.recoverPending();
   assert.equal(recovered.length, 1);
-  assert.equal(recovered[0]?.text, message.text);
-  assert.equal(recovered[0]?.time.toISOString(), message.time.toISOString());
+  assert.equal(recovered[0]?.message.text, message.text);
+  assert.equal(recovered[0]?.message.time.toISOString(), message.time.toISOString());
   assert.equal(await restarted.enqueue(message), false);
   assert.equal(await restarted.session(message.groupId, "/workspace"), "session-1");
 

@@ -34,12 +34,16 @@ interface StoredMention {
   quote?: QuoteMetadata;
   attachments?: AttachmentMetadata[];
   mentioned: true;
+  /** 当初受理这条消息的 Agent。同群多机器人时，恢复必须回到同一台。 */
+  agent?: string;
 }
 
 export interface PendingDelivery {
   id: string;
   groupId: string;
   content: string;
+  /** 该由哪台机器人补发。缺省表示旧记录，由调用方按群里唯一的 Agent 兜底。 */
+  agent?: string;
   attempts: number;
   createdAt: string;
   updatedAt: string;
@@ -71,8 +75,10 @@ const PHASES = new Set<FailurePhase>(["ack", "history", "runtime", "freshness", 
 const STATE_FIELDS = new Set(["version", "turns", "sessions", "inbox", "outbox"]);
 const TURN_FIELDS = new Set(["id", "group", "status", "receivedAt", "updatedAt", "errorId", "failurePhase"]);
 const SESSION_FIELDS = new Set(["group", "workspace", "sessionId", "updatedAt"]);
-const INBOX_FIELDS = new Set(["msgId", "groupId", "senderId", "senderName", "time", "text", "quote", "attachments", "mentioned"]);
-const OUTBOX_FIELDS = new Set(["id", "groupId", "content", "attempts", "createdAt", "updatedAt", "errorId"]);
+// agent 是可选的：一个群可以同时挂多台机器人，重启后补发必须知道当初是哪一台，
+// 否则会用另一台机器人的身份把回复发出去。旧状态文件没这个字段，按缺省处理。
+const INBOX_FIELDS = new Set(["msgId", "groupId", "senderId", "senderName", "time", "text", "quote", "attachments", "mentioned", "agent"]);
+const OUTBOX_FIELDS = new Set(["id", "groupId", "content", "attempts", "createdAt", "updatedAt", "errorId", "agent"]);
 
 function emptyState(): StateDocument {
   return { version: 3, turns: [], sessions: [], inbox: [], outbox: [] };
@@ -80,6 +86,13 @@ function emptyState(): StateDocument {
 
 function key(value: string): string {
   return createHash("sha256").update(value).digest("hex");
+}
+
+// 群里同时 @ 两台机器人时，企业微信给每台各发一次回调，**msgId 是同一条消息的**。
+// 所以 turn 和待发送记录的身份必须带上 Agent，否则第二台会被判成「已经处理过」而不回话，
+// 待补发的回复也会互相覆盖。不带 Agent 时保持原样，兼容 0.16.0 写下的记录。
+function turnId(msgId: string, agent?: string): string {
+  return key(agent ? `${agent}\u0000${msgId}` : msgId);
 }
 
 function validString(value: unknown, max: number): value is string {
@@ -120,6 +133,7 @@ function validMention(value: unknown): value is StoredMention {
     && typeof mention.text === "string" && mention.text.length <= MAX_MESSAGE_CHARS
     && mention.mentioned === true
     && (mention.quote === undefined || validQuote(mention.quote))
+    && (mention.agent === undefined || validString(mention.agent, 128))
     && (mention.attachments === undefined || validAttachments(mention.attachments));
 }
 
@@ -164,14 +178,15 @@ function validateState(value: unknown): StateDocument {
   return state as StateDocument;
 }
 
-function storeMention(message: IncomingMention): StoredMention {
-  const stored: StoredMention = { ...message, time: message.time.toISOString(), mentioned: true };
+function storeMention(message: IncomingMention, agent?: string): StoredMention {
+  const stored: StoredMention = { ...message, time: message.time.toISOString(), mentioned: true, ...(agent ? { agent } : {}) };
   if (!validMention(stored)) throw new Error("企业微信消息结构超过安全上限");
   return stored;
 }
 
 function restoreMention(message: StoredMention): IncomingMention {
-  return { ...structuredClone(message), time: new Date(message.time) };
+  const { agent, ...rest } = structuredClone(message);
+  return { ...rest, time: new Date(message.time) };
 }
 
 // Session 的第二维身份。两个机器人可能同在一个群，只按 groupId 定位会互相清掉对方的
@@ -295,11 +310,11 @@ export class ThreadFerryState {
     }
   }
 
-  async enqueue(message: IncomingMention): Promise<boolean> {
+  async enqueue(message: IncomingMention, agent?: string): Promise<boolean> {
     return this.exclusive(async () => {
-      const stored = storeMention(message);
+      const stored = storeMention(message, agent);
       await this.load();
-      const id = key(message.msgId);
+      const id = turnId(message.msgId, agent);
       if (this.data.turns.some((turn) => turn.id === id)) return false;
       if (this.data.inbox.length >= MAX_PENDING) throw new Error("ThreadFerry 待处理队列已满");
       if (this.data.outbox.length >= MAX_PENDING) throw new Error("ThreadFerry 待发送队列已满，请先恢复消息投递");
@@ -316,11 +331,11 @@ export class ThreadFerryState {
     });
   }
 
-  async claimCommand(msgId: string, scopeId: string): Promise<boolean> {
+  async claimCommand(msgId: string, scopeId: string, agent?: string): Promise<boolean> {
     return this.exclusive(async () => {
       if (!validString(msgId, 512) || !validString(scopeId, 512)) throw new Error("命令消息标识无效");
       await this.load();
-      const id = key(msgId);
+      const id = turnId(msgId, agent);
       if (this.data.turns.some((turn) => turn.id === id)) return false;
       while (this.data.turns.length >= MAX_TURNS) {
         const removable = this.data.turns.findIndex((turn) => turn.status !== "queued" && turn.status !== "running");
@@ -334,10 +349,10 @@ export class ThreadFerryState {
     });
   }
 
-  async markRunning(msgId: string): Promise<void> {
+  async markRunning(msgId: string, agent?: string): Promise<void> {
     await this.exclusive(async () => {
       await this.load();
-      const turn = this.data.turns.find((candidate) => candidate.id === key(msgId));
+      const turn = this.findTurn(msgId, agent);
       if (!turn) throw new Error("ThreadFerry 状态缺少当前消息");
       turn.status = "running";
       turn.updatedAt = new Date().toISOString();
@@ -345,19 +360,37 @@ export class ThreadFerryState {
     });
   }
 
-  async finish(msgId: string, status: "failed", failure: { errorId: string; phase: FailurePhase }): Promise<void> {
+  async finish(
+    msgId: string,
+    status: "failed",
+    failure: { errorId: string; phase: FailurePhase },
+    agent?: string,
+  ): Promise<void> {
     await this.exclusive(async () => {
       await this.load();
-      const id = key(msgId);
-      const turn = this.data.turns.find((candidate) => candidate.id === id);
+      const turn = this.findTurn(msgId, agent);
       if (!turn) throw new Error("ThreadFerry 状态缺少当前消息");
       turn.status = status;
       turn.updatedAt = new Date().toISOString();
       turn.errorId = failure.errorId;
       turn.failurePhase = failure.phase;
-      this.data.inbox = this.data.inbox.filter((message) => key(message.msgId) !== id);
+      this.dropInbox(msgId, agent);
       await this.save();
     });
+  }
+
+  // 0.16.0 写下的 turn 没有 Agent 维度，升级后仍要能收尾，所以找不到就退回不带 Agent 的旧身份。
+  private findTurn(msgId: string, agent?: string): TurnRecord | undefined {
+    const scoped = this.data.turns.find((turn) => turn.id === turnId(msgId, agent));
+    if (scoped || !agent) return scoped;
+    return this.data.turns.find((turn) => turn.id === key(msgId));
+  }
+
+  // 同一条 msgId 在收件箱里可能有多条（一台机器人一条），只清掉属于自己的那条。
+  private dropInbox(msgId: string, agent?: string): void {
+    this.data.inbox = this.data.inbox.filter((message) => message.msgId !== msgId
+      ? true
+      : !(message.agent === agent || message.agent === undefined || agent === undefined));
   }
 
   async finishWithDelivery(
@@ -366,15 +399,17 @@ export class ThreadFerryState {
     status: "handled" | "stale" | "failed",
     content: string,
     failure?: { errorId: string; phase: FailurePhase },
+    agent?: string,
   ): Promise<string> {
     return this.exclusive(async () => {
       if (!validString(content, MAX_MESSAGE_CHARS) || Buffer.byteLength(content) > MAX_REPLY_BYTES) {
         throw new Error("回复超过安全上限");
       }
       await this.load();
-      const id = key(msgId);
-      const turn = this.data.turns.find((candidate) => candidate.id === id);
+      const turn = this.findTurn(msgId, agent);
       if (!turn || turn.group !== key(groupId)) throw new Error("ThreadFerry 状态缺少当前消息");
+      // 待发送记录也按 Agent 分开：两台机器人对同一条消息各有一份回复，不能互相覆盖。
+      const id = turn.id;
       if (!this.data.outbox.some((delivery) => delivery.id === id) && this.data.outbox.length >= MAX_PENDING) {
         throw new Error("ThreadFerry 待发送队列已满");
       }
@@ -385,8 +420,8 @@ export class ThreadFerryState {
         turn.errorId = failure.errorId;
         turn.failurePhase = failure.phase;
       }
-      this.data.inbox = this.data.inbox.filter((message) => key(message.msgId) !== id);
-      const delivery: PendingDelivery = { id, groupId, content, attempts: 0, createdAt: now, updatedAt: now };
+      this.dropInbox(msgId, agent);
+      const delivery: PendingDelivery = { id, groupId, content, attempts: 0, createdAt: now, updatedAt: now, ...(agent ? { agent } : {}) };
       const current = this.data.outbox.find((item) => item.id === id);
       if (current) Object.assign(current, delivery);
       else this.data.outbox.push(delivery);
@@ -418,7 +453,7 @@ export class ThreadFerryState {
     });
   }
 
-  async recoverPending(): Promise<IncomingMention[]> {
+  async recoverPending(): Promise<Array<{ message: IncomingMention; agent?: string }>> {
     return this.exclusive(async () => {
       await this.load();
       let changed = false;
@@ -431,7 +466,10 @@ export class ThreadFerryState {
         }
       }
       if (changed) await this.save();
-      return this.data.inbox.map(restoreMention);
+      return this.data.inbox.map((message) => ({
+        message: restoreMention(message),
+        ...(message.agent ? { agent: message.agent } : {}),
+      }));
     });
   }
 

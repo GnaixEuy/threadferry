@@ -3,7 +3,7 @@ import { chmod, lstat, mkdir, readFile, realpath, rename, rm, stat, writeFile } 
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { parse, stringify } from "yaml";
 import { validateAgentId } from "./bots.js";
-import type { AgentConfig, AgentDefinition, GroupConfig, RuntimeName, ThreadFerryConfig } from "./types.js";
+import type { AgentConfig, AgentDefinition, AgentView, GroupBinding, GroupConfig, RuntimeName, ThreadFerryConfig } from "./types.js";
 
 const USER_ID = /^[A-Za-z0-9_@.-]{1,512}$/;
 const RUNTIMES = new Set<RuntimeName>(["codex", "pi"]);
@@ -68,9 +68,6 @@ export function setupConfig(
   if (!USER_ID.test(userId)) throw new Error("企业微信回调 userid 无效");
   validateAgent(agentId, agent);
   const existing = current?.groups[groupId];
-  if (existing && existing.agent !== agentId) {
-    throw new Error("该群已绑定其他 Agent；请通过 Owner 私聊命令切换，不会自动改写");
-  }
   const configuredAgent = current?.agents[agentId];
   if (configuredAgent && (configuredAgent.workspace !== agent.workspace
     || configuredAgent.runtime !== agent.runtime || configuredAgent.model !== agent.model)) {
@@ -84,10 +81,15 @@ export function setupConfig(
     groups: {
       ...(current?.groups ?? {}),
       [groupId]: {
-        agent: agentId,
-        allowUsers: [...new Set([...(existing?.allowUsers ?? []), ownerUser])],
-        ...(existing?.allowAll ? { allowAll: true } : {}),
-        context: { lookbackHours: 6, maxMessages: 80 },
+        // 群里已有的其他 Agent 原样保留：一个群可以同时启用多台机器人。
+        agents: {
+          ...(existing?.agents ?? {}),
+          [agentId]: {
+            allowUsers: [...new Set([...(existing?.agents[agentId]?.allowUsers ?? []), ownerUser])],
+            ...(existing?.agents[agentId]?.allowAll ? { allowAll: true } : {}),
+          },
+        },
+        context: existing?.context ?? { lookbackHours: 6, maxMessages: 80 },
       },
     },
     security: { requireMention: true, readOnly: true },
@@ -129,20 +131,32 @@ export function adoptOwner(config: ThreadFerryConfig, agentId: string, userId: s
     // 顶层 ownerUser 是过渡期字段；只有主 Agent 换 Owner 时才跟着变。
     ...(config.ownerUser === previousOwner ? { ownerUser: userId } : {}),
     agents: { ...config.agents, [agentId]: { ...agent, ownerUser: userId } },
-    groups: Object.fromEntries(Object.entries(config.groups).map(([id, group]) => [id, group.agent !== agentId ? group : {
-      ...group,
-      allowUsers: [...new Set([...group.allowUsers.map((user) => user === previousOwner ? userId : user), userId])],
-    }])),
+    groups: Object.fromEntries(Object.entries(config.groups).map(([id, group]) => {
+      const access = group.agents[agentId];
+      if (!access) return [id, group];
+      return [id, {
+        ...group,
+        agents: {
+          ...group.agents,
+          [agentId]: {
+            ...access,
+            allowUsers: [...new Set([...access.allowUsers.map((user) => user === previousOwner ? userId : user), userId])],
+          },
+        },
+      }];
+    })),
   };
 }
 
 export function configText(config: ThreadFerryConfig): string {
   const groupsByAgent = new Map<string, Record<string, unknown>>();
   for (const [groupId, group] of Object.entries(config.groups)) {
-    if (!config.agents[group.agent]) throw new Error(`群 ${groupId} 引用了不存在的 Agent ${group.agent}`);
-    const bucket = groupsByAgent.get(group.agent) ?? {};
-    bucket[groupId] = { allow_users: group.allowUsers, ...(group.allowAll ? { allow_all: true } : {}) };
-    groupsByAgent.set(group.agent, bucket);
+    for (const [agentId, access] of Object.entries(group.agents)) {
+      if (!config.agents[agentId]) throw new Error(`群 ${groupId} 引用了不存在的 Agent ${agentId}`);
+      const bucket = groupsByAgent.get(agentId) ?? {};
+      bucket[groupId] = { allow_users: access.allowUsers, ...(access.allowAll ? { allow_all: true } : {}) };
+      groupsByAgent.set(agentId, bucket);
+    }
   }
   // v6：Agent 是隔离单元，owner 和群都挂在 Agent 上。运行时暂时仍是单机器人，
   // 因此每个 Agent 写入同一个 owner；loadConfig 会强制这个不变式（见 readV6Document）。
@@ -169,21 +183,37 @@ export function addAgent(config: ThreadFerryConfig, agentId: string, agent: Agen
 // 而单 Agent 视图正好是那个形状，所以运行时可以每个 Agent 起一个 app 实例而不改 app.ts。
 // 副作用红利：processDirect 里取「第一个 Agent」由构造保证正确；serial/groupTails/controllers
 // 都在各自闭包里，天然按 Agent 隔离。
-export function agentView(config: ThreadFerryConfig, agentId: string): ThreadFerryConfig {
+export function agentView(config: ThreadFerryConfig, agentId: string): AgentView {
   const agent = config.agents[agentId];
   if (!agent) throw new Error(`Agent ${agentId} 未配置`);
   return {
     version: 6,
     ownerUser: agent.ownerUser,
     agents: { [agentId]: agent },
-    groups: Object.fromEntries(Object.entries(config.groups).filter(([, group]) => group.agent === agentId)),
+    groups: viewGroups(config, agentId),
     security: config.security,
   };
 }
 
+// 只挑出这个 Agent 参与的群，并摊平成「一个群一份授权」——正是 app.ts 一直在处理的形状。
+function viewGroups(config: ThreadFerryConfig, agentId: string): Record<string, GroupConfig> {
+  const groups: Record<string, GroupConfig> = {};
+  for (const [groupId, group] of Object.entries(config.groups)) {
+    const access = group.agents[agentId];
+    if (!access) continue;
+    groups[groupId] = {
+      agent: agentId,
+      allowUsers: access.allowUsers,
+      ...(access.allowAll ? { allowAll: true } : {}),
+      context: group.context,
+    };
+  }
+  return groups;
+}
+
 // 配置热更新后就地刷新视图，让已经跑起来的 app 立刻看到新配置（与旧的单 app 行为一致）。
 // Agent 被删掉时视图清空：该 app 随即拒绝所有群消息，私聊回「当前没有可用 Agent」。
-export function refreshAgentView(view: ThreadFerryConfig, latest: ThreadFerryConfig, agentId: string): void {
+export function refreshAgentView(view: AgentView, latest: ThreadFerryConfig, agentId: string): void {
   const agent = latest.agents[agentId];
   if (!agent) {
     view.agents = {};
@@ -192,7 +222,7 @@ export function refreshAgentView(view: ThreadFerryConfig, latest: ThreadFerryCon
   }
   view.ownerUser = agent.ownerUser;
   view.agents = { [agentId]: agent };
-  view.groups = Object.fromEntries(Object.entries(latest.groups).filter(([, group]) => group.agent === agentId));
+  view.groups = viewGroups(latest, agentId);
 }
 
 export async function saveConfig(path: string, config: ThreadFerryConfig): Promise<void> {
@@ -223,8 +253,8 @@ export async function saveConfig(path: string, config: ThreadFerryConfig): Promi
 // 之后由 loadConfig 做语义校验（workspace 解析、userid 格式、allow_users 不变式）。
 // 内存结构仍是扁平的（顶层 ownerUser + 带 agent 字段的 groups），Phase 1b 才会改。
 interface FlatAgentRaw { runtime: unknown; workspace: unknown; owner_user: unknown; model?: unknown; config_dir?: unknown }
-interface FlatGroupRaw { agent: string; allow_users: unknown; allow_all?: unknown }
-interface FlatDocument { agents: Record<string, FlatAgentRaw>; groups: Record<string, FlatGroupRaw> }
+interface FlatGroupRaw { id: string; agent: string; allow_users: unknown; allow_all?: unknown }
+interface FlatDocument { agents: Record<string, FlatAgentRaw>; groups: FlatGroupRaw[] }
 
 function rejectExtraKeys(actual: Record<string, unknown>, allowed: string[], label: string): void {
   const extra = Object.keys(actual).filter((key) => !allowed.includes(key));
@@ -234,7 +264,8 @@ function rejectExtraKeys(actual: Record<string, unknown>, allowed: string[], lab
 function readV6Document(root: Record<string, unknown>): FlatDocument {
   rejectExtraKeys(root, ["version", "agents"], "配置");
   const agents: Record<string, FlatAgentRaw> = {};
-  const groups: Record<string, FlatGroupRaw> = {};
+  // 一个群可以在多个 Agent 下各出现一次（群里有几台机器人就几次），所以这里是列表不是字典。
+  const groups: FlatGroupRaw[] = [];
   for (const [agentId, value] of Object.entries(object(root.agents, "agents"))) {
     const agent = object(value, `Agent ${agentId}`);
     rejectExtraKeys(agent, ["runtime", "workspace", "model", "owner_user", "config_dir", "groups"], `Agent ${agentId} `);
@@ -251,13 +282,12 @@ function readV6Document(root: Record<string, unknown>): FlatDocument {
     for (const [groupId, groupValue] of Object.entries(object(agent.groups ?? {}, `Agent ${agentId} 的 groups`))) {
       const group = object(groupValue, `群 ${groupId}`);
       rejectExtraKeys(group, ["allow_users", "allow_all"], `群 ${groupId} `);
-      const holder = groups[groupId]?.agent;
-      if (holder) throw new Error(`群 ${groupId} 同时挂在 Agent ${holder} 和 ${agentId} 下；一个群只能归属一个 Agent`);
-      groups[groupId] = {
+      groups.push({
+        id: groupId,
         agent: agentId,
         allow_users: group.allow_users,
         ...(group.allow_all !== undefined ? { allow_all: group.allow_all } : {}),
-      };
+      });
     }
   }
   return { agents, groups };
@@ -307,23 +337,25 @@ export async function loadConfig(path: string): Promise<ThreadFerryConfig> {
     agents[agentId] = configured;
   }
 
-  const groups: Record<string, GroupConfig> = {};
-  for (const [groupId, group] of Object.entries(flat.groups)) {
+  const groups: Record<string, GroupBinding> = {};
+  for (const group of flat.groups) {
+    const groupId = group.id;
+    const label = `群 ${groupId}（Agent ${group.agent}）`;
     if (!agents[group.agent]) throw new Error(`群 ${groupId} 引用了不存在的 Agent`);
-    if (group.allow_all !== undefined && typeof group.allow_all !== "boolean") throw new Error(`群 ${groupId} 的 allow_all 必须是布尔值`);
+    if (group.allow_all !== undefined && typeof group.allow_all !== "boolean") throw new Error(`${label} 的 allow_all 必须是布尔值`);
     if (!Array.isArray(group.allow_users) || !group.allow_users.every((user) => typeof user === "string" && USER_ID.test(user))) {
-      throw new Error(`群 ${groupId} 的 allow_users 必须是非空字符串数组`);
+      throw new Error(`${label} 的 allow_users 必须是非空字符串数组`);
     }
-    if (group.allow_users.length === 0) throw new Error(`群 ${groupId} 的 allow_users 不能为空`);
-    if (group.allow_users.length > 256) throw new Error(`群 ${groupId} 的 allow_users 超过 256 人上限`);
+    if (group.allow_users.length === 0) throw new Error(`${label} 的 allow_users 不能为空`);
+    if (group.allow_users.length > 256) throw new Error(`${label} 的 allow_users 超过 256 人上限`);
     const groupOwner = agents[group.agent]!.ownerUser;
-    if (!group.allow_users.includes(groupOwner)) throw new Error(`群 ${groupId} 的 allow_users 必须包含所属 Agent 的 owner_user`);
-    groups[groupId] = {
-      agent: group.agent,
+    if (!group.allow_users.includes(groupOwner)) throw new Error(`${label} 的 allow_users 必须包含该 Agent 的 owner_user`);
+    const binding = groups[groupId] ?? { agents: {}, context: { lookbackHours: 6, maxMessages: 80 } };
+    binding.agents[group.agent] = {
       allowUsers: [...new Set(group.allow_users as string[])],
       ...(group.allow_all === true ? { allowAll: true } : {}),
-      context: { lookbackHours: 6, maxMessages: 80 },
     };
+    groups[groupId] = binding;
   }
 
   const primary = agents.default ? "default" : Object.keys(agents)[0]!;

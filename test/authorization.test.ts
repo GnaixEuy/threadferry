@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { authorize } from "../src/authorization.js";
-import type { IncomingMention, ThreadFerryConfig } from "../src/types.js";
+import type { AgentView, IncomingMention } from "../src/types.js";
 
-const config: ThreadFerryConfig = {
+const config: AgentView = {
   version: 6,
   ownerUser: "user_allowed",
   agents: { default: { workspace: process.cwd(), runtime: "codex", ownerUser: "user_allowed" } },
@@ -34,7 +34,7 @@ test("authorization requires configured group, mention, and allowlisted user", (
 });
 
 test("authorization allows any mentioned group member when allowAll is enabled", () => {
-  const openConfig: ThreadFerryConfig = {
+  const openConfig: AgentView = {
     ...config,
     groups: { group_allowed: { ...config.groups.group_allowed!, allowAll: true } },
   };

@@ -57,6 +57,25 @@ export interface AgentConfig {
 /** 新建 Agent 时还不知道它自己机器人下的 Owner，由调用方补齐（配对时用配对者，新增时继承）。 */
 export type AgentDefinition = Omit<AgentConfig, "ownerUser">;
 
+/** 一个 Agent 在某个群里的授权。群里有几台 ThreadFerry 机器人，这个群下面就有几份。 */
+export interface GroupAccess {
+  allowUsers: string[];
+  allowAll?: boolean;
+}
+
+/**
+ * 全量配置里的一个群。授权按 Agent 分开记——同一个群里可以同时启用多台机器人，
+ * @谁谁回答，各自用各自的 Workspace、Session 和授权名单。context 是取历史的窗口，整个群共用。
+ */
+export interface GroupBinding {
+  agents: Record<string, GroupAccess>;
+  context: {
+    lookbackHours: number;
+    maxMessages: number;
+  };
+}
+
+/** 单 Agent 运行视图里的群：一个群只对应它自己那一份授权。 */
 export interface GroupConfig {
   agent: string;
   allowUsers: string[];
@@ -69,6 +88,21 @@ export interface GroupConfig {
 
 export interface ThreadFerryConfig {
   /** 磁盘格式版本。只接受 v6。 */
+  version: 6;
+  ownerUser: string;
+  agents: Record<string, AgentConfig>;
+  groups: Record<string, GroupBinding>;
+  security: {
+    requireMention: true;
+    readOnly: true;
+  };
+}
+
+/**
+ * 运行时视图：只含一个 Agent 和它在各群里的那份授权。`createApp` 消费的是这个形状，
+ * 所以「一个群挂多个 Agent」对 app.ts 完全透明——每个 app 实例眼里群仍然只归自己。
+ */
+export interface AgentView {
   version: 6;
   ownerUser: string;
   agents: Record<string, AgentConfig>;

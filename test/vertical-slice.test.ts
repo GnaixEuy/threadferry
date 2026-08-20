@@ -4,22 +4,33 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { createApp } from "../src/app.js";
-import { listWecomGroups, searchWecomUsers, sendWecomReply } from "../src/channels/wecom.js";
-import { agentView, loadConfig, onboardingDefaults, pairConfig, refreshAgentView, resolveWorkspace, saveConfig, setupConfig } from "../src/config.js";
+import { listWecomGroups, searchWecomUsers, sendWecomReply, wecomFailureReason } from "../src/channels/wecom.js";
+import { addAgent, agentView, loadConfig, onboardingDefaults, pairConfig, refreshAgentView, resolveWorkspace, saveConfig, setupConfig } from "../src/config.js";
 import { fetchWecomHistory } from "../src/history/wecom-cli.js";
 import { CommandExecutionError, runCommand } from "../src/process.js";
 import { runCodex } from "../src/runtimes/codex.js";
 import { allowedReadPath } from "../src/runtimes/pi-readonly-extension.js";
 import { runPi } from "../src/runtimes/pi.js";
 import { ThreadFerryState } from "../src/state.js";
-import type { CommandRunner, GroupMessage, IncomingMention, ThreadFerryConfig } from "../src/types.js";
+import type { AgentView, CommandRunner, GroupMessage, IncomingMention, ThreadFerryConfig } from "../src/types.js";
 
-function testConfig(workspace = "/workspace", ownerUser = "user", groupId = "group"): ThreadFerryConfig {
+function testConfig(workspace = "/workspace", ownerUser = "user", groupId = "group"): AgentView {
   return {
     version: 6,
     ownerUser,
     agents: { default: { workspace, runtime: "codex", ownerUser } },
     groups: { [groupId]: { agent: "default", allowUsers: [ownerUser], context: { lookbackHours: 6, maxMessages: 80 } } },
+    security: { requireMention: true, readOnly: true },
+  };
+}
+
+// 全量配置形状：群按 Agent 记授权，一个群可以同时挂多台机器人。
+function fullConfig(workspace = "/workspace", ownerUser = "user", groupId = "group"): ThreadFerryConfig {
+  return {
+    version: 6,
+    ownerUser,
+    agents: { default: { workspace, runtime: "codex", ownerUser } },
+    groups: { [groupId]: { agents: { default: { allowUsers: [ownerUser] } }, context: { lookbackHours: 6, maxMessages: 80 } } },
     security: { requireMention: true, readOnly: true },
   };
 }
@@ -170,7 +181,7 @@ test("robot owner manages per-group users in direct chat", async () => {
   assert.match(replies.at(-1) ?? "", /已绑定到我/);
   // 已绑定的群不能重复绑定。
   assert.equal(await direct("owner", "threadferry bind 未配置群"), "command");
-  assert.match(replies.at(-1) ?? "", /已经配置/);
+  assert.match(replies.at(-1) ?? "", /已经绑给我了/);
   // 机器人看不见的群要说清楚，而不是含糊报错。
   assert.equal(await direct("owner", "threadferry bind 不存在的群"), "command");
   assert.match(replies.at(-1) ?? "", /我看不到群/);
@@ -329,10 +340,95 @@ test("owner toggles all-member access in direct chat", async () => {
   assert.doesNotMatch(replies.at(-1) ?? "", /全员可用/);
 });
 
-test("wecom group session listing uses the official message command", async () => {
-  let received: { command: string; args: string[] } | undefined;
+test("both bots answer when one @ message mentions them together", async (t) => {
+  // 群里同时 @ 两台机器人时，企业微信给每台各发一次回调，msgId 是同一条消息的。
+  // 「已处理」的判定必须带上 Agent，否则第二台会被当成重复消息丢掉——用户看到的就是有一台不回话。
+  const root = await mkdtemp(join(tmpdir(), "threadferry-both-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const workspace = await realpath(root);
+  const state = new ThreadFerryState(join(root, "state.json"));
+  const config: ThreadFerryConfig = {
+    version: 6,
+    ownerUser: "owner",
+    agents: {
+      "叶翔": { workspace, runtime: "codex", ownerUser: "owner" },
+      "悦翔": { workspace, runtime: "pi", ownerUser: "owner" },
+    },
+    groups: {
+      group: {
+        agents: { "叶翔": { allowUsers: ["owner"] }, "悦翔": { allowUsers: ["owner"] } },
+        context: { lookbackHours: 6, maxMessages: 80 },
+      },
+    },
+    security: { requireMention: true, readOnly: true },
+  };
+  const replies: Array<{ agentId: string; text: string }> = [];
+  const appFor = (agentId: string) => createApp(agentView(config, agentId), {
+    history: async () => [],
+    runtime: async ({ runtime }) => ({ text: `${runtime} 的回答`, sessionId: `${runtime}-session` }),
+  }, state);
+  const mention: IncomingMention = {
+    msgId: "shared-msg-1",
+    groupId: "group",
+    senderId: "owner",
+    time: new Date(),
+    text: "@叶翔 @悦翔 你们好",
+    mentioned: true,
+  };
+
+  const statuses = await Promise.all(["叶翔", "悦翔"].map(async (agentId) => appFor(agentId).handle(
+    { ...mention },
+    async (content, finish = true) => { if (finish) replies.push({ agentId, text: content }); },
+  )));
+  assert.deepEqual(statuses, ["handled", "handled"]);
+  assert.deepEqual(replies.map((reply) => reply.agentId).sort(), ["叶翔", "悦翔"]);
+  assert.deepEqual(replies.map((reply) => reply.text).sort(), ["codex 的回答", "pi 的回答"]);
+
+  // 两台机器人各留一条 turn，各自完成，互不覆盖。
+  const snapshot = await state.snapshot();
+  assert.equal(snapshot.turns.filter((turn) => turn.status === "handled").length, 2);
+  assert.equal(snapshot.outbox.length, 0);
+  assert.equal(snapshot.inbox.length, 0);
+
+  // 同一台机器人重复收到同一条消息仍然算重复，不会答两次。
+  assert.equal(await appFor("叶翔").handle({ ...mention }, async () => undefined), "duplicate");
+
+  // 群命令同理：@ 两台机器人发一条 threadferry 命令，两台都要认。
+  const command: IncomingMention = { ...mention, msgId: "shared-cmd-1", text: "@叶翔 @悦翔 threadferry help" };
+  const commandStatuses = await Promise.all(["叶翔", "悦翔"].map((agentId) =>
+    appFor(agentId).handle({ ...command }, async () => undefined)));
+  assert.deepEqual(commandStatuses, ["command", "command"]);
+});
+
+test("group discovery merges messaged groups with the bot's own sessions", async () => {
+  // 拉机器人进群不会产生机器人会话，所以群只能从「有消息的群会话」里发现；
+  // 机器人会话只用来给已经互动过的群盖「机器人已在群」的章。
+  const calls: string[][] = [];
+  const now = new Date("2026-08-19T18:00:00");
   const groups = await listWecomGroups(async (command, args) => {
-    received = { command, args };
+    assert.equal(command, "wecom-cli");
+    calls.push(args);
+    if (args[0] === "chat") {
+      const request = JSON.parse(args[4]!) as { begin_time: string; end_time: string; cursor?: string };
+      assert.equal(request.end_time, "2026-08-19 18:00:00");
+      assert.equal(request.begin_time, "2026-08-12 18:01:00");
+      // 翻页是时间切片，同一个群会重复出现，必须去重。
+      return request.cursor
+        ? { stdout: JSON.stringify({ chats: [{ chat_id: "group-1", chat_name: "月相工作室" }], has_more: false }), stderr: "" }
+        : {
+          stdout: JSON.stringify({
+            chats: [
+              { chat_id: "group-1", chat_name: "月相工作室" },
+              { chat_id: "group-2", chat_name: "新群" },
+              // 私聊不能混进待绑定群：私聊靠 Owner 配对，不走群绑定。
+              { chat_id: "user-1", chat_name: "苏粤翔", chat_type: "single" },
+            ],
+            has_more: true,
+            next_cursor: "page-2",
+          }),
+          stderr: "",
+        };
+    }
     return {
       stdout: JSON.stringify({
         sessions: [
@@ -342,12 +438,45 @@ test("wecom group session listing uses the official message command", async () =
       }),
       stderr: "",
     };
+  }, now);
+  assert.deepEqual(groups, [
+    { id: "group-1", name: "月相工作室", hasBotSession: true },
+    { id: "group-2", name: "新群" },
+  ]);
+  assert.deepEqual(calls.filter((args) => args[0] === "message")[0], ["message", "aibot", "sessions", "list", "--json", "{}"]);
+  assert.equal(calls.filter((args) => args[0] === "chat").length, 2);
+});
+
+test("group discovery survives one source failing but not both", async () => {
+  const onlySessions = await listWecomGroups(async (_command, args) => args[0] === "chat"
+    ? { stdout: JSON.stringify({ errcode: 853006 }), stderr: "" }
+    : { stdout: JSON.stringify({ sessions: [{ chat_id: "group-1", chat_type: "group" }] }), stderr: "" });
+  assert.deepEqual(onlySessions, [{ id: "group-1", hasBotSession: true }]);
+
+  const onlyMessaged = await listWecomGroups(async (_command, args) => args[0] === "chat"
+    ? { stdout: JSON.stringify({ chats: [{ chat_id: "group-2", chat_name: "新群" }], has_more: false }), stderr: "" }
+    : { stdout: "not json", stderr: "" });
+  assert.deepEqual(onlyMessaged, [{ id: "group-2", name: "新群" }]);
+
+  await assert.rejects(
+    listWecomGroups(async () => ({ stdout: JSON.stringify({ errcode: 853006 }), stderr: "" })),
+    /853006/,
+  );
+});
+
+test("a failed group lookup reports the reason wecom-cli printed, not just the exit code", async () => {
+  const stderr = JSON.stringify({
+    error: { type: "UnknownError", code: 893999, message: "AuthError: 该请求需要授权，请先运行 `wecom-cli auth init` 登录 [code=893201]" },
   });
-  assert.deepEqual(received, {
-    command: "wecom-cli",
-    args: ["message", "aibot", "sessions", "list", "--json", "{}"],
-  });
-  assert.deepEqual(groups, [{ id: "group-1", name: "月相工作室" }]);
+  // wecom-cli 把结构化错误打在 stdout 上，退出码才是 1——只读 stderr 会永远只看到「退出码 1」。
+  const failure = new CommandExecutionError("wecom-cli", 1, stderr, "");
+  assert.equal(failure.message, "wecom-cli 执行失败（退出码 1）");
+  assert.match(wecomFailureReason(failure), /该请求需要授权/);
+  assert.match(wecomFailureReason(new CommandExecutionError("wecom-cli", 1, "", stderr)), /该请求需要授权/);
+  // 非 JSON 输出退回第一行；什么都没有时退回原始 message。
+  assert.equal(wecomFailureReason(new CommandExecutionError("wecom-cli", 1, "boom\nmore", "")), "boom");
+  assert.equal(wecomFailureReason(new CommandExecutionError("wecom-cli", 1, "  ", "  ")), "wecom-cli 执行失败（退出码 1）");
+  assert.equal(wecomFailureReason("not an error"), "企业微信查询失败");
 });
 
 test("wecom contact search uses names without shell interpolation", async () => {
@@ -387,38 +516,69 @@ test("workspace paths cannot be relative or escape through a symlink", async (t)
   assert.equal(compact.agents.default?.runtime, "codex");
   assert.equal(compact.ownerUser, "user");
   assert.deepEqual(compact.groups.group?.context, { lookbackHours: 6, maxMessages: 80 });
-  assert.deepEqual(compact.groups.group?.allowUsers, ["user"]);
+  assert.deepEqual(compact.groups.group?.agents.default?.allowUsers, ["user"]);
 
   const mergedPath = join(root, "merged.yaml");
   await writeFile(mergedPath, setupConfig("group", "default", defaultAgent, "user", compact));
   const merged = await loadConfig(mergedPath);
-  assert.deepEqual(merged.groups.group?.allowUsers, ["user"]);
+  assert.deepEqual(merged.groups.group?.agents.default?.allowUsers, ["user"]);
   await writeFile(mergedPath, setupConfig("group-2", "default", defaultAgent, "user-2", compact));
   const pairedByCode = await loadConfig(mergedPath);
   assert.equal(pairedByCode.ownerUser, "user");
-  assert.deepEqual(pairedByCode.groups["group-2"]?.allowUsers, ["user"]);
+  assert.deepEqual(pairedByCode.groups["group-2"]?.agents.default?.allowUsers, ["user"]);
   await writeFile(mergedPath, pairConfig("default", defaultAgent, "user-2", compact));
   const pairedDirectly = await loadConfig(mergedPath);
   assert.equal(pairedDirectly.ownerUser, "user-2");
-  assert.deepEqual(pairedDirectly.groups.group?.allowUsers, ["user-2"]);
+  assert.deepEqual(pairedDirectly.groups.group?.agents.default?.allowUsers, ["user-2"]);
   await writeFile(mergedPath, pairConfig("default", defaultAgent, "user-3"));
   assert.deepEqual((await loadConfig(mergedPath)).groups, {});
-  assert.throws(() => setupConfig("group", "other", defaultAgent, "user", compact), /已绑定其他 Agent/);
 
-  compact.groups.group!.allowUsers.push("user-2");
+  compact.groups.group!.agents.default!.allowUsers.push("user-2");
   await saveConfig(compactPath, compact);
-  assert.deepEqual((await loadConfig(compactPath)).groups.group?.allowUsers, ["user", "user-2"]);
+  assert.deepEqual((await loadConfig(compactPath)).groups.group?.agents.default?.allowUsers, ["user", "user-2"]);
 
-  compact.groups.group!.allowAll = true;
+  compact.groups.group!.agents.default!.allowAll = true;
   await saveConfig(compactPath, compact);
-  assert.equal((await loadConfig(compactPath)).groups.group?.allowAll, true);
-  delete compact.groups.group!.allowAll;
+  assert.equal((await loadConfig(compactPath)).groups.group?.agents.default?.allowAll, true);
+  delete compact.groups.group!.agents.default!.allowAll;
   await saveConfig(compactPath, compact);
-  assert.equal((await loadConfig(compactPath)).groups.group?.allowAll, undefined);
+  assert.equal((await loadConfig(compactPath)).groups.group?.agents.default?.allowAll, undefined);
+});
+
+test("one group can run two bots at once, each with its own allowlist and switch", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "threadferry-multi-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const workspace = await realpath(root);
+  const path = join(root, "two-bots.yaml");
+  // 群里有两台机器人：同一个群分别绑给两个 Agent，各自一份名单。
+  const first = setupConfig("group", "叶翔", { workspace, runtime: "codex" }, "owner");
+  await writeFile(path, first);
+  const withOne = await loadConfig(path);
+  const both = addAgent(withOne, "悦翔", { workspace, runtime: "pi" });
+  await writeFile(path, setupConfig("group", "悦翔", { workspace, runtime: "pi" }, "owner", both));
+  const loaded = await loadConfig(path);
+
+  assert.deepEqual(Object.keys(loaded.groups.group!.agents).sort(), ["叶翔", "悦翔"]);
+  loaded.groups.group!.agents["悦翔"]!.allowUsers = ["owner", "teammate"];
+  loaded.groups.group!.agents["悦翔"]!.allowAll = true;
+  await saveConfig(path, loaded);
+  const reloaded = await loadConfig(path);
+  // 两台机器人的名单和开关互不影响。
+  assert.deepEqual(reloaded.groups.group?.agents["叶翔"]?.allowUsers, ["owner"]);
+  assert.equal(reloaded.groups.group?.agents["叶翔"]?.allowAll, undefined);
+  assert.deepEqual(reloaded.groups.group?.agents["悦翔"]?.allowUsers, ["owner", "teammate"]);
+  assert.equal(reloaded.groups.group?.agents["悦翔"]?.allowAll, true);
+
+  // 单 Agent 运行视图里，这个群仍然只归它自己——app.ts 完全看不到另一台机器人。
+  const view = agentView(reloaded, "叶翔");
+  assert.deepEqual(Object.keys(view.groups), ["group"]);
+  assert.equal(view.groups.group?.agent, "叶翔");
+  assert.deepEqual(view.groups.group?.allowUsers, ["owner"]);
+  assert.equal(agentView(reloaded, "悦翔").groups.group?.allowAll, true);
 });
 
 test("agent names must be directory-safe while onboarding uses the invocation directory", () => {
-  const current = testConfig("/saved/workspace");
+  const current = fullConfig("/saved/workspace");
   const defaults = onboardingDefaults(current, "/current/invocation");
 
   assert.deepEqual(defaults, {
@@ -486,9 +646,9 @@ test("the v6 disk format round-trips agents, their groups and credential overrid
   assert.deepEqual(fromV6, fromV5);
   assert.equal(fromV6.version, 6);
   assert.equal(fromV6.ownerUser, "woOWNER");
-  assert.equal(fromV6.groups.g1?.agent, "default");
-  assert.equal(fromV6.groups.g2?.agent, "reviewer");
-  assert.equal(fromV6.groups.g2?.allowAll, true);
+  assert.deepEqual(Object.keys(fromV6.groups.g1!.agents), ["default"]);
+  assert.deepEqual(Object.keys(fromV6.groups.g2!.agents), ["reviewer"]);
+  assert.equal(fromV6.groups.g2?.agents.reviewer?.allowAll, true);
   assert.equal(fromV6.agents.reviewer?.model, "provider/model");
 
   // config_dir 往返保留。
@@ -509,12 +669,15 @@ test("v6 configuration rejects shapes the runtime cannot honour", async (t) => {
     return target;
   };
 
-  // 同一个群挂在两个 Agent 下：摊平时会静默丢掉一个，必须拒绝。
-  const duplicated = await write("duplicate.yaml", [
+  // 同一个群挂在两个 Agent 下是**合法**的：群里可以同时有两台机器人，各自一份授权。
+  const shared = await write("shared.yaml", [
     ...agent("a", ["    owner_user: woOWNER", "    groups:", "      shared:", "        allow_users: [woOWNER]"]),
-    ...agent("b", ["    owner_user: woOWNER", "    groups:", "      shared:", "        allow_users: [woOWNER]"]),
+    ...agent("b", ["    owner_user: woOWNER", "    groups:", "      shared:", "        allow_users: [woOWNER]", "        allow_all: true"]),
   ]);
-  await assert.rejects(loadConfig(duplicated), /只能归属一个 Agent/);
+  const twoBots = await loadConfig(shared);
+  assert.deepEqual(Object.keys(twoBots.groups.shared!.agents).sort(), ["a", "b"]);
+  assert.equal(twoBots.groups.shared?.agents.a?.allowAll, undefined);
+  assert.equal(twoBots.groups.shared?.agents.b?.allowAll, true);
 
   // 每个 Agent 独立 Owner 是本改造的目标能力（跨企业时同一个人 userid 不同）。
   const perAgentOwners = await write("per-agent-owner.yaml", [
@@ -535,7 +698,7 @@ test("v6 configuration rejects shapes the runtime cannot honour", async (t) => {
     ...agent("a", ["    owner_user: woA", "    groups:", "      g1:", "        allow_users: [woB]"]),
     ...agent("b", ["    owner_user: woB"]),
   ]);
-  await assert.rejects(loadConfig(wrongOwnerInGroup), /必须包含所属 Agent 的 owner_user/);
+  await assert.rejects(loadConfig(wrongOwnerInGroup), /必须包含该 Agent 的 owner_user/);
 
   const relativeDir = await write("relative.yaml", agent("a", ["    owner_user: woOWNER", "    config_dir: relative/dir"]));
   await assert.rejects(loadConfig(relativeDir), /config_dir 必须是绝对路径/);
@@ -552,7 +715,7 @@ test("v6 configuration rejects shapes the runtime cannot honour", async (t) => {
   const ownerMissing = await write("owner-missing.yaml", [
     ...agent("a", ["    owner_user: woOWNER", "    groups:", "      g1:", "        allow_users: [woTEAM]"]),
   ]);
-  await assert.rejects(loadConfig(ownerMissing), /必须包含所属 Agent 的 owner_user/);
+  await assert.rejects(loadConfig(ownerMissing), /必须包含该 Agent 的 owner_user/);
 });
 
 test("legacy and extra configuration fields are rejected", async (t) => {
@@ -771,13 +934,14 @@ test("an interrupted inbox is replayed after restart and final content is remove
   const restarted = new ThreadFerryState(statePath);
   const [pending] = await restarted.recoverPending();
   assert.ok(pending);
+  const pendingMessage = pending.message;
   const config = testConfig();
   const replies: string[] = [];
   const app = createApp(config, {
     history: async () => [],
     runtime: async () => ({ text: "恢复后的结果", sessionId: "recovered-session" }),
   }, restarted);
-  assert.equal(await app.replay(pending, async (content) => { replies.push(content); }), "handled");
+  assert.equal(await app.replay(pendingMessage, async (content) => { replies.push(content); }), "handled");
   assert.deepEqual(replies, ["恢复后的结果"]);
   const snapshot = await restarted.snapshot();
   assert.equal(snapshot.inbox.length, 0);
@@ -946,8 +1110,8 @@ test("per-agent config views isolate groups, owners and runtime scope", async ()
       backend: { workspace: "/ws-b", runtime: "pi", ownerUser: "owner-b" },
     },
     groups: {
-      "group-a": { agent: "frontend", allowUsers: ["owner-a"], context: { lookbackHours: 6, maxMessages: 80 } },
-      "group-b": { agent: "backend", allowUsers: ["owner-b"], context: { lookbackHours: 6, maxMessages: 80 } },
+      "group-a": { agents: { frontend: { allowUsers: ["owner-a"] } }, context: { lookbackHours: 6, maxMessages: 80 } },
+      "group-b": { agents: { backend: { allowUsers: ["owner-b"] } }, context: { lookbackHours: 6, maxMessages: 80 } },
     },
     security: { requireMention: true, readOnly: true },
   };
@@ -963,7 +1127,7 @@ test("per-agent config views isolate groups, owners and runtime scope", async ()
 
   // 每个视图起一个 app：私聊必定落到该视图唯一的 Agent 上，跨 Agent 的群一律拒绝。
   const runtimeCalls: Array<{ agentId: string; workspace: string }> = [];
-  const makeApp = (view: ThreadFerryConfig) => createApp(view, {
+  const makeApp = (view: AgentView) => createApp(view, {
     history: async () => [],
     runtime: async ({ agentId, workspace }) => {
       runtimeCalls.push({ agentId, workspace });
@@ -1004,7 +1168,7 @@ test("refreshing a view propagates config changes and disables a removed agent",
     version: 6,
     ownerUser: "owner-a",
     agents: { frontend: { workspace: "/ws-a", runtime: "codex", ownerUser: "owner-a" } },
-    groups: { "group-a": { agent: "frontend", allowUsers: ["owner-a"], context: { lookbackHours: 6, maxMessages: 80 } } },
+    groups: { "group-a": { agents: { frontend: { allowUsers: ["owner-a"] } }, context: { lookbackHours: 6, maxMessages: 80 } } },
     security: { requireMention: true, readOnly: true },
   };
   const view = agentView(config, "frontend");
@@ -1014,8 +1178,8 @@ test("refreshing a view propagates config changes and disables a removed agent",
     agents: { frontend: { workspace: "/ws-a", runtime: "codex", ownerUser: "owner-new" } },
     groups: {
       ...config.groups,
-      "group-c": { agent: "frontend", allowUsers: ["owner-new"], context: { lookbackHours: 6, maxMessages: 80 } },
-      "group-d": { agent: "other", allowUsers: ["x"], context: { lookbackHours: 6, maxMessages: 80 } },
+      "group-c": { agents: { frontend: { allowUsers: ["owner-new"] } }, context: { lookbackHours: 6, maxMessages: 80 } },
+      "group-d": { agents: { other: { allowUsers: ["x"] } }, context: { lookbackHours: 6, maxMessages: 80 } },
     },
   };
   refreshAgentView(view, updated, "frontend");

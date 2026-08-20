@@ -3,6 +3,10 @@ version: 6
 # 一个 Agent 对应一个企业微信机器人，严格 1:1。
 # 每个 Agent 独立拥有自己的机器人凭据、Owner、群与授权名单、Workspace、Runtime 和 Session。
 #
+# 反过来不受限：同一个群可以同时挂多台机器人——把这个群写进多个 Agent 的 groups 下即可。
+# 群里 @ 哪台机器人，就由它用自己的 Workspace 回答，名单、全员开关和 Session 各自独立。
+# 下面的 "group_xxx" 就同时出现在 default 和 reviewer 里。
+#
 # Agent 名同时用作机器人凭据目录名，只允许 1-64 个字母、数字、下划线或连字符。
 # 机器人凭据不在这里：由 `threadferry agent login <名称>` 交给官方 wecom-cli
 # 加密保存在 ~/.threadferry/wecom/<Agent名>/，本文件绝不存 Bot Secret。
@@ -27,4 +31,8 @@ agents:
     owner_user: "user_owner_in_other_corp"
     # 覆盖凭据目录（可选，必须是绝对路径）
     # config_dir: "/absolute/path/to/credentials"
-    groups: {}
+    groups:
+      # 和上面 default 同一个群：群里两台机器人，@ 谁谁回答。
+      "group_xxx":
+        allow_users:
+          - "user_owner_in_other_corp"

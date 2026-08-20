@@ -60,21 +60,21 @@ test("adopting a new owner migrates the old owner inside every group allowlist",
     ownerUser: "old-owner",
     agents: { default: { runtime: "codex", workspace: "/workspace", ownerUser: "old-owner" } },
     groups: {
-      a: { agent: "default", allowUsers: ["old-owner", "teammate"], context: { lookbackHours: 6, maxMessages: 80 } },
-      b: { agent: "default", allowUsers: ["teammate"], allowAll: true, context: { lookbackHours: 6, maxMessages: 80 } },
+      a: { agents: { default: { allowUsers: ["old-owner", "teammate"] } }, context: { lookbackHours: 6, maxMessages: 80 } },
+      b: { agents: { default: { allowUsers: ["teammate"], allowAll: true } }, context: { lookbackHours: 6, maxMessages: 80 } },
     },
     security: { requireMention: true, readOnly: true },
   };
   const migrated = adoptOwner(config, "default", "new-owner");
 
   assert.equal(migrated.ownerUser, "new-owner");
-  assert.deepEqual(migrated.groups.a?.allowUsers, ["new-owner", "teammate"]);
+  assert.deepEqual(migrated.groups.a?.agents.default?.allowUsers, ["new-owner", "teammate"]);
   // 原先没有 Owner 的群也要补上，否则迁移后 Owner 反而进不了自己的群。
-  assert.deepEqual(migrated.groups.b?.allowUsers, ["teammate", "new-owner"]);
-  assert.equal(migrated.groups.b?.allowAll, true);
+  assert.deepEqual(migrated.groups.b?.agents.default?.allowUsers, ["teammate", "new-owner"]);
+  assert.equal(migrated.groups.b?.agents.default?.allowAll, true);
   // 原配置不被就地修改。
   assert.equal(config.ownerUser, "old-owner");
-  assert.deepEqual(config.groups.a?.allowUsers, ["old-owner", "teammate"]);
+  assert.deepEqual(config.groups.a?.agents.default?.allowUsers, ["old-owner", "teammate"]);
   assert.throws(() => adoptOwner(config, "default", "bad userid!"), /userid 无效/);
   assert.throws(() => adoptOwner(config, "missing", "new-owner"), /Agent missing 未配置/);
 });
