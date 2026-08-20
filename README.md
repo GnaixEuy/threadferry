@@ -21,8 +21,8 @@ The bot fetches up to 80 messages from the preceding 6 hours only after it is me
 
 [View the changelog](./CHANGELOG.md)
 
-> **Under active development; not formally released yet.** Multi-bot support is complete but has
-> not yet been exercised with two live bots. See [MULTI_BOT_PLAN.md](./MULTI_BOT_PLAN.md).
+> **Under active development; not formally released yet.** Multi-bot support has been verified with
+> two live bots. See [MULTI_BOT_PLAN.md](./MULTI_BOT_PLAN.md).
 
 ## Quick Start
 
@@ -239,11 +239,13 @@ Bot:   已自动执行：
 
   | Area | Actions |
   | --- | --- |
-  | Calendar | `schedule.search`, `schedule.free`, `schedule.create`, `schedule.update`, `schedule.cancel` |
-  | Meetings | `meeting.search`, `meeting.create`, `meeting.update`, `meeting.cancel` |
-  | Todo | `todo.list`, `todo.create`, `todo.update`, `todo.finish`, `todo.delete` |
-  | Mail | `mail.search`, `mail.send` |
-  | Docs and Drive | `doc.search`, `doc.create`, `disk.search` |
+  | Calendar | `schedule.search/get/free/create/update/cancel` |
+  | Meetings | `meeting.search/get/transcript/rooms/create/update/cancel` |
+  | Todo | `todo.list/get/create/update/finish/delete` |
+  | Mail | `mail.search/read/send` |
+  | Docs and Drive | `doc.search/read/create`, `disk.search/get/list` |
+  | Tables | `sheet.info/read`, `smartpage.read`, `smartsheet.info/fields/records` |
+  | Proactive work | `reminder.create/list/update/cancel`, `work.create/list/get/handoff` |
 
 - Enterprise-data queries and all mail, document, and Drive operations run only in the **Owner's
   direct chat**, so personal data and message bodies are never disclosed in a group.
@@ -253,10 +255,22 @@ Bot:   已自动执行：
   a fresh confirmation. Codes expire after 10 minutes and are memory-only.
 - Group history stays untrusted input. Automatic execution additionally requires a matching,
   explicit action intent in the Owner's current message; runtime output and history cannot grant it.
+- One request can chain several enterprise reads before producing the final answer or one write.
+  Every result returns to the same runtime session as untrusted business data.
+- If document reading needs additional authorization, the official `auth_change_event` resumes the
+  Owner's original direct-chat session after approval without widening the original request.
 - Attendees are resolved through the address book by name or `id:<userid>` and actively invited by
-  the native meeting request.
+  the native meeting request. Group bots absent from the directory are excluded automatically.
+- The Owner can create persistent reminders or assign a task to another agent with an optional
+  reviewer. ThreadFerry resumes them after restart and proactively reports the result. Notifications
+  enter the durable outbox first, so delivery failures retry the message without rerunning the agent.
+  Meeting, reminder, and work creation replies include the resource ID needed for follow-up actions.
+- A successfully created meeting schedules a private follow-up five minutes after it ends to read
+  its transcript and summarize decisions and action items.
 - Query results are formatted with times, links, meeting codes, and resource IDs. Updates and
   destructive actions must use an ID returned by a real query, never a guessed one.
+- CLI-generated document, mail, table, and transcript files are read only from an isolated temporary
+  directory, limited to 1 MB, and deleted before the runtime receives the content.
 - Every action passes the official CLI's local `--dry-run` validation before the real write.
 
 The official CLI also exposes attachment upload/download, document and spreadsheet overwrites,
@@ -293,7 +307,7 @@ Normal use does not require manually configuring environment variables. `wecom-c
 ## Security Boundaries
 
 - In direct chat, only messages from **that agent's own Owner** start a Runtime. In groups, only the current message that mentions `@bot` is treated as a user instruction. Message history, quoted messages, and attachment metadata are untrusted context.
-- **Agents are isolated from each other**: agent A's bot rejects messages from agent B's groups, and A's Owner cannot chat with agent B.
+- **Agents are isolated by default**: agent A's bot rejects messages from agent B's groups, and A's Owner cannot chat with agent B. An explicit same-Owner collaboration task copies only its description and result; it never shares sessions, group history, or credentials. Cross-Owner creation, handoff, and execution are rejected.
 - Messages from unconfigured groups or unauthorized users, and messages that do not mention `@bot`, do not start a runtime. A group with all-member access (`allow_all`) widens "unauthorized users" to every member of that group; every other limit stays in place.
 - **ThreadFerry never handles the Bot Secret**: it never prompts for one, never writes it to the config file, and never puts it in an environment variable. The official `wecom-cli` keeps credentials encrypted in each agent's own directory; ThreadFerry only reads them when opening a connection.
 - The runtime is confined to the agent's workspace and cannot read files outside it.

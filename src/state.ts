@@ -44,10 +44,54 @@ export interface PendingDelivery {
   content: string;
   /** 该由哪台机器人补发。缺省表示旧记录，由调用方按群里唯一的 Agent 兜底。 */
   agent?: string;
+  /** 主动提醒或协作任务回执；普通会话回复不设，避免调度器并发抢发。 */
+  proactive?: true;
   attempts: number;
   createdAt: string;
   updatedAt: string;
   errorId?: string;
+}
+
+export interface ActivityRecord {
+  id: string;
+  agent: string;
+  type: string;
+  outcome: "success" | "failure" | "info";
+  resource?: string;
+  at: string;
+}
+
+export interface ReminderRecord {
+  id: string;
+  agent: string;
+  chatId: string;
+  chatType: "single" | "group";
+  createdBy: string;
+  instruction: string;
+  nextRunAt: string;
+  repeatMinutes?: number;
+  status: "scheduled" | "running" | "completed" | "cancelled";
+  runningAt?: string;
+  failures: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface WorkItemRecord {
+  id: string;
+  title: string;
+  description: string;
+  createdBy: string;
+  createdAgent: string;
+  assignedAgent: string;
+  reviewerAgent?: string;
+  sourceChatId: string;
+  sourceChatType: "single" | "group";
+  status: "queued" | "running" | "review" | "reviewing" | "completed" | "failed";
+  result?: string;
+  review?: string;
+  createdAt: string;
+  updatedAt: string;
 }
 
 export interface StateSnapshot {
@@ -55,33 +99,50 @@ export interface StateSnapshot {
   sessions: SessionRecord[];
   inbox: StoredMention[];
   outbox: PendingDelivery[];
+  activities?: ActivityRecord[];
+  reminders?: ReminderRecord[];
+  workItems?: WorkItemRecord[];
 }
 
 interface StateDocument extends StateSnapshot {
-  version: 3;
+  version: 4;
+  activities: ActivityRecord[];
+  reminders: ReminderRecord[];
+  workItems: WorkItemRecord[];
 }
 
 const MAX_STATE_BYTES = 4 * 1024 * 1024;
 const MAX_TURNS = 10_000;
 const MAX_PENDING = 128;
+const MAX_ACTIVITIES = 1_000;
+const MAX_REMINDERS = 256;
+const MAX_WORK_ITEMS = 64;
 const MAX_MESSAGE_CHARS = 32_000;
 const MAX_REPLY_BYTES = 12_000;
 const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const WORK_STALE_MS = 60 * 60 * 1_000;
 const DIGEST = /^[a-f0-9]{64}$/;
 const SESSION_ID = /^[A-Za-z0-9_-]{1,160}$/;
 const ERROR_ID = /^TF-[A-F0-9]{8}$/;
+const ACTIVITY_ID = /^A-[A-F0-9]{12}$/;
+const REMINDER_ID = /^R-[A-F0-9]{12}$/;
+const WORK_ID = /^W-[A-F0-9]{12}$/;
 const STATUSES = new Set<TurnStatus>(["queued", "running", "handled", "stale", "failed"]);
 const PHASES = new Set<FailurePhase>(["ack", "history", "runtime", "freshness", "reply", "host"]);
-const STATE_FIELDS = new Set(["version", "turns", "sessions", "inbox", "outbox"]);
+const LEGACY_STATE_FIELDS = new Set(["version", "turns", "sessions", "inbox", "outbox"]);
+const STATE_FIELDS = new Set([...LEGACY_STATE_FIELDS, "activities", "reminders", "workItems"]);
 const TURN_FIELDS = new Set(["id", "group", "status", "receivedAt", "updatedAt", "errorId", "failurePhase"]);
 const SESSION_FIELDS = new Set(["group", "workspace", "sessionId", "updatedAt"]);
 // agent 是可选的：一个群可以同时挂多台机器人，重启后补发必须知道当初是哪一台，
 // 否则会用另一台机器人的身份把回复发出去。旧状态文件没这个字段，按缺省处理。
 const INBOX_FIELDS = new Set(["msgId", "groupId", "senderId", "senderName", "time", "text", "quote", "attachments", "mentioned", "agent"]);
-const OUTBOX_FIELDS = new Set(["id", "groupId", "content", "attempts", "createdAt", "updatedAt", "errorId", "agent"]);
+const OUTBOX_FIELDS = new Set(["id", "groupId", "content", "attempts", "createdAt", "updatedAt", "errorId", "agent", "proactive"]);
+const ACTIVITY_FIELDS = new Set(["id", "agent", "type", "outcome", "resource", "at"]);
+const REMINDER_FIELDS = new Set(["id", "agent", "chatId", "chatType", "createdBy", "instruction", "nextRunAt", "repeatMinutes", "status", "runningAt", "failures", "createdAt", "updatedAt"]);
+const WORK_FIELDS = new Set(["id", "title", "description", "createdBy", "createdAgent", "assignedAgent", "reviewerAgent", "sourceChatId", "sourceChatType", "status", "result", "review", "createdAt", "updatedAt"]);
 
 function emptyState(): StateDocument {
-  return { version: 3, turns: [], sessions: [], inbox: [], outbox: [] };
+  return { version: 4, turns: [], sessions: [], inbox: [], outbox: [], activities: [], reminders: [], workItems: [] };
 }
 
 function key(value: string): string {
@@ -137,12 +198,69 @@ function validMention(value: unknown): value is StoredMention {
     && (mention.attachments === undefined || validAttachments(mention.attachments));
 }
 
+function validActivity(value: unknown): value is ActivityRecord {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const item = value as Record<string, unknown>;
+  return Object.keys(item).every((field) => ACTIVITY_FIELDS.has(field))
+    && ACTIVITY_ID.test(String(item.id))
+    && validString(item.agent, 128)
+    && validString(item.type, 64)
+    && ["success", "failure", "info"].includes(String(item.outcome))
+    && (item.resource === undefined || validString(item.resource, 1_024))
+    && validDate(item.at);
+}
+
+function validReminder(value: unknown): value is ReminderRecord {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const item = value as Record<string, unknown>;
+  return Object.keys(item).every((field) => REMINDER_FIELDS.has(field))
+    && REMINDER_ID.test(String(item.id))
+    && validString(item.agent, 128)
+    && validString(item.chatId, 512)
+    && ["single", "group"].includes(String(item.chatType))
+    && validString(item.createdBy, 512)
+    && validString(item.instruction, 8_000)
+    && validDate(item.nextRunAt)
+    && (item.repeatMinutes === undefined || Number.isInteger(item.repeatMinutes) && Number(item.repeatMinutes) >= 1 && Number(item.repeatMinutes) <= 525_600)
+    && ["scheduled", "running", "completed", "cancelled"].includes(String(item.status))
+    && (item.runningAt === undefined || validDate(item.runningAt))
+    && Number.isInteger(item.failures) && Number(item.failures) >= 0
+    && validDate(item.createdAt) && validDate(item.updatedAt);
+}
+
+function validWorkItem(value: unknown): value is WorkItemRecord {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const item = value as Record<string, unknown>;
+  return Object.keys(item).every((field) => WORK_FIELDS.has(field))
+    && WORK_ID.test(String(item.id))
+    && validString(item.title, 1_000)
+    && typeof item.description === "string" && item.description.length <= 8_000
+    && validString(item.createdBy, 512)
+    && validString(item.createdAgent, 128)
+    && validString(item.assignedAgent, 128)
+    && (item.reviewerAgent === undefined || validString(item.reviewerAgent, 128))
+    && validString(item.sourceChatId, 512)
+    && ["single", "group"].includes(String(item.sourceChatType))
+    && ["queued", "running", "review", "reviewing", "completed", "failed"].includes(String(item.status))
+    && (item.result === undefined || typeof item.result === "string" && item.result.length <= 12_000)
+    && (item.review === undefined || typeof item.review === "string" && item.review.length <= 12_000)
+    && validDate(item.createdAt) && validDate(item.updatedAt);
+}
+
 function validateState(value: unknown): StateDocument {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("ThreadFerry 状态文件结构无效");
-  const state = value as Partial<StateDocument>;
-  if (Object.keys(value).some((field) => !STATE_FIELDS.has(field))
-    || state.version !== 3 || !Array.isArray(state.turns) || !Array.isArray(state.sessions)
-    || !Array.isArray(state.inbox) || !Array.isArray(state.outbox)) {
+  const source = value as Record<string, unknown>;
+  if (source.version === 3 && Object.keys(source).some((field) => !LEGACY_STATE_FIELDS.has(field))) {
+    throw new Error("ThreadFerry 状态文件版本或结构无效");
+  }
+  const migrated = source.version === 3
+    ? { ...source, version: 4, activities: [], reminders: [], workItems: [] }
+    : source;
+  const state = migrated as unknown as Partial<StateDocument>;
+  if (Object.keys(migrated).some((field) => !STATE_FIELDS.has(field))
+    || state.version !== 4 || !Array.isArray(state.turns) || !Array.isArray(state.sessions)
+    || !Array.isArray(state.inbox) || !Array.isArray(state.outbox)
+    || !Array.isArray(state.activities) || !Array.isArray(state.reminders) || !Array.isArray(state.workItems)) {
     throw new Error("ThreadFerry 状态文件版本或结构无效");
   }
   if (state.turns.length > MAX_TURNS || state.turns.some((turn) => !turn || typeof turn !== "object" || Array.isArray(turn)
@@ -171,9 +289,19 @@ function validateState(value: unknown): StateDocument {
     || !validString((delivery as PendingDelivery).content, MAX_MESSAGE_CHARS)
     || Buffer.byteLength((delivery as PendingDelivery).content) > MAX_REPLY_BYTES
     || !Number.isInteger((delivery as PendingDelivery).attempts) || (delivery as PendingDelivery).attempts < 0
+    || ((delivery as PendingDelivery).proactive !== undefined && (delivery as PendingDelivery).proactive !== true)
     || !validDate((delivery as PendingDelivery).createdAt) || !validDate((delivery as PendingDelivery).updatedAt)
     || ((delivery as PendingDelivery).errorId !== undefined && !ERROR_ID.test(String((delivery as PendingDelivery).errorId))))) {
     throw new Error("ThreadFerry 待发送回复记录无效");
+  }
+  if (state.activities.length > MAX_ACTIVITIES || state.activities.some((item) => !validActivity(item))) {
+    throw new Error("ThreadFerry Activity 记录无效");
+  }
+  if (state.reminders.length > MAX_REMINDERS || state.reminders.some((item) => !validReminder(item))) {
+    throw new Error("ThreadFerry 提醒记录无效");
+  }
+  if (state.workItems.length > MAX_WORK_ITEMS || state.workItems.some((item) => !validWorkItem(item))) {
+    throw new Error("ThreadFerry 任务记录无效");
   }
   return state as StateDocument;
 }
@@ -430,6 +558,23 @@ export class ThreadFerryState {
     });
   }
 
+  async queueDelivery(identity: string, chatId: string, content: string, agent: string): Promise<string> {
+    return this.exclusive(async () => {
+      if (!validString(identity, 512) || !validString(chatId, 512) || !validString(agent, 128)
+        || !validString(content, MAX_MESSAGE_CHARS) || Buffer.byteLength(content) > MAX_REPLY_BYTES) {
+        throw new Error("主动通知参数无效或超过安全上限");
+      }
+      await this.load();
+      const id = key(identity);
+      if (this.data.outbox.some((delivery) => delivery.id === id)) return id;
+      if (this.data.outbox.length >= MAX_PENDING) throw new Error("ThreadFerry 待发送队列已满");
+      const now = new Date().toISOString();
+      this.data.outbox.push({ id, groupId: chatId, content, agent, proactive: true, attempts: 0, createdAt: now, updatedAt: now });
+      await this.save();
+      return id;
+    });
+  }
+
   async deliveryFailed(id: string, errorId: string): Promise<void> {
     await this.exclusive(async () => {
       if (!DIGEST.test(id) || !ERROR_ID.test(errorId)) throw new Error("投递状态标识无效");
@@ -524,10 +669,293 @@ export class ThreadFerryState {
     });
   }
 
+  async recordActivity(input: {
+    agent: string;
+    type: string;
+    outcome: ActivityRecord["outcome"];
+    resource?: string;
+    at?: Date;
+  }): Promise<ActivityRecord> {
+    return this.exclusive(async () => {
+      await this.load();
+      const activity: ActivityRecord = {
+        id: `A-${randomBytes(6).toString("hex").toUpperCase()}`,
+        agent: input.agent,
+        type: input.type,
+        outcome: input.outcome,
+        ...(input.resource ? { resource: input.resource } : {}),
+        at: (input.at ?? new Date()).toISOString(),
+      };
+      if (!validActivity(activity)) throw new Error("Activity 参数无效");
+      this.data.activities.push(activity);
+      if (this.data.activities.length > MAX_ACTIVITIES) this.data.activities.splice(0, this.data.activities.length - MAX_ACTIVITIES);
+      await this.save();
+      return structuredClone(activity);
+    });
+  }
+
+  async recentActivities(limit = 100, agent?: string): Promise<ActivityRecord[]> {
+    return this.exclusive(async () => {
+      if (!Number.isInteger(limit) || limit < 1 || limit > 500) throw new Error("Activity 数量必须是 1～500");
+      await this.load();
+      return structuredClone(this.data.activities.filter((item) => !agent || item.agent === agent).slice(-limit).reverse());
+    });
+  }
+
+  async createReminder(input: {
+    agent: string;
+    chatId: string;
+    chatType: ReminderRecord["chatType"];
+    createdBy: string;
+    instruction: string;
+    runAt: string;
+    repeatMinutes?: number;
+  }): Promise<ReminderRecord> {
+    return this.exclusive(async () => {
+      await this.load();
+      while (this.data.reminders.length >= MAX_REMINDERS) {
+        const removable = this.data.reminders.findIndex((item) => item.status === "completed" || item.status === "cancelled");
+        if (removable === -1) throw new Error("提醒数量已达到上限");
+        this.data.reminders.splice(removable, 1);
+      }
+      const now = new Date().toISOString();
+      const reminder: ReminderRecord = {
+        id: `R-${randomBytes(6).toString("hex").toUpperCase()}`,
+        agent: input.agent,
+        chatId: input.chatId,
+        chatType: input.chatType,
+        createdBy: input.createdBy,
+        instruction: input.instruction,
+        nextRunAt: input.runAt,
+        ...(input.repeatMinutes ? { repeatMinutes: input.repeatMinutes } : {}),
+        status: "scheduled",
+        failures: 0,
+        createdAt: now,
+        updatedAt: now,
+      };
+      if (!validReminder(reminder)) throw new Error("提醒参数无效");
+      this.data.reminders.push(reminder);
+      await this.save();
+      return structuredClone(reminder);
+    });
+  }
+
+  async listReminders(agent?: string): Promise<ReminderRecord[]> {
+    return this.exclusive(async () => {
+      await this.load();
+      return structuredClone(this.data.reminders.filter((item) => !agent || item.agent === agent));
+    });
+  }
+
+  async updateReminder(id: string, patch: { instruction?: string; runAt?: string; repeatMinutes?: number | null }): Promise<ReminderRecord> {
+    return this.exclusive(async () => {
+      await this.load();
+      const reminder = this.data.reminders.find((item) => item.id === id);
+      if (!reminder || reminder.status === "completed" || reminder.status === "cancelled") throw new Error("提醒不存在或已经结束");
+      if (patch.instruction !== undefined) reminder.instruction = patch.instruction;
+      if (patch.runAt !== undefined) reminder.nextRunAt = patch.runAt;
+      if (patch.repeatMinutes === null) delete reminder.repeatMinutes;
+      else if (patch.repeatMinutes !== undefined) reminder.repeatMinutes = patch.repeatMinutes;
+      reminder.status = "scheduled";
+      delete reminder.runningAt;
+      reminder.updatedAt = new Date().toISOString();
+      if (!validReminder(reminder)) throw new Error("提醒参数无效");
+      await this.save();
+      return structuredClone(reminder);
+    });
+  }
+
+  async cancelReminder(id: string): Promise<boolean> {
+    return this.exclusive(async () => {
+      await this.load();
+      const reminder = this.data.reminders.find((item) => item.id === id);
+      if (!reminder || reminder.status === "completed" || reminder.status === "cancelled") return false;
+      reminder.status = "cancelled";
+      delete reminder.runningAt;
+      reminder.updatedAt = new Date().toISOString();
+      await this.save();
+      return true;
+    });
+  }
+
+  async claimDueReminders(now = new Date()): Promise<ReminderRecord[]> {
+    return this.exclusive(async () => {
+      await this.load();
+      const nowMs = now.getTime();
+      const staleBefore = nowMs - 5 * 60_000;
+      const claimed = this.data.reminders.filter((item) =>
+        item.status === "scheduled" && Date.parse(item.nextRunAt) <= nowMs
+        || item.status === "running" && item.runningAt !== undefined && Date.parse(item.runningAt) <= staleBefore);
+      for (const reminder of claimed) {
+        reminder.status = "running";
+        reminder.runningAt = now.toISOString();
+        reminder.updatedAt = now.toISOString();
+      }
+      if (claimed.length) await this.save();
+      return structuredClone(claimed);
+    });
+  }
+
+  async finishReminder(id: string, success: boolean, now = new Date()): Promise<void> {
+    await this.exclusive(async () => {
+      await this.load();
+      const reminder = this.data.reminders.find((item) => item.id === id);
+      if (!reminder || reminder.status !== "running") return;
+      delete reminder.runningAt;
+      reminder.updatedAt = now.toISOString();
+      if (success) {
+        reminder.failures = 0;
+        if (reminder.repeatMinutes) {
+          reminder.status = "scheduled";
+          reminder.nextRunAt = new Date(now.getTime() + reminder.repeatMinutes * 60_000).toISOString();
+        } else {
+          reminder.status = "completed";
+        }
+      } else {
+        reminder.failures += 1;
+        reminder.status = "scheduled";
+        const retryMinutes = Math.min(5 * 2 ** (reminder.failures - 1), 60);
+        reminder.nextRunAt = new Date(now.getTime() + retryMinutes * 60_000).toISOString();
+      }
+      await this.save();
+    });
+  }
+
+  async createWorkItem(input: {
+    title: string;
+    description: string;
+    createdBy: string;
+    createdAgent: string;
+    assignedAgent: string;
+    reviewerAgent?: string;
+    sourceChatId: string;
+    sourceChatType: WorkItemRecord["sourceChatType"];
+  }): Promise<WorkItemRecord> {
+    return this.exclusive(async () => {
+      await this.load();
+      while (this.data.workItems.length >= MAX_WORK_ITEMS) {
+        const removable = this.data.workItems.findIndex((item) => item.status === "completed" || item.status === "failed");
+        if (removable === -1) throw new Error("协作任务数量已达到上限");
+        this.data.workItems.splice(removable, 1);
+      }
+      const now = new Date().toISOString();
+      const work: WorkItemRecord = {
+        id: `W-${randomBytes(6).toString("hex").toUpperCase()}`,
+        ...input,
+        status: "queued",
+        createdAt: now,
+        updatedAt: now,
+      };
+      if (!validWorkItem(work)) throw new Error("协作任务参数无效");
+      this.data.workItems.push(work);
+      await this.save();
+      return structuredClone(work);
+    });
+  }
+
+  async listWorkItems(agent?: string): Promise<WorkItemRecord[]> {
+    return this.exclusive(async () => {
+      await this.load();
+      return structuredClone(this.data.workItems.filter((item) => !agent
+        || item.createdAgent === agent || item.assignedAgent === agent || item.reviewerAgent === agent));
+    });
+  }
+
+  async getWorkItem(id: string): Promise<WorkItemRecord | undefined> {
+    return this.exclusive(async () => {
+      await this.load();
+      const item = this.data.workItems.find((candidate) => candidate.id === id);
+      return item ? structuredClone(item) : undefined;
+    });
+  }
+
+  async handoffWorkItem(id: string, assignedAgent: string): Promise<WorkItemRecord> {
+    return this.exclusive(async () => {
+      await this.load();
+      const item = this.data.workItems.find((candidate) => candidate.id === id);
+      if (!item || ["completed", "failed"].includes(item.status)) throw new Error("协作任务不存在或已经结束");
+      item.assignedAgent = assignedAgent;
+      item.status = "queued";
+      delete item.result;
+      delete item.review;
+      item.updatedAt = new Date().toISOString();
+      if (!validWorkItem(item)) throw new Error("协作任务参数无效");
+      await this.save();
+      return structuredClone(item);
+    });
+  }
+
+  async claimWorkItems(agent: string, now = new Date()): Promise<WorkItemRecord[]> {
+    return this.exclusive(async () => {
+      await this.load();
+      // ponytail: 一小时租约避免崩溃后永久卡住；需要超长任务时再补心跳续租。
+      const staleBefore = now.getTime() - WORK_STALE_MS;
+      const claimed = this.data.workItems.filter((item) =>
+        (item.status === "queued" || item.status === "running" && Date.parse(item.updatedAt) <= staleBefore) && item.assignedAgent === agent
+        || (item.status === "review" || item.status === "reviewing" && Date.parse(item.updatedAt) <= staleBefore) && item.reviewerAgent === agent);
+      const claimedAt = now.toISOString();
+      for (const item of claimed) {
+        item.status = item.status === "review" || item.status === "reviewing" ? "reviewing" : "running";
+        item.updatedAt = claimedAt;
+      }
+      if (claimed.length) await this.save();
+      return structuredClone(claimed);
+    });
+  }
+
+  async completeWorkItem(id: string, output: string): Promise<void> {
+    await this.exclusive(async () => {
+      await this.load();
+      const item = this.data.workItems.find((candidate) => candidate.id === id);
+      if (!item || !["running", "reviewing"].includes(item.status)) throw new Error("协作任务没有处于执行状态");
+      if (output.length > 12_000) throw new Error("协作任务输出超过安全上限");
+      if (item.status === "reviewing") {
+        item.review = output;
+        item.status = "completed";
+      } else {
+        item.result = output;
+        item.status = item.reviewerAgent ? "review" : "completed";
+      }
+      item.updatedAt = new Date().toISOString();
+      await this.save();
+    });
+  }
+
+  async releaseWorkItem(id: string): Promise<void> {
+    await this.exclusive(async () => {
+      await this.load();
+      const item = this.data.workItems.find((candidate) => candidate.id === id);
+      if (!item || !["running", "reviewing"].includes(item.status)) return;
+      item.status = item.status === "reviewing" ? "review" : "queued";
+      item.updatedAt = new Date().toISOString();
+      await this.save();
+    });
+  }
+
+  async failWorkItem(id: string, output: string): Promise<void> {
+    await this.exclusive(async () => {
+      await this.load();
+      const item = this.data.workItems.find((candidate) => candidate.id === id);
+      if (!item) return;
+      item.result = output.slice(0, 12_000);
+      item.status = "failed";
+      item.updatedAt = new Date().toISOString();
+      await this.save();
+    });
+  }
+
   async snapshot(): Promise<StateSnapshot> {
     return this.exclusive(async () => {
       await this.load();
-      return structuredClone({ turns: this.data.turns, sessions: this.data.sessions, inbox: this.data.inbox, outbox: this.data.outbox });
+      return structuredClone({
+        turns: this.data.turns,
+        sessions: this.data.sessions,
+        inbox: this.data.inbox,
+        outbox: this.data.outbox,
+        activities: this.data.activities,
+        reminders: this.data.reminders,
+        workItems: this.data.workItems,
+      });
     });
   }
 }

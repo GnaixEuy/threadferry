@@ -390,6 +390,9 @@ async function overviewPage(config: ThreadFerryConfig, dependencies: AdminDepend
   for (const turn of snapshot?.turns ?? []) counts.set(turn.status, (counts.get(turn.status) ?? 0) + 1);
   const active = (counts.get("queued") ?? 0) + (counts.get("running") ?? 0);
   const lastFailure = snapshot?.turns.slice().reverse().find((turn) => turn.status === "failed");
+  const reminders = (snapshot?.reminders ?? []).filter((item) => item.status === "scheduled" || item.status === "running");
+  const workItems = (snapshot?.workItems ?? []).filter((item) => item.status !== "completed" && item.status !== "failed");
+  const activities = (snapshot?.activities ?? []).slice(-20).reverse();
   const stats: Array<[string, string, string]> = [
     [String(Object.keys(config.agents).length), "Agent 工作区", "/agents"],
     [String(boundIds.size), "已绑定群", "/groups"],
@@ -400,6 +403,8 @@ async function overviewPage(config: ThreadFerryConfig, dependencies: AdminDepend
       [String(active), "排队 / 运行中", ""],
       [String(snapshot.sessions.length), "Runtime Session", ""],
       [String(snapshot.outbox.length), "待补发回复", ""],
+      [String(reminders.length), "主动提醒", ""],
+      [String(workItems.length), "协作任务", ""],
     );
   }
   const todos: string[] = unbound.map((session, index) =>
@@ -409,12 +414,21 @@ async function overviewPage(config: ThreadFerryConfig, dependencies: AdminDepend
   if (lastFailure) {
     todos.push(`<article class="card"><h3>最近一次失败</h3><p class="muted">错误编号 <code>${html(lastFailure.errorId ?? "无")}</code> · 阶段 ${html(lastFailure.failurePhase ?? "unknown")} · ${html(lastFailure.updatedAt)}</p><p class="muted">请在终端运行 <code>threadferry status</code> 和 <code>threadferry doctor</code> 排查。</p></article>`);
   }
+  const proactive = [
+    ...reminders.map((item) => `<article class="card"><div class="row"><h3>提醒 <code>${html(item.id)}</code></h3><span class="badge ${item.status === "running" ? "warning" : "ok"}">${html(item.status)}</span></div><p class="muted">Agent <code>${html(item.agent)}</code> · 下次运行 ${html(item.nextRunAt)}${item.repeatMinutes ? ` · 每 ${item.repeatMinutes} 分钟` : ""}</p></article>`),
+    ...workItems.map((item) => `<article class="card"><div class="row"><h3>${html(item.title)}</h3><span class="badge warning">${html(item.status)}</span></div><p class="muted">任务 <code>${html(item.id)}</code> · ${html(item.assignedAgent)}${item.reviewerAgent ? ` → ${html(item.reviewerAgent)} 复核` : ""}</p></article>`),
+  ];
+  const activityList = activities.length
+    ? `<article class="card"><ul>${activities.map((item) => `<li><span><code>${html(item.agent)}</code> ${html(item.type)}${item.resource ? ` · ${html(item.resource)}` : ""}</span><span class="badge ${item.outcome === "success" ? "ok" : item.outcome === "failure" ? "warning" : ""}">${html(item.outcome)}</span></li>`).join("")}</ul></article>`
+    : `<p class="sub">还没有 Activity。</p>`;
   return shell("overview", config, url, `
     <div class="stats">${stats.map(([value, label, href]) => href
       ? `<a class="stat" href="${href}"><b>${value}</b><span>${label}</span></a>`
       : `<div class="stat"><b>${value}</b><span>${label}</span></div>`).join("")}</div>
     ${snapshot ? "" : `<p class="sub mt">运行状态暂不可用；Agent 工作区和群配置管理不受影响。</p>`}
-    <h2>待处理</h2>${todos.length ? `<div class="grid">${todos.join("")}</div>` : `<p class="sub">没有待处理事项。</p>`}`);
+    <h2>待处理</h2>${todos.length ? `<div class="grid">${todos.join("")}</div>` : `<p class="sub">没有待处理事项。</p>`}
+    <h2>主动工作</h2>${proactive.length ? `<div class="grid">${proactive.join("")}</div>` : `<p class="sub">没有运行中的提醒或协作任务。</p>`}
+    <h2>最近 Activity</h2>${activityList}`);
 }
 
 // 添加表单放进对话框，页面上只留一个按钮。开着的状态由 ?new=1 决定：没有脚本时点按钮就是

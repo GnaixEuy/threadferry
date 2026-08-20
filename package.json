@@ -1,6 +1,6 @@
 {
   "name": "threadferry",
-  "version": "0.19.0",
+  "version": "0.20.3",
   "description": "Safely ferry enterprise chat context to read-only local AI agents.",
   "type": "module",
   "bin": {

@@ -45,6 +45,9 @@ test("localhost admin manages agents, groups, and users with CSRF protection", a
       sessions: [{ group: digest("group"), workspace: digest(workspace), sessionId: "session-1", updatedAt: now }],
       inbox: [],
       outbox: [],
+      reminders: [{ id: "R-123456789ABC", agent: "default", chatId: "owner", chatType: "single", createdBy: "owner", instruction: "检查待办", nextRunAt: now, status: "scheduled", failures: 0, createdAt: now, updatedAt: now }],
+      workItems: [{ id: "W-123456789ABC", title: "核对季度复盘", description: "读取复盘", createdBy: "owner", createdAgent: "default", assignedAgent: "reviewer", reviewerAgent: "default", sourceChatId: "owner", sourceChatType: "single", status: "queued", createdAt: now, updatedAt: now }],
+      activities: [{ id: "A-123456789ABC", agent: "default", type: "action.read", outcome: "success", resource: "doc:doc-1", at: now }],
     }),
     resetSession: async (groupId, agentId) => { resetCalls.push(`${groupId}:${agentId}`); return true; },
   }, 0);
@@ -57,6 +60,8 @@ test("localhost admin manages agents, groups, and users with CSRF protection", a
   assert.match(overview, /新群/);
   assert.match(overview, /排队 \/ 运行中/);
   assert.match(overview, /TF-12345678/);
+  assert.match(overview, /主动工作[\s\S]*R-123456789ABC[\s\S]*核对季度复盘/);
+  assert.match(overview, /最近 Activity[\s\S]*action\.read[\s\S]*doc:doc-1/);
 
   const agentsPage = await (await fetch(`${admin.url}/agents`)).text();
   assert.match(agentsPage, /Agent 工作区/);

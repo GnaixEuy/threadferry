@@ -37,6 +37,7 @@ test("context contains recent history as untrusted data and preserves the curren
   assert.match(prompt, /trace\.log/);
   assert.match(prompt, /meeting\.create/);
   assert.match(prompt, /attendees/);
+  assert.match(prompt, /不要包含当前消息里被 @ 的机器人名/);
 });
 
 test("context enforces lookback and total message limit", () => {

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { actionCatalog, extractAction, isKnownAction, prepareAction } from "../src/actions.js";
+import { DirectoryUserNotFoundError } from "../src/directory.js";
 
 const fence = (body: string) => "```threadferry-action\n" + body + "\n```";
 
@@ -101,7 +102,7 @@ test("attendees are resolved through the directory, never taken as raw ids", asy
   }), /不支持解析参与人/);
 });
 
-test("meeting creation converts local time and invites resolved directory users", async () => {
+test("meeting creation keeps the official local time format and invites resolved directory users", async () => {
   const prepared = await prepareAction({
     name: "meeting.create",
     arguments: {
@@ -117,10 +118,25 @@ test("meeting creation converts local time and invites resolved directory users"
   assert.deepEqual(prepared.command.slice(0, 3), ["meeting", "create", "--json"]);
   assert.deepEqual(JSON.parse(prepared.command[3]!), {
     subject: "刚才的测试复盘",
-    begin_time: String(Date.parse("2026-08-20T17:00:00+08:00") / 1000),
-    end_time: String(Date.parse("2026-08-20T17:30:00+08:00") / 1000),
+    begin_time: "2026-08-20 17:00:00",
+    end_time: "2026-08-20 17:30:00",
     attendees: [{ userid: "encrypted-user-id" }],
   });
+  assert.match(prepared.formatResult?.({ meeting_id: "meeting-1", meeting_code: "123456789" }) ?? "", /会议 ID：meeting-1[\s\S]*123-456-789/);
+});
+
+test("persistent workflow writes return the resource id needed for follow-up", async () => {
+  const reminder = await prepareAction({
+    name: "reminder.create",
+    arguments: { instruction: "检查待办", run_at: "2026-08-21 09:00:00" },
+  });
+  assert.match(reminder.formatResult?.({ reminder: { id: "R-123456789ABC", nextRunAt: "2026-08-21T01:00:00.000Z" } }) ?? "", /提醒 ID：R-123456789ABC[\s\S]*下次运行/);
+
+  const work = await prepareAction({
+    name: "work.create",
+    arguments: { title: "复盘", description: "整理结论", assignee_agent: "reviewer" },
+  });
+  assert.match(work.formatResult?.({ work: { id: "W-123456789ABC", status: "queued" } }) ?? "", /任务 ID：W-123456789ABC[\s\S]*queued/);
 });
 
 test("read actions prepare official meeting, schedule-free and todo commands", async () => {
@@ -234,6 +250,10 @@ test("mail, document and disk actions use official commands and keep private dat
     arguments: { to: ["external@example.com"], subject: "通知", content: "正文" },
   });
   assert.deepEqual(JSON.parse(externalMail.command[3]!).to, { emails: ["external@example.com"] });
+  await assert.rejects(prepareAction({
+    name: "mail.send",
+    arguments: { to: ["收件人"], subject: "通知", content: "正文" },
+  }, async () => { throw new DirectoryUserNotFoundError("通讯录中没有找到收件人"); }), /通讯录中没有找到收件人/);
 
   const doc = await prepareAction({
     name: "doc.create",
@@ -255,4 +275,44 @@ test("mail, document and disk actions use official commands and keep private dat
   assert.deepEqual(JSON.parse(disk.command[4]!), {
     keywords: ["复盘"], file_types: ["doc", "pdf"], space_keywords: ["项目"], search_type: "all", limit: 10,
   });
+});
+
+test("knowledge actions read full enterprise content with the current official command tree", async () => {
+  const cases: Array<{
+    name: string;
+    arguments: Record<string, unknown>;
+    command: string[];
+    request: Record<string, unknown>;
+  }> = [
+    { name: "doc.read", arguments: { docid: "https://doc.weixin.qq.com/doc/example" }, command: ["doc", "contents", "get"], request: { docid: "https://doc.weixin.qq.com/doc/example", content_type: "markdown" } },
+    { name: "mail.read", arguments: { mail_ids: ["mail-1", "mail-2"] }, command: ["mail", "get"], request: { mail_ids: ["mail-1", "mail-2"] } },
+    { name: "sheet.info", arguments: { docid: "sheet-doc" }, command: ["sheet", "get"], request: { docid: "sheet-doc" } },
+    { name: "sheet.read", arguments: { docid: "sheet-doc", sheet_id: "sheet-1", range: "A1:D20" }, command: ["sheet", "ranges", "get"], request: { docid: "sheet-doc", sheet_id: "sheet-1", range: "A1:D20" } },
+    { name: "smartpage.read", arguments: { docid: "smartpage-doc", page_id: "page-1" }, command: ["smartpage", "pages", "get"], request: { docid: "smartpage-doc", page_id: "page-1", content_type: "markdown" } },
+    { name: "smartsheet.info", arguments: { docid: "smart-doc" }, command: ["smartsheet", "sheets", "list"], request: { docid: "smart-doc" } },
+    { name: "smartsheet.fields", arguments: { docid: "smart-doc", sheet_id: "sheet-1" }, command: ["smartsheet", "fields", "list"], request: { docid: "smart-doc", sheet_id: "sheet-1", type: "fields", limit: 150 } },
+    { name: "smartsheet.records", arguments: { docid: "smart-doc", sheet_id: "sheet-1", field_titles: ["负责人", "状态"], limit: 100 }, command: ["smartsheet", "records", "list"], request: { docid: "smart-doc", sheet_id: "sheet-1", field_titles: ["负责人", "状态"], type: "records", key_type: "field_title", limit: 100 } },
+    { name: "schedule.get", arguments: { schedule_ids: ["schedule-1"] }, command: ["calendar", "schedules", "get"], request: { schedule_ids: ["schedule-1"] } },
+    { name: "meeting.get", arguments: { meeting_id: "meeting-1" }, command: ["meeting", "get"], request: { meeting_ids: [{ meeting_id: "meeting-1" }] } },
+    { name: "meeting.transcript", arguments: { meeting_id: "meeting-1", sub_meeting_id: "sub-1" }, command: ["meeting", "original", "get"], request: { meeting_id: "meeting-1", sub_meeting_id: "sub-1", media_index: 0, limit: 500 } },
+    { name: "meeting.rooms", arguments: { begin_time: "2026-08-21 10:00:00", end_time: "2026-08-21 11:00:00", capacity_min: 6 }, command: ["meeting", "rooms", "search"], request: { begin_time: "2026-08-21 10:00:00", end_time: "2026-08-21 11:00:00", capacity_min: 6, limit: 20 } },
+    { name: "todo.get", arguments: { todo_ids: ["todo-1"] }, command: ["todo", "get"], request: { items: [{ todo_id: "todo-1" }] } },
+    { name: "disk.get", arguments: { file_id: "file-1" }, command: ["disk", "files", "get"], request: { file_id: "file-1" } },
+    { name: "disk.list", arguments: {}, command: ["disk", "files", "list"], request: { limit: 20 } },
+  ];
+
+  for (const item of cases) {
+    const prepared = await prepareAction({ name: item.name, arguments: item.arguments });
+    assert.equal(prepared.mode, "read", item.name);
+    assert.equal(prepared.private, true, item.name);
+    assert.deepEqual(prepared.command.slice(0, item.command.length), item.command, item.name);
+    const jsonIndex = prepared.command.indexOf("--json");
+    assert.deepEqual(JSON.parse(prepared.command[jsonIndex + 1]!), item.request, item.name);
+  }
+});
+
+test("activity resource identity never persists an enterprise URL", async () => {
+  const prepared = await prepareAction({ name: "doc.read", arguments: { docid: "https://doc.example/path?token=secret" } });
+  assert.match(prepared.resource ?? "", /^doc:[a-f0-9]{16}$/);
+  assert.doesNotMatch(prepared.resource ?? "", /token|secret|https/);
 });

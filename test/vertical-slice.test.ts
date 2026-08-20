@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { createApp } from "../src/app.js";
-import { listWecomGroups, runWecomAction, searchWecomUsers, sendWecomReply, wecomFailureReason } from "../src/channels/wecom.js";
+import { listWecomGroups, runWecomAction, searchWecomUsers, sendWecomReply, standardizeAuthChange, wecomFailureReason } from "../src/channels/wecom.js";
 import { addAgent, agentView, loadConfig, onboardingDefaults, pairConfig, refreshAgentView, resolveWorkspace, saveConfig, setupConfig } from "../src/config.js";
 import { fetchWecomHistory } from "../src/history/wecom-cli.js";
 import { CommandExecutionError, runCommand } from "../src/process.js";
@@ -89,7 +89,7 @@ test("mock WeCom -> history -> context -> Codex -> reply vertical slice", async 
   assert.equal(await app.handle(message, reply), "handled");
   assert.equal(runtimeCalls, 1);
   assert.deepEqual(replies, [
-    { content: "ThreadFerry 已收到，正在分析。", finish: false },
+    { content: "default（ThreadFerry）已收到，正在分析。", finish: false },
     { content: "只读分析结果", finish: true },
   ]);
   for (const expected of ["张三", "这个接口有问题", "李四", "可能是 Redis", "王五", "线上出现三次", "@ThreadFerry 帮忙分析"]) {
@@ -258,7 +258,7 @@ test("owner is recognized when the callback uses a different userid namespace th
   // 回调给明文 userid（SuYueXiang），配置存的是目录 ID（wow-...），映射后应识别为 Owner。
   assert.equal(await send("m1", "SuYueXiang", "帮我分析一下"), "handled");
   assert.equal(runtimeCalls, 1);
-  assert.equal(replies[0], "ThreadFerry 已收到，正在分析。");
+  assert.equal(replies[0], "default（ThreadFerry）已收到，正在分析。");
   // whoami 展示统一为目录 ID，和配置/管理台一致，不再一会儿拼音一会儿官方 ID。
   assert.equal(await send("m2", "SuYueXiang", "threadferry whoami"), "command");
   assert.match(replies.at(-1) ?? "", /wow-owner-directory-id/);
@@ -404,17 +404,17 @@ test("a write request is proposed, waits for the owner, and only then executes",
   assert.equal(executed.length, 1);
 });
 
-test("an owner meeting request creates it immediately and invites named attendees", async () => {
+test("an owner meeting request invites directory users and excludes bot names", async () => {
   const executed: string[][] = [];
   const replies: string[] = [];
   const app = createApp(testConfig("/workspace", "owner"), {
     history: async () => [],
     runtime: async () => ({
       text: "我来安排。\n\n```threadferry-action\n"
-        + '{"action":"meeting.create","subject":"刚才的测试复盘","begin_time":"2026-08-20 17:00:00","end_time":"2026-08-20 17:30:00","attendees":["平平无奇小天才"]}'
+        + '{"action":"meeting.create","subject":"刚才的测试复盘","begin_time":"2026-08-20 17:00:00","end_time":"2026-08-20 17:30:00","attendees":["平平无奇小天才","叶翔"]}'
         + "\n```",
     }),
-    searchUsers: async () => [{ id: "invitee-id", name: "平平无奇小天才" }],
+    searchUsers: async (keywords) => keywords[0] === "叶翔" ? [] : [{ id: "invitee-id", name: "平平无奇小天才" }],
     runAction: async (command) => {
       executed.push(command);
       return { meeting_code: "123456789", meeting_link: "https://meeting.example/join" };
@@ -423,13 +423,14 @@ test("an owner meeting request creates it immediately and invites named attendee
 
   assert.equal(await app.handle({
     msgId: "m-owner-meeting", groupId: "group", senderId: "owner", time: new Date(),
-    text: "@机器人 创建 没问题", mentioned: true,
+    text: "@悦翔 你也拉一场会吧，同时间，不过主题是批判", mentioned: true,
   }, async (content, finish = true) => { if (finish) replies.push(content); }), "handled");
 
   assert.equal(executed.length, 1);
   assert.deepEqual(executed[0]!.slice(0, 3), ["meeting", "create", "--json"]);
   assert.deepEqual(JSON.parse(executed[0]![3]!).attendees, [{ userid: "invitee-id" }]);
   assert.match(replies.at(-1) ?? "", /已自动执行[\s\S]*参与人：平平无奇小天才/);
+  assert.doesNotMatch(replies.at(-1) ?? "", /这个动作我没法执行|通讯录中没有找到/);
   assert.match(replies.at(-1) ?? "", /123-456-789[\s\S]*https:\/\/meeting\.example\/join/);
   assert.doesNotMatch(replies.at(-1) ?? "", /threadferry confirm/);
 });
@@ -466,9 +467,131 @@ test("owner direct chat can query enterprise data and gets formatted results", a
   assert.doesNotMatch(replies.at(-1) ?? "", /threadferry confirm/);
 });
 
+test("owner direct chat can chain reads and create a meeting from their results", async () => {
+  const calls: Array<{ command: string[]; write: boolean }> = [];
+  const prompts: string[] = [];
+  const sessions: Array<string | undefined> = [];
+  const replies: string[] = [];
+  let turn = 0;
+  const runtimeReplies = [
+    "```threadferry-action\n{\"action\":\"doc.search\",\"keywords\":[\"季度复盘\"]}\n```",
+    "```threadferry-action\n{\"action\":\"doc.read\",\"docid\":\"doc-1\"}\n```",
+    "已找到未完成事项并安排责任人复盘。\n```threadferry-action\n{\"action\":\"meeting.create\",\"subject\":\"季度未完成事项复盘\",\"begin_time\":\"2026-08-21 10:00:00\",\"end_time\":\"2026-08-21 10:30:00\",\"attendees\":[\"张三\"]}\n```",
+  ];
+  const app = createApp(testConfig("/workspace", "owner"), {
+    history: async () => [],
+    runtime: async (request) => {
+      prompts.push(request.prompt);
+      sessions.push(request.sessionId);
+      return { text: runtimeReplies[turn++]!, sessionId: "knowledge-session" };
+    },
+    searchUsers: async () => [{ id: "zhangsan-id", name: "张三" }],
+    runAction: async (command, write) => {
+      calls.push({ command, write });
+      if (command[0] === "doc" && command[1] === "search") {
+        return { docs: [{ doc_name: "季度复盘", docid: "doc-1", url: "https://doc.weixin.qq.com/doc/doc-1" }] };
+      }
+      if (command[0] === "doc" && command[1] === "contents") {
+        return { name: "季度复盘", content: "未完成：张三负责上线复核。" };
+      }
+      return { meeting_code: "123456789" };
+    },
+  });
+
+  assert.equal(await app.handleDirect({
+    msgId: "d-chain", senderId: "owner", time: new Date(),
+    text: "读取季度复盘，找出未完成事项，然后创建会议并邀请责任人",
+  }, async (content, finish = true) => { if (finish) replies.push(content); }), "handled");
+
+  assert.deepEqual(calls.map(({ command, write }) => ({ path: command.slice(0, 3).join("."), write })), [
+    { path: "doc.search.--json", write: false },
+    { path: "doc.contents.get", write: false },
+    { path: "meeting.create.--json", write: true },
+  ]);
+  assert.deepEqual(sessions, [undefined, "knowledge-session", "knowledge-session"]);
+  assert.match(prompts[1] ?? "", /UNTRUSTED_ACTION_RESULT[\s\S]*doc-1/);
+  assert.match(prompts[2] ?? "", /UNTRUSTED_ACTION_RESULT[\s\S]*张三负责上线复核/);
+  assert.match(replies.at(-1) ?? "", /已自动执行[\s\S]*季度未完成事项复盘[\s\S]*张三[\s\S]*123-456-789/);
+});
+
+test("owner can persist proactive reminders and cross-agent work without exposing credentials to runtime", async () => {
+  const state = new ThreadFerryState();
+  const replies: string[] = [];
+  const runtimeTexts = [
+    "```threadferry-action\n{\"action\":\"reminder.create\",\"instruction\":\"检查未完成待办并汇报\",\"run_at\":\"2026-08-21 09:00:00\"}\n```",
+    "```threadferry-action\n{\"action\":\"work.create\",\"title\":\"核对季度复盘\",\"description\":\"读取复盘并列出未完成事项\",\"assignee_agent\":\"researcher\",\"reviewer_agent\":\"reviewer\"}\n```",
+  ];
+  let runtimeCall = 0;
+  const app = createApp(testConfig("/workspace", "owner"), {
+    history: async () => [],
+    runtime: async () => ({ text: runtimeTexts[runtimeCall++]! }),
+    agentIds: () => ["default", "researcher", "reviewer"],
+    agentOwners: () => ({ default: "owner", researcher: "owner", reviewer: "owner" }),
+  }, state);
+  const send = (msgId: string, text: string) => app.handleDirect({
+    msgId, senderId: "owner", time: new Date(), text,
+  }, async (content, finish = true) => { if (finish) replies.push(content); });
+
+  assert.equal(await send("reminder-create", "设置提醒，明天九点检查未完成待办并汇报"), "handled");
+  assert.match(replies.at(-1) ?? "", /已自动执行[\s\S]*创建提醒[\s\S]*提醒 ID：R-/);
+  const reminder = (await state.listReminders("default"))[0]!;
+  assert.equal(reminder.instruction, "检查未完成待办并汇报");
+  assert.equal(reminder.chatId, "owner");
+
+  assert.equal(await send("work-create", "交给 researcher Agent 处理，并让 reviewer Agent 复核"), "handled");
+  assert.match(replies.at(-1) ?? "", /已自动执行[\s\S]*创建协作任务[\s\S]*任务 ID：W-/);
+  const work = (await state.listWorkItems("default"))[0]!;
+  assert.equal(work.assignedAgent, "researcher");
+  assert.equal(work.reviewerAgent, "reviewer");
+  assert.equal(work.createdAgent, "default");
+});
+
+test("owner cannot assign work to an agent owned by someone else", async () => {
+  const state = new ThreadFerryState();
+  const replies: string[] = [];
+  const app = createApp(testConfig("/workspace", "owner-a"), {
+    history: async () => [],
+    runtime: async () => ({ text: "```threadferry-action\n"
+      + '{"action":"work.create","title":"跨企业任务","description":"读取资料","assignee_agent":"outsider"}'
+      + "\n```" }),
+    agentIds: () => ["default", "outsider"],
+    agentOwners: () => ({ default: "owner-a", outsider: "owner-b" }),
+  }, state);
+
+  assert.equal(await app.handleDirect({
+    msgId: "cross-owner-work", senderId: "owner-a", time: new Date(), text: "交给 outsider Agent 处理",
+  }, async (content, finish = true) => { if (finish) replies.push(content); }), "handled");
+  assert.match(replies.at(-1) ?? "", /只能把任务交给同一 Owner 的 Agent/);
+  assert.equal((await state.listWorkItems()).length, 0);
+});
+
+test("a created meeting schedules a private transcript follow-up after it ends", async () => {
+  const state = new ThreadFerryState();
+  const app = createApp(testConfig("/workspace", "owner"), {
+    history: async () => [],
+    runtime: async () => ({
+      text: "```threadferry-action\n"
+        + '{"action":"meeting.create","subject":"项目复盘","begin_time":"2026-08-21 10:00:00","end_time":"2026-08-21 10:30:00"}'
+        + "\n```",
+    }),
+    runAction: async () => ({ meeting_id: "meeting-1", meeting_code: "123456789" }),
+  }, state);
+
+  await app.handle({
+    msgId: "meeting-followup", groupId: "group", senderId: "owner", time: new Date(),
+    text: "@机器人 创建项目复盘会议", mentioned: true,
+  }, async () => undefined);
+  const reminder = (await state.listReminders("default"))[0]!;
+  assert.equal(reminder.chatType, "single");
+  assert.equal(reminder.chatId, "owner");
+  assert.match(reminder.instruction, /meeting-1[\s\S]*转写原文[\s\S]*结论.*待办/);
+  assert.equal(reminder.nextRunAt, "2026-08-21T02:35:00.000Z");
+});
+
 test("enterprise data queries never run or disclose results in a group", async () => {
   let executions = 0;
   const replies: string[] = [];
+  const state = new ThreadFerryState();
   const app = createApp(testConfig("/workspace", "owner"), {
     history: async () => [],
     runtime: async () => ({
@@ -477,7 +600,7 @@ test("enterprise data queries never run or disclose results in a group", async (
         + "\n```",
     }),
     runAction: async () => { executions += 1; },
-  });
+  }, state);
 
   await app.handle({
     msgId: "m-query-todo", groupId: "group", senderId: "owner", time: new Date(),
@@ -485,6 +608,15 @@ test("enterprise data queries never run or disclose results in a group", async (
   }, async (content, finish = true) => { if (finish) replies.push(content); });
   assert.equal(executions, 0);
   assert.match(replies.at(-1) ?? "", /只在 Owner 私聊/);
+  const denial = (await state.recentActivities()).find((item) => item.type === "action.denied")!;
+  assert.deepEqual(denial, {
+    id: denial.id,
+    agent: "default",
+    type: "action.denied",
+    outcome: "failure",
+    resource: "todo.list",
+    at: denial.at,
+  });
 });
 
 test("private mail operations never stage or run in a group", async () => {
@@ -580,6 +712,22 @@ test("wecom actions pass dry-run before the real write", async () => {
     return { stdout: JSON.stringify({ errcode: 0, data: { meetings: [] } }), stderr: "" };
   }, false);
   assert.deepEqual(calls, [["meeting", "search", "--json", "{}"]]);
+});
+
+test("long enterprise content is read from an isolated temp directory without leaking its path", async () => {
+  let outputDirectory = "";
+  const result = await runWecomAction(["doc", "contents", "get", "--json", "{\"docid\":\"doc-1\"}"], async (_command, args) => {
+    const outputIndex = args.indexOf("--output-dir");
+    assert.ok(outputIndex > 0);
+    outputDirectory = args[outputIndex + 1]!;
+    const file = join(outputDirectory, "doc_content");
+    await writeFile(file, "# 复盘\n\n未完成：张三负责上线复核。", { mode: 0o600 });
+    return { stdout: JSON.stringify({ errcode: 0, data: { name: "季度复盘", file_path: file } }), stderr: "" };
+  }, false);
+
+  assert.deepEqual(result, { name: "季度复盘", content: "# 复盘\n\n未完成：张三负责上线复核。" });
+  await assert.rejects(stat(outputDirectory), /ENOENT/);
+  assert.doesNotMatch(JSON.stringify(result), /threadferry-action-/);
 });
 
 test("an unexecutable proposal explains itself instead of silently dropping", async () => {
@@ -1009,7 +1157,7 @@ test("a newer group message makes the completed analysis stale", async () => {
 
   assert.equal(status, "stale");
   assert.deepEqual(replies, [
-    { content: "ThreadFerry 已收到，正在分析。", finish: false },
+    { content: "default（ThreadFerry）已收到，正在分析。", finish: false },
     { content: "分析期间群里出现了新消息。为避免发送过期结论，请重新 @机器人。", finish: true },
   ]);
 });
@@ -1043,7 +1191,7 @@ test("same-group turns run serially and queued users get immediate feedback", as
   await new Promise<void>((resolve) => setImmediate(resolve));
 
   assert.equal(calls, 1);
-  assert.equal(secondReplies[0], "ThreadFerry 已收到，当前群有任务处理中，已排队。");
+  assert.equal(secondReplies[0], "default（ThreadFerry）已收到，当前群有任务处理中，已排队。");
   releaseFirst();
   assert.deepEqual(await Promise.all([first, second]), ["handled", "handled"]);
   assert.equal(maxActive, 1);
@@ -1238,6 +1386,26 @@ test("active WeCom reply uses message.aibot.send with a JSON argument", async ()
     return { stdout: JSON.stringify({ errcode: 0, data: { success: true } }), stderr: "" };
   };
   await sendWecomReply("group", "恢复结果", runner);
+});
+
+test("document permission changes resume only the authenticated user's direct session", () => {
+  const event = standardizeAuthChange({
+    headers: { req_id: "req-1" },
+    body: {
+      msgid: "auth-1",
+      create_time: 1_787_210_000,
+      from: { userid: "owner" },
+      msgtype: "event",
+      event: { eventtype: "auth_change_event", auth_change_event: { auth_list: [1, 2] } },
+    },
+  });
+  assert.equal(event?.chatType, "single");
+  assert.equal(event?.message.senderId, "owner");
+  assert.match(event?.message.text ?? "", /新建和编辑文档[\s\S]*获取成员文档内容[\s\S]*不要扩大原请求范围/);
+  assert.equal(standardizeAuthChange({
+    headers: { req_id: "req-2" },
+    body: { msgid: "feedback-1", from: { userid: "owner" }, event: { eventtype: "feedback_event" } },
+  }), undefined);
 });
 
 test("Codex starts a fresh session only when a saved session is definitely missing", async (t) => {

@@ -44,9 +44,11 @@ import {
 } from "./setup-wizard.js";
 import type { AgentView, CommandRunner, GroupMessage, IncomingMention, RuntimeName, ThreadFerryConfig } from "./types.js";
 import { findUpdate, installUpdate } from "./update.js";
+import { runWorkflowTick } from "./workflow.js";
 
-const VERSION = "0.19.0";
+const VERSION = "0.20.3";
 const UPDATE_INTERVAL_MS = 6 * 60 * 60 * 1_000;
+const WORKFLOW_INTERVAL_MS = 30_000;
 const USAGE = `ThreadFerry ${VERSION}
 
 Usage:
@@ -721,10 +723,13 @@ async function status(configPath?: string): Promise<void> {
   const counts = new Map<string, number>();
   for (const turn of snapshot.turns) counts.set(turn.status, (counts.get(turn.status) ?? 0) + 1);
   const active = (counts.get("queued") ?? 0) + (counts.get("running") ?? 0);
+  const reminders = (snapshot.reminders ?? []).filter((item) => item.status === "scheduled" || item.status === "running").length;
+  const workItems = (snapshot.workItems ?? []).filter((item) => item.status !== "completed" && item.status !== "failed").length;
   const lastFailure = snapshot.turns.slice().reverse().find((turn) => turn.status === "failed");
   console.log(`ThreadFerry: ${active > 0 ? `${active} 个任务处理中或排队` : "空闲"}`);
   console.log(`配置 Agent: ${Object.keys(config.agents).length}；群: ${Object.keys(config.groups).length}；Session: ${snapshot.sessions.length}；执行记录: ${snapshot.turns.length}`);
   console.log(`可靠性队列: inbox=${snapshot.inbox.length}, outbox=${snapshot.outbox.length}`);
+  console.log(`主动工作: reminders=${reminders}, work=${workItems}`);
   console.log(`结果: handled=${counts.get("handled") ?? 0}, stale=${counts.get("stale") ?? 0}, failed=${counts.get("failed") ?? 0}`);
   if (lastFailure) console.log(`最近失败: ${lastFailure.errorId ?? "无错误编号"} phase=${lastFailure.failurePhase ?? "unknown"} time=${lastFailure.updatedAt}`);
 }
@@ -893,6 +898,8 @@ async function start(
       }),
       listGroups: () => listWecomGroups(runner),
       searchUsers: (keywords) => searchWecomUsers(keywords, runner),
+      agentIds: () => Object.keys(config.agents),
+      agentOwners: () => Object.fromEntries(Object.entries(config.agents).map(([id, agent]) => [id, agent.ownerUser])),
       // 白名单动作由 ThreadFerry 用这个 Agent 自己的凭据执行；Runtime 沙箱不参与。
       runAction: async (command, write) => {
         try {
@@ -1020,6 +1027,23 @@ async function start(
       }
       console.log(`ThreadFerry 已启动，${hosts.length} 个 Agent 各自一条企业微信机器人连接。`);
 
+      const workflowHosts = hosts.map((host) => ({
+        agentId: host.agentId,
+        ownerUser: host.view.ownerUser,
+        runAutomation: host.app.runAutomation,
+        notify: async (chatId: string, content: string) => {
+          const client = clients.get(host.agentId);
+          if (client) {
+            try {
+              return await pushWecomMessage(client, chatId, content);
+            } catch {
+              // 长连接暂时不可用时退回该 Agent 自己的 wecom-cli 凭据。
+            }
+          }
+          await sendWecomReply(chatId, content, host.runner);
+        },
+      }));
+
       // 一个群可能挂着多台机器人，所以恢复优先认状态记录里的 Agent；
       // 旧记录没有这个字段时，只有群里恰好只有一个 Agent 才敢兜底，否则宁可不发也不冒名。
       const hostForGroup = (groupId: string, agent?: string) => {
@@ -1032,8 +1056,12 @@ async function start(
           // 必须用该群所属 Agent 的机器人补发；用别的机器人会从错误身份发出去。
           const host = hostForGroup(delivery.groupId, delivery.agent);
           if (!host) {
+            if (delivery.agent) {
+              console.error(`[state] 保留待发送回复：Agent ${delivery.agent} 未启动`);
+              continue;
+            }
             await state.completeDelivery(delivery.id);
-            console.error("[state] 已丢弃待发送回复：群未配置、对应 Agent 未启动，或无法确定该由哪台机器人补发");
+            console.error("[state] 已丢弃旧版待发送回复：群未配置或无法确定该由哪台机器人补发");
             continue;
           }
           try {
@@ -1068,14 +1096,17 @@ async function start(
       await new Promise<void>((done) => {
         let stopping = false;
         let updateCheck: Promise<void> | undefined;
+        let workflowCheck: Promise<void> | undefined;
         let updateTimer: NodeJS.Timeout;
+        let workflowTimer: NodeJS.Timeout;
         const stop = (cancel: boolean) => {
           if (stopping) return;
           stopping = true;
           clearInterval(updateTimer);
+          clearInterval(workflowTimer);
           for (const connection of connections) connection.disconnect();
           void admin.close();
-          void Promise.all([...hosts.map(({ app }) => app.shutdown(cancel)), recovery, updateCheck]).finally(done);
+          void Promise.all([...hosts.map(({ app }) => app.shutdown(cancel)), recovery, updateCheck, workflowCheck]).finally(done);
         };
         updateTimer = setInterval(() => {
           if (stopping || updateCheck) return;
@@ -1088,6 +1119,15 @@ async function start(
             .finally(() => { updateCheck = undefined; });
         }, UPDATE_INTERVAL_MS);
         updateTimer.unref();
+        const runWorkflows = () => {
+          if (stopping || workflowCheck) return;
+          workflowCheck = recovery.then(() => runWorkflowTick(state, workflowHosts))
+            .catch((error) => console.error(`[workflow] 调度失败 reason=${wecomFailureReason(error)}`))
+            .finally(() => { workflowCheck = undefined; });
+        };
+        workflowTimer = setInterval(runWorkflows, WORKFLOW_INTERVAL_MS);
+        workflowTimer.unref();
+        runWorkflows();
         process.once("SIGINT", () => stop(true));
         process.once("SIGTERM", () => stop(true));
       });

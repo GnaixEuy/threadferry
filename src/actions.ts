@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+import { DirectoryUserNotFoundError } from "./directory.js";
 import type { DirectoryUser } from "./types.js";
 
 /**
@@ -19,12 +21,15 @@ export interface ProposedAction {
 }
 
 export interface PreparedAction {
+  name: string;
   /** 给人看的动作摘要。 */
   summary: string;
   /** 真正要执行的 wecom-cli 参数。 */
   command: string[];
   mode: "read" | "write" | "destructive";
   private?: boolean;
+  /** 本机审计使用的资源标识，不包含正文或凭据。 */
+  resource?: string;
   formatResult?: (result: Record<string, unknown>) => string | undefined;
 }
 
@@ -37,6 +42,7 @@ const CREATE_CONFIRMATION = /(?:^|\s)(?:创建(?:\s*没问题)?|确认创建|可
 const DATE = /^\d{4}-\d{2}-\d{2}$/;
 const MAX_ATTENDEES = 50;
 const EMAIL = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const SHEET_RANGE = /^[A-Za-z]{1,3}\d+(?::[A-Za-z]{1,3}\d+)?$/;
 
 function text(value: unknown, field: string, max: number, required = false): string | undefined {
   if (value === undefined || value === null || value === "") {
@@ -66,8 +72,8 @@ function byteText(value: unknown, field: string, maxBytes: number, required = fa
   return parsed;
 }
 
-function unixTime(value: string): string {
-  return String(Date.parse(`${value.replace(" ", "T")}+08:00`) / 1000);
+function isoTime(value: string): string {
+  return new Date(`${value.replace(" ", "T")}+08:00`).toISOString();
 }
 
 function optionalTime(value: unknown, field: string): string | undefined {
@@ -126,10 +132,29 @@ function meetingCode(value: string): string {
 }
 
 function formatMeetingCreate(result: Record<string, unknown>): string | undefined {
+  const id = field(result, "meeting_id");
   const code = field(result, "meeting_code");
   const link = field(result, "meeting_link");
-  const lines = [code ? `会议号：${meetingCode(code)}` : undefined, link ? `入会链接：${link}` : undefined].filter(Boolean);
+  const lines = [id ? `会议 ID：${id}` : undefined, code ? `会议号：${meetingCode(code)}` : undefined, link ? `入会链接：${link}` : undefined].filter(Boolean);
   return lines.length ? lines.join("\n") : undefined;
+}
+
+function formatReminderMutation(result: Record<string, unknown>): string | undefined {
+  const reminder = result.reminder;
+  if (!reminder || typeof reminder !== "object" || Array.isArray(reminder)) return undefined;
+  const item = reminder as Record<string, unknown>;
+  const id = field(item, "id");
+  const next = field(item, "nextRunAt");
+  return [id ? `提醒 ID：${id}` : undefined, next ? `下次运行：${next}` : undefined].filter(Boolean).join("\n") || undefined;
+}
+
+function formatWorkMutation(result: Record<string, unknown>): string | undefined {
+  const work = result.work;
+  if (!work || typeof work !== "object" || Array.isArray(work)) return undefined;
+  const item = work as Record<string, unknown>;
+  const id = field(item, "id");
+  const status = field(item, "status");
+  return [id ? `任务 ID：${id}` : undefined, status ? `状态：${status}` : undefined].filter(Boolean).join("\n") || undefined;
 }
 
 function formatMeetings(result: Record<string, unknown>): string {
@@ -232,7 +257,7 @@ function formatDiskFiles(result: Record<string, unknown>): string {
   ].filter(Boolean).join("\n")).join("\n\n");
 }
 
-async function attendeeIds(value: unknown, resolve: UserResolver | undefined): Promise<Array<{ userid: string; name: string }>> {
+async function attendeeIds(value: unknown, resolve: UserResolver | undefined, skipMissing = true): Promise<Array<{ userid: string; name: string }>> {
   if (value === undefined || value === null) return [];
   if (!Array.isArray(value)) throw new Error("参与人必须是列表");
   if (value.length > MAX_ATTENDEES) throw new Error(`参与人最多 ${MAX_ATTENDEES} 人`);
@@ -241,7 +266,13 @@ async function attendeeIds(value: unknown, resolve: UserResolver | undefined): P
   const ids: Array<{ userid: string; name: string }> = [];
   for (const entry of value) {
     const reference = text(entry, "参与人", 512, true)!;
-    const user = await resolve(reference);
+    let user: DirectoryUser;
+    try {
+      user = await resolve(reference);
+    } catch (error) {
+      if (skipMissing && error instanceof DirectoryUserNotFoundError) continue;
+      throw error;
+    }
     if (!ids.some((known) => known.userid === user.id)) ids.push({ userid: user.id, name: user.name });
   }
   return ids;
@@ -253,7 +284,7 @@ async function recipients(value: unknown, fieldName: string, resolve: UserResolv
 }> {
   const references = texts(value, fieldName, 50, required);
   const emails = references.filter((reference) => EMAIL.test(reference));
-  const users = await attendeeIds(references.filter((reference) => !EMAIL.test(reference)), resolve);
+  const users = await attendeeIds(references.filter((reference) => !EMAIL.test(reference)), resolve, false);
   return {
     value: { ...(emails.length ? { emails } : {}), ...(users.length ? { userids: users.map(({ userid }) => userid) } : {}) },
     labels: [...emails, ...users.map(({ name }) => name)],
@@ -267,6 +298,17 @@ interface ActionSpec {
   explicitRequest?: RegExp;
   formatResult?: PreparedAction["formatResult"];
   prepare: (args: Record<string, unknown>, resolve?: UserResolver) => Promise<Pick<PreparedAction, "summary" | "command">>;
+}
+
+function resourceForAction(action: ProposedAction): string | undefined {
+  for (const fieldName of ["reminder_id", "work_id", "meeting_id", "schedule_id", "todo_id", "docid", "file_id", "url"]) {
+    const value = action.arguments[fieldName];
+    if (typeof value === "string" && value) {
+      const identity = value.includes("://") ? createHash("sha256").update(value).digest("hex").slice(0, 16) : value;
+      return `${action.name.split(".")[0]}:${identity}`;
+    }
+  }
+  return action.name;
 }
 
 const ACTIONS: Record<string, ActionSpec> = {
@@ -314,6 +356,15 @@ const ACTIONS: Record<string, ActionSpec> = {
       if (beginTime && endTime && endTime <= beginTime) throw new Error("结束时间必须晚于开始时间");
       const request = { keywords, ...(beginTime ? { begin_time: beginTime } : {}), ...(endTime ? { end_time: endTime } : {}), limit: 10 };
       return { summary: `动作：搜索日程\n关键词：${keywords.join("、")}`, command: ["calendar", "schedules", "search", "--json", JSON.stringify(request)] };
+    },
+  },
+  "schedule.get": {
+    guide: "读取日程详情；参数：schedule_ids；只在 Owner 私聊执行",
+    mode: "read",
+    private: true,
+    async prepare(args) {
+      const scheduleIds = texts(args.schedule_ids, "日程 ID", 20, true);
+      return { summary: `动作：读取日程详情\n日程 ID：${scheduleIds.join("、")}`, command: ["calendar", "schedules", "get", "--json", JSON.stringify({ schedule_ids: scheduleIds })] };
     },
   },
   "schedule.free": {
@@ -370,7 +421,7 @@ const ACTIONS: Record<string, ActionSpec> = {
   "meeting.create": {
     guide: "创建企业微信会议（用户说会议时使用）；参数：subject、begin_time、end_time，选填 description、location、attendees（参与人姓名数组；用户说了邀请谁就必须完整带上）",
     mode: "write",
-    explicitRequest: /(?:(?:创建|新建|建|发起|安排|预约|约).{0,20}(?:会议|开会|个会)|(?:会议|开会).{0,20}(?:创建|新建|建|发起|安排|预约)|(?:create|schedule|book|set up).{0,40}meeting)/i,
+    explicitRequest: /(?:(?:创建|新建|建|发起|安排|预约|约|拉).{0,20}(?:会议|开会|个会|场会)|(?:会议|开会).{0,20}(?:创建|新建|建|发起|安排|预约)|(?:create|schedule|book|set up).{0,40}meeting)/i,
     formatResult: formatMeetingCreate,
     async prepare(args, resolve) {
       const subject = byteText(args.subject, "会议标题", 255, true)!;
@@ -382,8 +433,8 @@ const ACTIONS: Record<string, ActionSpec> = {
       const attendees = await attendeeIds(args.attendees, resolve);
       const request = {
         subject,
-        begin_time: unixTime(beginTime),
-        end_time: unixTime(endTime),
+        begin_time: beginTime,
+        end_time: endTime,
         ...(description ? { description } : {}),
         ...(location ? { location } : {}),
         ...(attendees.length > 0 ? { attendees: attendees.map(({ userid }) => ({ userid })) } : {}),
@@ -412,6 +463,63 @@ const ACTIONS: Record<string, ActionSpec> = {
       if (beginTime && endTime && endTime <= beginTime) throw new Error("结束时间必须晚于开始时间");
       const request = { keywords, ...(beginTime ? { begin_time: beginTime } : {}), ...(endTime ? { end_time: endTime } : {}), limit: 10 };
       return { summary: `动作：搜索会议\n关键词：${keywords.join("、")}`, command: ["meeting", "search", "--json", JSON.stringify(request)] };
+    },
+  },
+  "meeting.get": {
+    guide: "读取会议详情；参数：meeting_id，选填 sub_meeting_id；只在 Owner 私聊执行",
+    mode: "read",
+    private: true,
+    async prepare(args) {
+      const meetingId = text(args.meeting_id, "会议 ID", 512, true)!;
+      const subMeetingId = text(args.sub_meeting_id, "子会议 ID", 512);
+      const item = { meeting_id: meetingId, ...(subMeetingId ? { sub_meeting_id: subMeetingId } : {}) };
+      return { summary: `动作：读取会议详情\n会议 ID：${meetingId}`, command: ["meeting", "get", "--json", JSON.stringify({ meeting_ids: [item] })] };
+    },
+  },
+  "meeting.transcript": {
+    guide: "读取会议转写原文；参数：meeting_id 或 url，选填 sub_meeting_id、media_index；只在 Owner 私聊执行",
+    mode: "read",
+    private: true,
+    async prepare(args) {
+      const meetingId = text(args.meeting_id, "会议 ID", 512);
+      const url = text(args.url, "会议链接", 5_000);
+      if (!meetingId && !url) throw new Error("会议 ID 和会议链接至少提供一项");
+      const subMeetingId = text(args.sub_meeting_id, "子会议 ID", 512);
+      const mediaIndex = integer(args.media_index, "媒体索引", 0, 0, 10_000);
+      const request = {
+        ...(meetingId ? { meeting_id: meetingId } : {}),
+        ...(url ? { url } : {}),
+        ...(subMeetingId ? { sub_meeting_id: subMeetingId } : {}),
+        media_index: mediaIndex,
+        limit: 500,
+      };
+      return { summary: `动作：读取会议转写\n会议：${meetingId ?? url}`, command: ["meeting", "original", "get", "--json", JSON.stringify(request)] };
+    },
+  },
+  "meeting.rooms": {
+    guide: "查询可用会议室；参数：begin_time、end_time，选填 city_name、building_name、floor_name、room_name、capacity_min；只在 Owner 私聊执行",
+    mode: "read",
+    private: true,
+    async prepare(args) {
+      const beginTime = time(args.begin_time, "开始时间");
+      const endTime = time(args.end_time, "结束时间");
+      if (endTime <= beginTime) throw new Error("结束时间必须晚于开始时间");
+      const cityName = text(args.city_name, "城市", 128);
+      const buildingName = text(args.building_name, "楼栋", 128);
+      const floorName = text(args.floor_name, "楼层", 128);
+      const roomName = text(args.room_name, "会议室", 128);
+      const capacityMin = args.capacity_min === undefined ? undefined : integer(args.capacity_min, "最小容量", 1, 1, 10_000);
+      const request = {
+        begin_time: beginTime,
+        end_time: endTime,
+        ...(cityName ? { city_name: cityName } : {}),
+        ...(buildingName ? { building_name: buildingName } : {}),
+        ...(floorName ? { floor_name: floorName } : {}),
+        ...(roomName ? { room_name: roomName } : {}),
+        ...(capacityMin ? { capacity_min: capacityMin } : {}),
+        limit: 20,
+      };
+      return { summary: `动作：查询会议室\n时间：${beginTime} → ${endTime}`, command: ["meeting", "rooms", "search", "--json", JSON.stringify(request)] };
     },
   },
   "meeting.update": {
@@ -483,6 +591,15 @@ const ACTIONS: Record<string, ActionSpec> = {
       return { summary: `动作：查询待办\n状态：${status}`, command: ["todo", "list", "--json", JSON.stringify(request)] };
     },
   },
+  "todo.get": {
+    guide: "读取待办详情；参数：todo_ids；只在 Owner 私聊执行",
+    mode: "read",
+    private: true,
+    async prepare(args) {
+      const todoIds = texts(args.todo_ids, "待办 ID", 20, true);
+      return { summary: `动作：读取待办详情\n待办 ID：${todoIds.join("、")}`, command: ["todo", "get", "--json", JSON.stringify({ items: todoIds.map((todoId) => ({ todo_id: todoId })) })] };
+    },
+  },
   "todo.update": {
     guide: "更新待办；参数：todo_id，及 title、description、deadline 中至少一项",
     mode: "write",
@@ -549,6 +666,15 @@ const ACTIONS: Record<string, ActionSpec> = {
       return { summary: "动作：搜索邮件", command: ["mail", "search", "--json", JSON.stringify(request)] };
     },
   },
+  "mail.read": {
+    guide: "读取邮件正文和附件信息；参数：mail_ids；只在 Owner 私聊执行",
+    mode: "read",
+    private: true,
+    async prepare(args) {
+      const mailIds = texts(args.mail_ids, "邮件 ID", 20, true);
+      return { summary: `动作：读取邮件\n邮件 ID：${mailIds.join("、")}`, command: ["mail", "get", "--json", JSON.stringify({ mail_ids: mailIds })] };
+    },
+  },
   "mail.send": {
     guide: "发送纯文本或 Markdown 邮件；参数：to（姓名或邮箱数组）、subject、content，选填 cc、bcc；只在 Owner 私聊，发送前始终再确认",
     mode: "destructive",
@@ -595,6 +721,81 @@ const ACTIONS: Record<string, ActionSpec> = {
       return { summary: `动作：搜索文档\n关键词：${keywords.join("、")}`, command: ["doc", "search", "--json", JSON.stringify(request)] };
     },
   },
+  "doc.read": {
+    guide: "读取在线文档正文；参数：docid（ID 或链接）；只在 Owner 私聊执行",
+    mode: "read",
+    private: true,
+    async prepare(args) {
+      const docid = text(args.docid, "文档 ID 或链接", 5_000, true)!;
+      return { summary: `动作：读取文档\n文档：${docid}`, command: ["doc", "contents", "get", "--json", JSON.stringify({ docid, content_type: "markdown" })] };
+    },
+  },
+  "sheet.info": {
+    guide: "读取在线表格及工作表列表；参数：docid；只在 Owner 私聊执行",
+    mode: "read",
+    private: true,
+    async prepare(args) {
+      const docid = text(args.docid, "表格 ID 或链接", 5_000, true)!;
+      return { summary: `动作：读取表格信息\n表格：${docid}`, command: ["sheet", "get", "--json", JSON.stringify({ docid })] };
+    },
+  },
+  "sheet.read": {
+    guide: "读取在线表格范围；参数：docid、sheet_id、range（如 A1:D20）；只在 Owner 私聊执行",
+    mode: "read",
+    private: true,
+    async prepare(args) {
+      const docid = text(args.docid, "表格 ID 或链接", 5_000, true)!;
+      const sheetId = text(args.sheet_id, "工作表 ID", 200, true)!;
+      const range = text(args.range, "单元格范围", 64, true)!;
+      if (!SHEET_RANGE.test(range)) throw new Error("单元格范围必须形如 A1:D20");
+      return { summary: `动作：读取表格范围\n范围：${range}`, command: ["sheet", "ranges", "get", "--json", JSON.stringify({ docid, sheet_id: sheetId, range })] };
+    },
+  },
+  "smartpage.read": {
+    guide: "读取智能文档页面；参数：docid 或 url，选填 page_id；只在 Owner 私聊执行",
+    mode: "read",
+    private: true,
+    async prepare(args) {
+      const docid = text(args.docid, "智能文档 ID", 5_000);
+      const url = text(args.url, "智能文档链接", 5_000);
+      if (!docid && !url) throw new Error("智能文档 ID 和链接至少提供一项");
+      const pageId = text(args.page_id, "页面 ID", 5_000);
+      const request = { ...(docid ? { docid } : {}), ...(url ? { url } : {}), ...(pageId ? { page_id: pageId } : {}), content_type: "markdown" };
+      return { summary: `动作：读取智能文档\n文档：${docid ?? url}`, command: ["smartpage", "pages", "get", "--json", JSON.stringify(request)] };
+    },
+  },
+  "smartsheet.info": {
+    guide: "读取智能表格及子表列表；参数：docid；只在 Owner 私聊执行",
+    mode: "read",
+    private: true,
+    async prepare(args) {
+      const docid = text(args.docid, "智能表格 ID 或链接", 5_000, true)!;
+      return { summary: `动作：读取智能表格信息\n表格：${docid}`, command: ["smartsheet", "sheets", "list", "--json", JSON.stringify({ docid })] };
+    },
+  },
+  "smartsheet.fields": {
+    guide: "读取智能表格字段；参数：docid、sheet_id；只在 Owner 私聊执行",
+    mode: "read",
+    private: true,
+    async prepare(args) {
+      const docid = text(args.docid, "智能表格 ID 或链接", 5_000, true)!;
+      const sheetId = text(args.sheet_id, "子表 ID", 200, true)!;
+      return { summary: "动作：读取智能表格字段", command: ["smartsheet", "fields", "list", "--json", JSON.stringify({ docid, sheet_id: sheetId, type: "fields", limit: 150 })] };
+    },
+  },
+  "smartsheet.records": {
+    guide: "读取智能表格记录；参数：docid、sheet_id，选填 field_titles、limit；只在 Owner 私聊执行",
+    mode: "read",
+    private: true,
+    async prepare(args) {
+      const docid = text(args.docid, "智能表格 ID 或链接", 5_000, true)!;
+      const sheetId = text(args.sheet_id, "子表 ID", 200, true)!;
+      const fieldTitles = texts(args.field_titles, "字段标题", 50);
+      const limit = integer(args.limit, "记录数量", 100, 1, 1_000);
+      const request = { docid, sheet_id: sheetId, ...(fieldTitles.length ? { field_titles: fieldTitles } : {}), type: "records", key_type: "field_title", limit };
+      return { summary: "动作：读取智能表格记录", command: ["smartsheet", "records", "list", "--json", JSON.stringify(request)] };
+    },
+  },
   "doc.create": {
     guide: "创建企业微信文档；参数：doc_name，选填 content（Markdown）；只在 Owner 私聊执行",
     mode: "write",
@@ -630,6 +831,121 @@ const ACTIONS: Record<string, ActionSpec> = {
         limit: 10,
       };
       return { summary: `动作：搜索微盘\n关键词：${keywords.join("、")}`, command: ["disk", "files", "search", "--json", JSON.stringify(request)] };
+    },
+  },
+  "disk.get": {
+    guide: "读取微盘文件详情；参数：file_id 或 url；只在 Owner 私聊执行",
+    mode: "read",
+    private: true,
+    async prepare(args) {
+      const fileId = text(args.file_id, "文件 ID", 200);
+      const url = text(args.url, "文件链接", 500);
+      if (!fileId && !url) throw new Error("文件 ID 和链接至少提供一项");
+      const request = { ...(fileId ? { file_id: fileId } : {}), ...(url ? { url } : {}) };
+      return { summary: `动作：读取微盘文件\n文件：${fileId ?? url}`, command: ["disk", "files", "get", "--json", JSON.stringify(request)] };
+    },
+  },
+  "disk.list": {
+    guide: "列出最近浏览的微盘文件；选填 cursor、limit；只在 Owner 私聊执行",
+    mode: "read",
+    private: true,
+    async prepare(args) {
+      const cursor = text(args.cursor, "分页游标", 1_024);
+      const limit = integer(args.limit, "文件数量", 20, 1, 100);
+      return { summary: "动作：列出最近微盘文件", command: ["disk", "files", "list", "--json", JSON.stringify({ ...(cursor ? { cursor } : {}), limit })] };
+    },
+  },
+  "reminder.create": {
+    guide: "创建可主动唤醒 Agent 的提醒；参数：instruction、run_at，选填 repeat_minutes",
+    mode: "write",
+    formatResult: formatReminderMutation,
+    explicitRequest: /(?:(?:创建|设置|添加|安排).{0,20}(?:提醒|定时)|(?:提醒|定时).{0,20}(?:创建|设置|添加|安排))/i,
+    async prepare(args) {
+      const instruction = text(args.instruction, "提醒内容", 8_000, true)!;
+      const runAt = time(args.run_at, "提醒时间");
+      const repeatMinutes = args.repeat_minutes === undefined ? undefined : integer(args.repeat_minutes, "重复间隔", 60, 1, 525_600);
+      const request = { instruction, run_at: isoTime(runAt), ...(repeatMinutes ? { repeat_minutes: repeatMinutes } : {}) };
+      return { summary: `动作：创建提醒\n时间：${runAt}${repeatMinutes ? `\n每 ${repeatMinutes} 分钟重复` : ""}\n内容：${instruction}`, command: ["internal", "reminder", "create", "--json", JSON.stringify(request)] };
+    },
+  },
+  "reminder.list": {
+    guide: "查看当前 Agent 的提醒；只在 Owner 私聊执行",
+    mode: "read",
+    private: true,
+    async prepare() {
+      return { summary: "动作：查看提醒", command: ["internal", "reminder", "list", "--json", "{}"] };
+    },
+  },
+  "reminder.update": {
+    guide: "更新提醒；参数：reminder_id，选填 instruction、run_at、repeat_minutes",
+    mode: "write",
+    formatResult: formatReminderMutation,
+    explicitRequest: /(?:(?:修改|更新|调整|改).{0,20}(?:提醒|定时)|(?:提醒|定时).{0,20}(?:修改|更新|调整|改))/i,
+    async prepare(args) {
+      const reminderId = text(args.reminder_id, "提醒 ID", 32, true)!;
+      const instruction = args.instruction === undefined ? undefined : text(args.instruction, "提醒内容", 8_000, true);
+      const runAt = args.run_at === undefined ? undefined : time(args.run_at, "提醒时间");
+      const repeatMinutes = args.repeat_minutes === undefined ? undefined
+        : args.repeat_minutes === null || args.repeat_minutes === 0 ? null
+          : integer(args.repeat_minutes, "重复间隔", 60, 1, 525_600);
+      if (instruction === undefined && runAt === undefined && repeatMinutes === undefined) throw new Error("至少要提供一项提醒修改内容");
+      const request = { reminder_id: reminderId, ...(instruction ? { instruction } : {}), ...(runAt ? { run_at: isoTime(runAt) } : {}), ...(repeatMinutes !== undefined ? { repeat_minutes: repeatMinutes } : {}) };
+      return { summary: `动作：更新提醒\n提醒 ID：${reminderId}`, command: ["internal", "reminder", "update", "--json", JSON.stringify(request)] };
+    },
+  },
+  "reminder.cancel": {
+    guide: "取消提醒；参数：reminder_id",
+    mode: "write",
+    explicitRequest: /(?:(?:取消|停止|关闭|删除).{0,20}(?:提醒|定时)|(?:提醒|定时).{0,20}(?:取消|停止|关闭|删除))/i,
+    async prepare(args) {
+      const reminderId = text(args.reminder_id, "提醒 ID", 32, true)!;
+      return { summary: `动作：取消提醒\n提醒 ID：${reminderId}`, command: ["internal", "reminder", "cancel", "--json", JSON.stringify({ reminder_id: reminderId })] };
+    },
+  },
+  "work.create": {
+    guide: "把协作任务交给另一个 Agent；参数：title、description、assignee_agent，选填 reviewer_agent",
+    mode: "write",
+    private: true,
+    formatResult: formatWorkMutation,
+    explicitRequest: /(?:(?:交给|指派|分配|安排).{0,30}(?:Agent|智能体|机器人)|(?:Agent|智能体|机器人).{0,30}(?:处理|执行|复核|审阅))/i,
+    async prepare(args) {
+      const title = text(args.title, "任务标题", 1_000, true)!;
+      const description = text(args.description, "任务说明", 8_000, true)!;
+      const assignedAgent = text(args.assignee_agent, "执行 Agent", 128, true)!;
+      const reviewerAgent = text(args.reviewer_agent, "复核 Agent", 128);
+      return {
+        summary: `动作：创建协作任务\n标题：${title}\n执行 Agent：${assignedAgent}${reviewerAgent ? `\n复核 Agent：${reviewerAgent}` : ""}`,
+        command: ["internal", "work", "create", "--json", JSON.stringify({ title, description, assigned_agent: assignedAgent, ...(reviewerAgent ? { reviewer_agent: reviewerAgent } : {}) })],
+      };
+    },
+  },
+  "work.list": {
+    guide: "查看与当前 Agent 相关的协作任务；只在 Owner 私聊执行",
+    mode: "read",
+    private: true,
+    async prepare() {
+      return { summary: "动作：查看协作任务", command: ["internal", "work", "list", "--json", "{}"] };
+    },
+  },
+  "work.get": {
+    guide: "读取协作任务详情；参数：work_id；只在 Owner 私聊执行",
+    mode: "read",
+    private: true,
+    async prepare(args) {
+      const workId = text(args.work_id, "任务 ID", 32, true)!;
+      return { summary: `动作：读取协作任务\n任务 ID：${workId}`, command: ["internal", "work", "get", "--json", JSON.stringify({ work_id: workId })] };
+    },
+  },
+  "work.handoff": {
+    guide: "把协作任务转交给另一个 Agent；参数：work_id、assignee_agent；只在 Owner 私聊执行",
+    mode: "write",
+    private: true,
+    formatResult: formatWorkMutation,
+    explicitRequest: /(?:(?:转交|交接|改派|重新分配).{0,30}(?:任务|Agent|智能体|机器人))/i,
+    async prepare(args) {
+      const workId = text(args.work_id, "任务 ID", 32, true)!;
+      const assignedAgent = text(args.assignee_agent, "执行 Agent", 128, true)!;
+      return { summary: `动作：转交协作任务\n任务 ID：${workId}\n执行 Agent：${assignedAgent}`, command: ["internal", "work", "handoff", "--json", JSON.stringify({ work_id: workId, assigned_agent: assignedAgent })] };
     },
   },
 };
@@ -684,10 +1000,13 @@ export function extractAction(reply: string): { reply: string; action?: Proposed
 export async function prepareAction(action: ProposedAction, resolve?: UserResolver): Promise<PreparedAction> {
   const spec = ACTIONS[action.name];
   if (!spec) throw new Error(`不支持的动作：${action.name}`);
+  const resource = resourceForAction(action);
   return {
+    name: action.name,
     ...await spec.prepare(action.arguments, resolve),
     mode: spec.mode,
     ...(spec.private ? { private: true } : {}),
+    ...(resource ? { resource } : {}),
     ...(spec.formatResult ? { formatResult: spec.formatResult } : {}),
   };
 }

@@ -2,6 +2,8 @@ import type { DirectoryUser } from "./types.js";
 
 const USER_ID = /^[A-Za-z0-9_@.-]{1,512}$/;
 
+export class DirectoryUserNotFoundError extends Error {}
+
 export async function resolveDirectoryUser(
   reference: string,
   searchUsers?: (keywords: string[]) => Promise<DirectoryUser[]>,
@@ -22,7 +24,7 @@ export async function resolveDirectoryUser(
   const exact = users.filter((user) => user.name.toLocaleLowerCase() === normalized || user.alias?.toLocaleLowerCase() === normalized);
   const matches = exact.length > 0 ? exact : users;
   if (matches.length === 1) return matches[0]!;
-  if (matches.length === 0) throw new Error(`通讯录中没有找到“${reference}”。也可以使用 id:<userid>。`);
+  if (matches.length === 0) throw new DirectoryUserNotFoundError(`通讯录中没有找到“${reference}”。也可以使用 id:<userid>。`);
   const choices = matches.slice(0, 10).map((user) => {
     const department = user.departments?.length ? `，${user.departments.join(" / ")}` : "";
     return `${user.name}${user.alias ? `（${user.alias}）` : ""}${department}：id:${user.id}`;

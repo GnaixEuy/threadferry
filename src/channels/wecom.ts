@@ -1,3 +1,6 @@
+import { mkdtemp, readFile, realpath, rm, stat } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { isAbsolute, join, relative } from "node:path";
 import { WSClient, generateReqId, type QuoteContent, type TextMessage, type WsFrame } from "@wecom/aibot-node-sdk";
 import { CommandExecutionError, runCommand } from "../process.js";
 import type { CommandRunner, DirectoryUser, IncomingMention, IncomingWecomEvent, QuoteMetadata, Reply } from "../types.js";
@@ -36,6 +39,35 @@ function standardize(frame: WsFrame<TextMessage>): IncomingWecomEvent | undefine
   return { chatType: "group", message };
 }
 
+export function standardizeAuthChange(frame: WsFrame<unknown>): IncomingWecomEvent | undefined {
+  if (!frame.body || typeof frame.body !== "object" || Array.isArray(frame.body)) return undefined;
+  const body = frame.body as Record<string, unknown>;
+  const from = body.from;
+  const event = body.event;
+  if (!from || typeof from !== "object" || Array.isArray(from)
+    || !event || typeof event !== "object" || Array.isArray(event)
+    || (event as Record<string, unknown>).eventtype !== "auth_change_event") return undefined;
+  const senderId = (from as Record<string, unknown>).userid;
+  const msgId = body.msgid;
+  const authChange = (event as Record<string, unknown>).auth_change_event;
+  const authList = authChange && typeof authChange === "object" && !Array.isArray(authChange)
+    ? (authChange as Record<string, unknown>).auth_list
+    : undefined;
+  if (typeof senderId !== "string" || !senderId || senderId.length > 512
+    || typeof msgId !== "string" || !msgId || msgId.length > 512
+    || !Array.isArray(authList) || !authList.every((item) => Number.isInteger(item))) return undefined;
+  const permissions = authList.map((item) => item === 1 ? "新建和编辑文档" : item === 2 ? "获取成员文档内容" : `未知权限 ${item}`).join("、") || "无文档权限";
+  return {
+    chatType: "single",
+    message: {
+      msgId,
+      senderId,
+      time: new Date((typeof body.create_time === "number" ? body.create_time : Math.floor(Date.now() / 1_000)) * 1_000),
+      text: `企业微信文档权限已更新：${permissions}。请根据当前权限继续刚才未完成的文档操作；不要扩大原请求范围。`,
+    },
+  };
+}
+
 /** 一条「加密 userid → 姓名」的映射。通讯录不支持按 userid 反查，只能从别处顺手收集。 */
 export interface WecomPerson {
   id: string;
@@ -56,6 +88,15 @@ export interface WecomGroupSession {
 const GROUP_WINDOW_MS = 7 * 24 * 60 * 60 * 1000 - 60_000;
 // `chat groups list` 按时间切片翻页，同一个群会在多页里重复出现；给个页数上限兜底，别把启动卡住。
 const MAX_GROUP_PAGES = 10;
+const MAX_ACTION_FILE_BYTES = 1024 * 1024;
+const FILE_OUTPUT_ACTIONS = new Set([
+  "doc.contents.get",
+  "mail.get",
+  "sheet.ranges.get",
+  "smartpage.pages.get",
+  "meeting.original.get",
+  "message.files.get",
+]);
 
 function cliTime(date: Date): string {
   const part = (value: number) => String(value).padStart(2, "0");
@@ -268,8 +309,40 @@ export async function runWecomAction(
     dryRun.splice(jsonIndex, 0, "--dry-run");
     await runner("wecom-cli", dryRun, { timeoutMs: 30_000 });
   }
-  const { stdout } = await runner("wecom-cli", command, { timeoutMs: 30_000 });
-  return envelopeData(stdout, command.slice(0, 3).join("."));
+  const action = command.slice(0, jsonIndex).join(".");
+  const outputDirectory = !write && FILE_OUTPUT_ACTIONS.has(action)
+    ? await mkdtemp(join(tmpdir(), "threadferry-action-"))
+    : undefined;
+  try {
+    const actual = [...command];
+    if (outputDirectory) actual.splice(jsonIndex, 0, "--output-dir", outputDirectory);
+    const { stdout } = await runner("wecom-cli", actual, { timeoutMs: 30_000 });
+    const data = envelopeData(stdout, command.slice(0, 3).join("."));
+    return outputDirectory ? await hydrateActionFiles(data, outputDirectory) as Record<string, unknown> : data;
+  } finally {
+    if (outputDirectory) await rm(outputDirectory, { recursive: true, force: true });
+  }
+}
+
+async function hydrateActionFiles(value: unknown, outputDirectory: string): Promise<unknown> {
+  if (Array.isArray(value)) return Promise.all(value.map((item) => hydrateActionFiles(item, outputDirectory)));
+  if (!value || typeof value !== "object") return value;
+  const item = value as Record<string, unknown>;
+  const hydrated: Record<string, unknown> = {};
+  for (const [name, nested] of Object.entries(item)) {
+    if (name !== "file_path") hydrated[name] = await hydrateActionFiles(nested, outputDirectory);
+  }
+  if (typeof item.file_path !== "string") return hydrated;
+
+  const [root, file] = await Promise.all([realpath(outputDirectory), realpath(item.file_path)]);
+  const path = relative(root, file);
+  if (!path || path.startsWith("..") || isAbsolute(path)) throw new Error("wecom-cli 返回了临时目录之外的文件路径");
+  const info = await stat(file);
+  if (!info.isFile() || info.size > MAX_ACTION_FILE_BYTES) throw new Error("企业内容文件无效或超过 1 MB 安全上限");
+  const buffer = await readFile(file);
+  const content = buffer.toString("utf8");
+  hydrated.content = content.includes("\u0000") ? "[二进制内容未注入 Runtime]" : content;
+  return hydrated;
 }
 
 export async function sendWecomReply(groupId: string, content: string, runner: CommandRunner = runCommand): Promise<void> {
@@ -319,6 +392,15 @@ export function startWecomChannel(
       } catch {
         // SDK 会负责连接错误与重连；不把凭据或原始帧写入日志。
       }
+    });
+  });
+  client.on("event", (frame) => {
+    const event = standardizeAuthChange(frame);
+    if (!event) return;
+    const reply: Reply = (content) => pushWecomMessage(client, event.message.senderId, content);
+    void handle(event, reply).catch(async () => {
+      await reply("文档权限已更新，但 ThreadFerry 暂时无法继续之前的请求。请直接重发原请求。")
+        .catch(() => undefined);
     });
   });
   client.connect();

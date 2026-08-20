@@ -20,8 +20,8 @@ Owner、群与授权名单、Workspace、Runtime、模型和 Session——想用
 
 [查看更新日志](./CHANGELOG.md)
 
-> **迭代中，尚未正式发布。** 多机器人能力已完成，但尚未在双机器人环境实测，
-> 改造记录见 [MULTI_BOT_PLAN.md](./MULTI_BOT_PLAN.md)。
+> **迭代中，尚未正式发布。** 多机器人能力已经过双机器人验证，改造记录见
+> [MULTI_BOT_PLAN.md](./MULTI_BOT_PLAN.md)。
 
 ## 快速开始
 
@@ -213,7 +213,8 @@ Agent 工作区的卡片右上角显示 **Owner 在通讯录里的顶层部门**
 userid 反查通讯录，所以姓名是从三处顺手收集的：单聊会话列表、群历史消息、以及按姓名添加用户的
 那一刻。收集不到的人继续显示 id。
 
-管理台分为「概览」「Agent 工作区」「群聊管理」三个页面：概览页汇总运行状态和待处理事项；
+管理台分为「概览」「Agent 工作区」「群聊管理」三个页面：概览页汇总运行状态、提醒、协作任务、
+最近 Activity 和待处理事项；
 Agent 工作区页显示每个 Agent 的机器人授权状态、Owner、Workspace 和绑定的群，可以新增和删除
 未被使用的 Agent；群聊管理页可以绑定或解绑群、切换全员可用开关、管理可使用用户和重置群
 Session。修改立即生效。
@@ -251,11 +252,13 @@ Agent 本身是**只读**的：沙箱不给网络和 shell，也不继承环境�
 
   | 领域 | 动作 |
   | --- | --- |
-  | 日程 | `schedule.search`、`schedule.free`、`schedule.create`、`schedule.update`、`schedule.cancel` |
-  | 会议 | `meeting.search`、`meeting.create`、`meeting.update`、`meeting.cancel` |
-  | 待办 | `todo.list`、`todo.create`、`todo.update`、`todo.finish`、`todo.delete` |
-  | 邮件 | `mail.search`、`mail.send` |
-  | 文档与微盘 | `doc.search`、`doc.create`、`disk.search` |
+  | 日程 | `schedule.search/get/free/create/update/cancel` |
+  | 会议 | `meeting.search/get/transcript/rooms/create/update/cancel` |
+  | 待办 | `todo.list/get/create/update/finish/delete` |
+  | 邮件 | `mail.search/read/send` |
+  | 文档与微盘 | `doc.search/read/create`、`disk.search/get/list` |
+  | 表格 | `sheet.info/read`、`smartpage.read`、`smartsheet.info/fields/records` |
+  | 主动工作 | `reminder.create/list/update/cancel`、`work.create/list/get/handoff` |
 
 - 企业数据查询及邮件、文档、微盘操作只在 **Owner 私聊**中执行，不把个人数据或邮件正文发进群里。
 - **Owner 的明确创建或修改指令就是授权**，包括在信息确认后回复“创建，没问题”；其他成员发起的
@@ -263,10 +266,20 @@ Agent 本身是**只读**的：沙箱不给网络和 shell，也不继承环境�
   确认码。确认码 10 分钟过期且只存在内存里。
 - 群历史仍然是不可信输入：自动执行还会检查 Owner 当前消息里是否明确要求了对应操作，
   Runtime 或历史消息不能替 Owner 授权。
-- 参与人按姓名或 `id:<userid>` 经通讯录解析，并随会议创建请求主动邀请。信息不全时 Agent 会先
-  问清楚，不会臆造时间或人员。
+- 一个请求可以连续读取多份企业数据，再完成最终回答或一次写入；每次读取结果都会作为不可信业务数据
+  回到同一个 Runtime Session，不需要用户手工复制粘贴。
+- 读取文档需要新增授权时，Owner 在企业微信完成授权即可；机器人收到官方 `auth_change_event` 后会
+  自动回到原私聊 Session 继续刚才的请求，同时禁止借权限回调扩大原请求范围。
+- 参与人按姓名或 `id:<userid>` 经通讯录解析，并随会议创建请求主动邀请；通讯录中不存在的群内
+  机器人会自动排除。信息不全时 Agent 会先问清楚，不会臆造时间或人员。
+- Owner 可以直接说“明天 9 点提醒我检查待办”，也可以把任务明确交给另一个 Agent 并指定复核 Agent。
+  提醒和协作任务会持久化，ThreadFerry 重启后继续执行并主动私聊汇报。回执先写入 outbox，发送失败
+  只重试通知，不会重复执行 Agent。创建会议、提醒和协作任务后会直接返回对应 ID，方便后续操作。
+- 创建会议成功后会自动安排会后任务，在会议结束 5 分钟后读取转写，整理结论、决定和待办发给 Owner。
 - 查询结果会直接整理成会议号、链接、时间和资源 ID；修改、取消、完成或删除时必须使用查询得到的
   真实 ID，不能猜。
+- 文档、邮件、表格和会议转写等 CLI 文件输出只在隔离临时目录读取，单文件限制 1 MB，内容注入后
+  立即删除；本机路径不会交给 Runtime。
 - 真实写入前会先执行官方 CLI 的 `--dry-run` 本地校验。
 
 官方 CLI 还提供附件上传/下载、文档和表格内容覆盖、智能表格结构与记录修改、通用主动消息等能力。
@@ -306,7 +319,9 @@ threadferry start --admin-port 18080
 ## 安全边界
 
 - 私聊中只有**该 Agent 自己的 Owner** 的消息会启动 Runtime；群聊中只有当前 `@机器人` 的消息是用户指令。历史消息、引用和附件元数据都是不可信背景。
-- **Agent 之间相互隔离**：A 的机器人收到 B 的群消息会被拒绝，A 的 Owner 也不能私聊 B 的 Agent。
+- **Agent 之间默认相互隔离**：A 的机器人收到 B 的群消息会被拒绝，A 的 Owner 也不能私聊 B 的 Agent。
+  同一 Owner 明确创建协作任务时，只复制任务说明和结果，不共享 Session、群历史或凭据；跨 Owner
+  创建、转交或执行任务都会拒绝。
 - 未配置群、未授权用户和未 `@机器人` 的消息不会启动 Runtime；开启全员可用（`allow_all`）的群把“未授权用户”放宽为该群全体成员，其余限制不变。
 - **ThreadFerry 不经手 Bot Secret**：不提示输入、不写入配置文件、不写入环境变量。凭据由官方 `wecom-cli` 在各 Agent 自己的目录里加密保存，ThreadFerry 只在建立连接时读取。
 - 每个 Agent 的所有企业微信调用都使用它自己的凭据目录，不会串到别的机器人身上。

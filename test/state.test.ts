@@ -45,6 +45,14 @@ test("state durably recovers inbox and outbox without retaining completed conten
   await restarted.completeDelivery(deliveryId);
   snapshot = await new ThreadFerryState(path).snapshot();
   assert.equal(snapshot.outbox.length, 0);
+
+  const proactiveId = await restarted.queueDelivery("reminder:R-1:2026-08-21", "owner", "主动汇报", "default");
+  assert.match(proactiveId, /^[a-f0-9]{64}$/);
+  assert.equal((await restarted.pendingDeliveries())[0]?.agent, "default");
+  assert.equal((await restarted.pendingDeliveries())[0]?.proactive, true);
+  assert.equal(await restarted.queueDelivery("reminder:R-1:2026-08-21", "owner", "主动汇报", "default"), proactiveId);
+  assert.equal((await restarted.pendingDeliveries()).length, 1);
+  await restarted.completeDelivery(proactiveId);
   assert.doesNotMatch(JSON.stringify(snapshot), /@ThreadFerry|分析结果/);
   assert.equal(await restarted.clearSession(message.groupId), true);
   assert.equal((await stat(join(root, "private"))).mode & 0o777, 0o700);
@@ -92,4 +100,74 @@ test("resetting a session only clears the requested agent's session for that gro
   assert.equal(await state.clearSession("shared-group"), true);
   assert.equal(await state.session("shared-group", front), undefined);
   assert.equal(await state.session("shared-group", back), undefined);
+});
+
+test("reminders survive restart, retry failures and reschedule recurring work", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "threadferry-reminder-test-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const path = join(root, "state.json");
+  const state = new ThreadFerryState(path);
+  const reminder = await state.createReminder({
+    agent: "default",
+    chatId: "owner",
+    chatType: "single",
+    createdBy: "owner",
+    instruction: "检查未完成待办并汇报",
+    runAt: "2026-08-21T01:00:00.000Z",
+    repeatMinutes: 60,
+  });
+
+  const restarted = new ThreadFerryState(path);
+  assert.equal((await restarted.listReminders("default"))[0]?.instruction, "检查未完成待办并汇报");
+  let claimed = await restarted.claimDueReminders(new Date("2026-08-21T01:00:01.000Z"));
+  assert.equal(claimed[0]?.id, reminder.id);
+  await restarted.finishReminder(reminder.id, false, new Date("2026-08-21T01:01:00.000Z"));
+  assert.equal((await restarted.listReminders("default"))[0]?.failures, 1);
+  assert.equal((await restarted.claimDueReminders(new Date("2026-08-21T01:05:59.000Z"))).length, 0);
+  claimed = await restarted.claimDueReminders(new Date("2026-08-21T01:06:01.000Z"));
+  assert.equal(claimed.length, 1);
+  await restarted.finishReminder(reminder.id, true, new Date("2026-08-21T01:06:02.000Z"));
+  const scheduled = (await restarted.listReminders("default"))[0]!;
+  assert.equal(scheduled.status, "scheduled");
+  assert.equal(scheduled.nextRunAt, "2026-08-21T02:06:02.000Z");
+});
+
+test("work items hand off between isolated agents and require reviewer completion", async () => {
+  const state = new ThreadFerryState();
+  const task = await state.createWorkItem({
+    title: "核对季度复盘",
+    description: "读取文档并列出未完成事项",
+    createdBy: "owner",
+    createdAgent: "planner",
+    assignedAgent: "researcher",
+    reviewerAgent: "reviewer",
+    sourceChatId: "owner",
+    sourceChatType: "single",
+  });
+
+  assert.equal((await state.claimWorkItems("planner")).length, 0);
+  const execution = await state.claimWorkItems("researcher");
+  assert.equal(execution[0]?.id, task.id);
+  assert.equal(execution[0]?.status, "running");
+  assert.equal((await state.claimWorkItems("researcher", new Date(Date.now() + 59 * 60_000))).length, 0);
+  assert.equal((await state.claimWorkItems("researcher", new Date(Date.now() + 61 * 60_000)))[0]?.id, task.id);
+  await state.completeWorkItem(task.id, "张三的上线复核未完成");
+  assert.equal((await state.getWorkItem(task.id))?.status, "review");
+
+  const review = await state.claimWorkItems("reviewer");
+  assert.equal(review[0]?.status, "reviewing");
+  await state.completeWorkItem(task.id, "结论准确，可以发送");
+  const completed = await state.getWorkItem(task.id);
+  assert.equal(completed?.status, "completed");
+  assert.equal(completed?.result, "张三的上线复核未完成");
+  assert.equal(completed?.review, "结论准确，可以发送");
+});
+
+test("activity records are durable, bounded and agent-scoped", async () => {
+  const state = new ThreadFerryState();
+  await state.recordActivity({ agent: "a", type: "action.read", outcome: "success", resource: "doc:doc-1" });
+  await state.recordActivity({ agent: "b", type: "runtime.completed", outcome: "success" });
+  assert.deepEqual((await state.recentActivities(10, "a")).map(({ type, resource }) => ({ type, resource })), [
+    { type: "action.read", resource: "doc:doc-1" },
+  ]);
 });
