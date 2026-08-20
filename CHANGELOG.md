@@ -4,6 +4,27 @@ ThreadFerry 的每个 GitHub Release 都使用这里对应版本的内容，不�
 
 ## Unreleased
 
+## 0.18.1
+
+本次修复启动自动更新检测的漏口，并让成功检查结果在终端可见。
+
+### 主要变化
+
+- `threadferry start` 现在会先检查 GitHub Latest Release，再判断本机是否已有配置。首次运行转入
+  初始化引导时，不再跳过启动前更新检测。
+- 当前已经是最新版时，终端会明确显示检查结果，避免正常的静默检查被误认为功能失效。
+- 已有配置的启动、每 6 小时定期检查、发现新版本后的安装与平滑重启逻辑保持不变。
+
+### 安装与升级
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/GnaixEuy/threadferry/main/install.sh | bash
+```
+
+配置格式和机器人凭据不变，升级后直接运行 `threadferry start`。
+
+[查看 v0.18.0...v0.18.1 的完整变更](https://github.com/GnaixEuy/threadferry/compare/v0.18.0...v0.18.1)
+
 ## 0.18.0
 
 Agent 现在能识别「帮我建个日程」这类写操作意图并**给出建议**，由 Owner 确认后 ThreadFerry

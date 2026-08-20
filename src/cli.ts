@@ -45,7 +45,7 @@ import {
 import type { AgentView, CommandRunner, GroupMessage, IncomingMention, RuntimeName, ThreadFerryConfig } from "./types.js";
 import { findUpdate, installUpdate } from "./update.js";
 
-const VERSION = "0.18.0";
+const VERSION = "0.18.1";
 const UPDATE_INTERVAL_MS = 6 * 60 * 60 * 1_000;
 const USAGE = `ThreadFerry ${VERSION}
 
@@ -95,7 +95,9 @@ async function applyUpdate(): Promise<string | undefined> {
 
 async function autoUpdate(): Promise<string | undefined> {
   try {
-    return await applyUpdate();
+    const binary = await applyUpdate();
+    if (!binary) console.log(`[update] 已检查，ThreadFerry ${VERSION} 已是最新版本。`);
+    return binary;
   } catch (error) {
     console.error(`[update] 自动更新失败，将继续运行当前版本：${error instanceof Error ? error.message : String(error)}`);
     return undefined;
@@ -1182,6 +1184,11 @@ async function main(): Promise<void> {
   if (command === "start") {
     const configPath = option(args, "--config") ?? defaultConfigPath();
     const mock = args.includes("--mock");
+    const binary = mock ? undefined : await autoUpdate();
+    if (binary) {
+      await runUpdated(binary, [command, ...args]);
+      return;
+    }
     // 完全没初始化时，start 不该报错让用户自己去猜下一步——直接转入引导。
     if (!existsSync(resolve(configPath))) {
       if (!process.stdin.isTTY || !process.stdout.isTTY) {
@@ -1193,11 +1200,6 @@ async function main(): Promise<void> {
       console.log(`未找到配置 ${resolve(configPath)}，ThreadFerry 还没有初始化。`);
       console.log("转入引导配置（完成后可以直接启动）。\n");
       await onboard(option(args, "--config"));
-      return;
-    }
-    const binary = mock ? undefined : await autoUpdate();
-    if (binary) {
-      await runUpdated(binary, [command, ...args]);
       return;
     }
     const restartBinary = await start(

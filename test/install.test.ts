@@ -372,6 +372,26 @@ test("CLI exposes package version and rejects non-interactive onboarding", () =>
   assert.match(onboard.stderr, /需要交互式终端/);
 });
 
+test("start checks for updates before first-time onboarding", () => {
+  const root = mkdtempSync(join(tmpdir(), "threadferry-update-start-"));
+  try {
+    const preload = join(root, "latest-release.mjs");
+    writeFileSync(preload, `globalThis.fetch = async () => new Response(null, {
+  status: 302,
+  headers: { location: "https://github.com/GnaixEuy/threadferry/releases/tag/v${packageMetadata.version}" },
+});\n`);
+    const result = spawnSync(process.execPath, [
+      "--import", preload, cli, "start", "--config", join(root, "missing.yaml"),
+    ], { encoding: "utf8" });
+
+    assert.equal(result.status, 1);
+    assert.match(result.stdout, new RegExp(`\\[update\\] 已检查，ThreadFerry ${packageMetadata.version.replaceAll(".", "\\.")} 已是最新版本`));
+    assert.match(result.stderr, /配置不存在/);
+  } finally {
+    rmSync(root, { force: true, recursive: true });
+  }
+});
+
 test("setup and onboard reject invalid timeout values before touching the terminal", () => {
   for (const command of ["setup", "onboard"]) {
     for (const value of ["abc", "0", "-5"]) {
