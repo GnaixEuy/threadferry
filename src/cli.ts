@@ -13,7 +13,7 @@ import { DirectoryNameCache } from "./directory-names.js";
 import { fanOutTargets, quotedReply } from "./group-fanout.js";
 import { authorizeHint, botConfigDir, botStatus, loadBotCredentials, validateAgentId, wecomEnv, type BotCredentials } from "./bots.js";
 import type { WSClient } from "@wecom/aibot-node-sdk";
-import { listWecomGroups, pushWecomMessage, searchWecomUsers, sendWecomReply, startWecomChannel, wecomFailureReason } from "./channels/wecom.js";
+import { listWecomGroups, pushWecomMessage, runWecomAction, searchWecomUsers, sendWecomReply, startWecomChannel, wecomFailureReason } from "./channels/wecom.js";
 import {
   addAgent,
   adoptOwner,
@@ -45,7 +45,7 @@ import {
 import type { AgentView, CommandRunner, GroupMessage, IncomingMention, RuntimeName, ThreadFerryConfig } from "./types.js";
 import { findUpdate, installUpdate } from "./update.js";
 
-const VERSION = "0.17.0";
+const VERSION = "0.18.0";
 const UPDATE_INTERVAL_MS = 6 * 60 * 60 * 1_000;
 const USAGE = `ThreadFerry ${VERSION}
 
@@ -856,6 +856,9 @@ async function start(
     const views = new Map<string, AgentView>();
     const state = new ThreadFerryState(defaultStatePath());
 
+    // 各 Agent 的连接索引。连接在下面才建立，但 app 的依赖里要先捕获这个 Map：
+    // 转交回复和动作回执都优先走机器人自己的 WS 连接。
+    const clients = new Map<string, WSClient>();
     // 每个 Agent 一套：配置视图 + 绑定自己凭据目录的 runner + 独立 app 实例 + 独立连接。
     const hosts = await Promise.all(startup.map(async ({ agentId, botId, secret, configDir }) => {
       const view = agentView(config, agentId);
@@ -888,6 +891,25 @@ async function start(
       }),
       listGroups: () => listWecomGroups(runner),
       searchUsers: (keywords) => searchWecomUsers(keywords, runner),
+      // 白名单动作由 ThreadFerry 用这个 Agent 自己的凭据执行；Runtime 沙箱不参与。
+      runAction: async (command) => {
+        try {
+          await runWecomAction(command, runner);
+        } catch (error) {
+          throw new Error(wecomFailureReason(error));
+        }
+      },
+      notifyGroup: async (groupId, content) => {
+        const client = clients.get(agentId);
+        if (client) {
+          try {
+            return await pushWecomMessage(client, groupId, content);
+          } catch {
+            // 连接侧发不出去就退回 wecom-cli。
+          }
+        }
+        await sendWecomReply(groupId, content, runner);
+      },
       onError: ({ errorId, phase, reason }) => console.error(`[wecom] Agent ${agentId} 处理失败 error=${errorId} phase=${phase}${reason ? ` reason=${reason}` : ""}`),
       }, state);
       return { agentId, view, runner, app, credentials: { botId, secret } };
@@ -949,7 +971,6 @@ async function start(
       // 进程里，所以这里把同一条消息在进程内转交给「也被 @ 到、也绑了这个群」的其他 Agent，
       // 各自用自己的机器人凭据回复。
       // 若企业微信将来改成投给所有被 @ 的机器人，重复的那份会被按 Agent 的 turn 去重挡掉，不会答两遍。
-      const clients = new Map<string, WSClient>();
       const fanOut = async (receivedBy: string, message: IncomingMention) => {
         const peers = fanOutTargets(
           message.text,

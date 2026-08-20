@@ -218,6 +218,35 @@ threadferry agent list
 
 `--model` is optional. Each agent has an isolated workspace and runtime session.
 
+## Letting an agent act (write operations)
+
+The agent itself stays **read-only**: its sandbox has no network, no shell, and no inherited
+environment. What it can do is **recognize a write intent and propose it**, for you to confirm:
+
+```text
+You:  @bot create a meeting tomorrow at 10, about the test we just ran
+Bot:  我建议这样安排。
+
+      动作：创建日程
+      标题：关于刚才的测试
+      时间：2026-08-21 10:00:00 → 2026-08-21 10:30:00
+
+      我不会自己动手。请 Owner 私聊我发送 `threadferry confirm 918F46` 执行（10 分钟内有效）。
+
+You (direct chat): threadferry confirm 918F46
+Bot:  已执行：动作：创建日程 …
+```
+
+- **Only whitelisted actions can run** — currently `schedule.create`. Anything else is treated as
+  no proposal at all.
+- **The Owner must confirm in a direct chat.** Confirmation codes are single-use, expire in 10
+  minutes, and live only in memory. Non-Owners cannot even reach the confirm command.
+- Group history stays untrusted input: a prompt injection can at most make the agent *propose*
+  something, which still has to pass validation and your explicit confirmation.
+- Attendees are resolved through the address book by name or `id:<userid>`.
+- To add an action (todo, document, mail…), add one entry to the table in `src/actions.ts`; the
+  proposal, confirmation, and execution plumbing is reused.
+
 ## Common Commands
 
 | Command | Purpose |
