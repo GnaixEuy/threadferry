@@ -35,6 +35,8 @@ test("context contains recent history as untrusted data and preserves the curren
   assert.match(prompt, /CURRENT_USER_INSTRUCTION/);
   assert.match(prompt, /@ThreadFerry 帮忙分析（原文）/);
   assert.match(prompt, /trace\.log/);
+  assert.match(prompt, /meeting\.create/);
+  assert.match(prompt, /attendees/);
 });
 
 test("context enforces lookback and total message limit", () => {

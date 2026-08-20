@@ -218,34 +218,51 @@ threadferry agent list
 
 `--model` is optional. Each agent has an isolated workspace and runtime session.
 
-## Letting an agent act (write operations)
+## Letting an agent query and act
 
 The agent itself stays **read-only**: its sandbox has no network, no shell, and no inherited
-environment. What it can do is **recognize a write intent and propose it**, for you to confirm:
+environment. It may propose a whitelisted WeCom action; ThreadFerry validates and performs it with
+that agent's own credentials. An explicit safe write from the Owner runs immediately; requests from
+other members still wait for Owner confirmation:
 
 ```text
-You:  @bot create a meeting tomorrow at 10, about the test we just ran
-Bot:  我建议这样安排。
+Owner: @bot create a meeting tomorrow at 10 to review the test, and invite Zhang San and Li Si
+Bot:   已自动执行：
 
-      动作：创建日程
-      标题：关于刚才的测试
+      动作：创建会议
+      标题：刚才的测试复盘
       时间：2026-08-21 10:00:00 → 2026-08-21 10:30:00
-
-      我不会自己动手。请 Owner 私聊我发送 `threadferry confirm 918F46` 执行（10 分钟内有效）。
-
-You (direct chat): threadferry confirm 918F46
-Bot:  已执行：动作：创建日程 …
+      参与人：张三、李四（创建时主动邀请）
 ```
 
-- **Only whitelisted actions can run** — currently `schedule.create`. Anything else is treated as
-  no proposal at all.
-- **The Owner must confirm in a direct chat.** Confirmation codes are single-use, expire in 10
-  minutes, and live only in memory. Non-Owners cannot even reach the confirm command.
-- Group history stays untrusted input: a prompt injection can at most make the agent *propose*
-  something, which still has to pass validation and your explicit confirmation.
-- Attendees are resolved through the address book by name or `id:<userid>`.
-- To add an action (todo, document, mail…), add one entry to the table in `src/actions.ts`; the
-  proposal, confirmation, and execution plumbing is reused.
+- **Only whitelisted actions can run**:
+
+  | Area | Actions |
+  | --- | --- |
+  | Calendar | `schedule.search`, `schedule.free`, `schedule.create`, `schedule.update`, `schedule.cancel` |
+  | Meetings | `meeting.search`, `meeting.create`, `meeting.update`, `meeting.cancel` |
+  | Todo | `todo.list`, `todo.create`, `todo.update`, `todo.finish`, `todo.delete` |
+  | Mail | `mail.search`, `mail.send` |
+  | Docs and Drive | `doc.search`, `doc.create`, `disk.search` |
+
+- Enterprise-data queries and all mail, document, and Drive operations run only in the **Owner's
+  direct chat**, so personal data and message bodies are never disclosed in a group.
+- **An explicit Owner create or update request is the authorization**, including a concise
+  follow-up such as “创建，没问题”. Other members' ordinary writes use a single-use direct-chat
+  confirmation code. Cancelling, deleting, finishing a whole todo, and sending mail always require
+  a fresh confirmation. Codes expire after 10 minutes and are memory-only.
+- Group history stays untrusted input. Automatic execution additionally requires a matching,
+  explicit action intent in the Owner's current message; runtime output and history cannot grant it.
+- Attendees are resolved through the address book by name or `id:<userid>` and actively invited by
+  the native meeting request.
+- Query results are formatted with times, links, meeting codes, and resource IDs. Updates and
+  destructive actions must use an ID returned by a real query, never a guessed one.
+- Every action passes the official CLI's local `--dry-run` validation before the real write.
+
+The official CLI also exposes attachment upload/download, document and spreadsheet overwrites,
+smart-table schema and record mutations, and generic proactive messaging. ThreadFerry intentionally
+does not whitelist them yet: they cross local-file boundaries or can rewrite broad enterprise data,
+so they first need resource-level authorization and an explicit file scope.
 
 ## Common Commands
 

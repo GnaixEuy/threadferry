@@ -3,7 +3,7 @@ import { authorize } from "./authorization.js";
 import { buildContext } from "./context-builder.js";
 import { resolveDirectoryUser } from "./directory.js";
 import { newErrorId, sessionScope, ThreadFerryState, type FailurePhase } from "./state.js";
-import { extractAction, prepareAction, type PreparedAction } from "./actions.js";
+import { actionMode, actionPrivate, extractAction, isExplicitActionRequest, prepareAction, type PreparedAction } from "./actions.js";
 import type { AgentView, DirectoryUser, GroupMessage, IncomingDirectMessage, IncomingMention, Reply, RuntimeRequest, RuntimeResult } from "./types.js";
 
 export type HandleResult = "handled" | "stale" | "failed" | "command" | "delivery_pending" | "duplicate" | "unauthorized_group" | "missing_mention" | "unauthorized_user";
@@ -26,7 +26,7 @@ export interface AppDependencies {
   listGroups?: () => Promise<Array<{ id: string; name?: string }>>;
   searchUsers?: (keywords: string[]) => Promise<DirectoryUser[]>;
   /** 执行一个已校验的白名单动作（由 ThreadFerry 自己调 wecom-cli，不经过 Runtime 沙箱）。 */
-  runAction?: (command: string[]) => Promise<void>;
+  runAction?: (command: string[], write: boolean) => Promise<Record<string, unknown> | void>;
   /** Owner 在私聊里确认后，把回执发回提议发生的那个群。 */
   notifyGroup?: (groupId: string, content: string) => Promise<void>;
   onError?: (error: { errorId: string; phase: FailurePhase; reason?: string }) => void;
@@ -156,18 +156,46 @@ export function createApp(config: AgentView, dependencies: AppDependencies, stat
     return operation;
   }
 
-  // Runtime 只会「提议」动作。这里把提议从回复里摘掉、校验参数、挂起等 Owner 确认。
+  // Runtime 只会「提议」动作。这里把提议从回复里摘掉、校验参数；Owner 本人的明确请求直接执行，
+  // 其他人的请求才挂起等 Owner 确认。
   // 校验失败就把原因当成普通回复发出去——绝不猜测用户意图，也绝不擅自执行。
-  async function stageAction(text: string, requestedBy: string, groupId?: string): Promise<string> {
+  async function stageAction(text: string, instruction: string, requestedBy: string, groupId?: string): Promise<string> {
     const { reply: cleaned, action } = extractAction(text);
     if (!action) return text;
     if (!dependencies.runAction) return cleaned || "当前启动方式不支持代为执行企业微信动作。";
+    if (groupId && (actionMode(action.name) === "read" || actionPrivate(action.name))) {
+      return `${cleaned ? `${cleaned}\n\n` : ""}该企业微信操作只在 Owner 私聊中执行，避免把个人数据或操作内容发到群里。`;
+    }
     let prepared: PreparedAction;
     try {
       prepared = await prepareAction(action, (reference) => resolveDirectoryUser(reference, dependencies.searchUsers));
     } catch (error) {
       const reason = error instanceof Error ? error.message : "动作参数无效";
       return `${cleaned ? `${cleaned}\n\n` : ""}这个动作我没法执行：${reason}`;
+    }
+    if (prepared.mode === "read") {
+      try {
+        const result = await dependencies.runAction(prepared.command, false) ?? {};
+        const details = prepared.formatResult?.(result);
+        return `${cleaned ? `${cleaned}\n\n` : ""}${details ?? "查询完成。"}`;
+      } catch (error) {
+        return `${cleaned ? `${cleaned}\n\n` : ""}${withReason("查询失败。", failureReason(error), "direct")}`;
+      }
+    }
+    if (isExplicitActionRequest(action, instruction) && await isOwner(requestedBy)) {
+      try {
+        const result = await dependencies.runAction(prepared.command, true) ?? {};
+        const details = prepared.formatResult?.(result);
+        return `${cleaned ? `${cleaned}\n\n` : ""}已自动执行：\n${prepared.summary}${details ? `\n${details}` : ""}`;
+      } catch (error) {
+        const errorId = newErrorId();
+        const reason = failureReason(error);
+        dependencies.onError?.({ errorId, phase: "host", ...(reason ? { reason } : {}) });
+        const failure = groupId
+          ? `动作执行失败（错误编号 ${errorId}）。请联系机器人 Owner。`
+          : withReason(`动作执行失败（错误编号 ${errorId}）。`, reason, "direct");
+        return `${cleaned ? `${cleaned}\n\n` : ""}${failure}`;
+      }
     }
     for (const [known, item] of pendingActions) if (item.expiresAt < Date.now()) pendingActions.delete(known);
     const code = randomBytes(3).toString("hex").toUpperCase();
@@ -382,18 +410,20 @@ export function createApp(config: AgentView, dependencies: AppDependencies, stat
       }
       if (!dependencies.runAction) return respond(reply, "当前启动方式不支持代为执行企业微信动作。");
       pendingActions.delete(code);
+      let details: string | undefined;
       try {
-        await dependencies.runAction(pending.prepared.command);
+        const result = await dependencies.runAction(pending.prepared.command, true) ?? {};
+        details = pending.prepared.formatResult?.(result);
       } catch (error) {
         const reason = failureReason(error);
         return respond(reply, withReason("动作执行失败。", reason, "direct"));
       }
       // 提议发生在群里就把回执发回群里，省得群里的人不知道到底做没做。
       if (pending.groupId) {
-        await dependencies.notifyGroup?.(pending.groupId, `已按 Owner 确认执行：\n${pending.prepared.summary}`)
+        await dependencies.notifyGroup?.(pending.groupId, `已按 Owner 确认执行：\n${pending.prepared.summary}${details ? `\n${details}` : ""}`)
           .catch(() => undefined);
       }
-      return respond(reply, `已执行：\n${pending.prepared.summary}`);
+      return respond(reply, `已执行：\n${pending.prepared.summary}${details ? `\n${details}` : ""}`);
     }
     if (command.name === "agents") {
       const lines = Object.entries(config.agents).map(([id, agent]) => `- \`${id}\`：${agent.runtime}${agent.model ? ` / ${agent.model}` : ""}\n  ${agent.workspace}`);
@@ -540,7 +570,7 @@ export function createApp(config: AgentView, dependencies: AppDependencies, stat
         if (controllers.get(scope) === controller) controllers.delete(scope);
       }
       if (result.sessionId) await state.setSession(scope, scopeKey, result.sessionId);
-      await reply(limitUtf8(await stageAction(result.text, message.senderId)), true);
+      await reply(limitUtf8(await stageAction(result.text, message.text, message.senderId)), true);
       return "handled";
     } catch (error) {
       const errorId = newErrorId();
@@ -626,7 +656,7 @@ export function createApp(config: AgentView, dependencies: AppDependencies, stat
 
       phase = "reply";
       return complete(message, reply, "handled",
-        limitUtf8(await stageAction(result.text, message.senderId, message.groupId)));
+        limitUtf8(await stageAction(result.text, message.text, message.senderId, message.groupId)));
     } catch (error) {
       return fail(message, reply, phase, error);
     }

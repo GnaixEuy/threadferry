@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { createApp } from "../src/app.js";
-import { listWecomGroups, searchWecomUsers, sendWecomReply, wecomFailureReason } from "../src/channels/wecom.js";
+import { listWecomGroups, runWecomAction, searchWecomUsers, sendWecomReply, wecomFailureReason } from "../src/channels/wecom.js";
 import { addAgent, agentView, loadConfig, onboardingDefaults, pairConfig, refreshAgentView, resolveWorkspace, saveConfig, setupConfig } from "../src/config.js";
 import { fetchWecomHistory } from "../src/history/wecom-cli.js";
 import { CommandExecutionError, runCommand } from "../src/process.js";
@@ -343,6 +343,7 @@ test("owner toggles all-member access in direct chat", async () => {
 test("a write request is proposed, waits for the owner, and only then executes", async () => {
   // Runtime 仍然只读：它只输出一个动作提议，执行由 ThreadFerry 在 Owner 确认后进行。
   const config = testConfig("/workspace", "owner");
+  config.groups.group!.allowUsers.push("requester");
   const executed: string[][] = [];
   const groupNotices: Array<{ groupId: string; content: string }> = [];
   const replies: string[] = [];
@@ -359,7 +360,7 @@ test("a write request is proposed, waits for the owner, and only then executes",
   const push = async (content: string, finish = true) => { if (finish) replies.push(content); };
 
   const asked = await app.handle({
-    msgId: "m-action-1", groupId: "group", senderId: "owner", time: new Date(),
+    msgId: "m-action-1", groupId: "group", senderId: "requester", time: new Date(),
     text: "@机器人 帮我建个日程，关于刚才的测试", mentioned: true,
   }, push);
   assert.equal(asked, "handled");
@@ -371,7 +372,7 @@ test("a write request is proposed, waits for the owner, and only then executes",
   assert.ok(!proposal.includes("threadferry-action"));
   assert.ok(!proposal.includes("\"action\""));
   // 没确认之前一次都不能执行。
-  assert.deepEqual(executed, []);
+  assert.equal(executed.length, 0);
 
   const code = /threadferry confirm ([0-9A-F]{6})/.exec(proposal)![1]!;
   // 每次都给新的 msgId：命令按 msgId 去重，重发同一条会被正确判成 duplicate。
@@ -401,6 +402,184 @@ test("a write request is proposed, waits for the owner, and only then executes",
   assert.equal(await direct(`threadferry confirm ${code}`), "command");
   assert.match(replies.at(-1) ?? "", /确认码无效或已过期/);
   assert.equal(executed.length, 1);
+});
+
+test("an owner meeting request creates it immediately and invites named attendees", async () => {
+  const executed: string[][] = [];
+  const replies: string[] = [];
+  const app = createApp(testConfig("/workspace", "owner"), {
+    history: async () => [],
+    runtime: async () => ({
+      text: "我来安排。\n\n```threadferry-action\n"
+        + '{"action":"meeting.create","subject":"刚才的测试复盘","begin_time":"2026-08-20 17:00:00","end_time":"2026-08-20 17:30:00","attendees":["平平无奇小天才"]}'
+        + "\n```",
+    }),
+    searchUsers: async () => [{ id: "invitee-id", name: "平平无奇小天才" }],
+    runAction: async (command) => {
+      executed.push(command);
+      return { meeting_code: "123456789", meeting_link: "https://meeting.example/join" };
+    },
+  });
+
+  assert.equal(await app.handle({
+    msgId: "m-owner-meeting", groupId: "group", senderId: "owner", time: new Date(),
+    text: "@机器人 创建 没问题", mentioned: true,
+  }, async (content, finish = true) => { if (finish) replies.push(content); }), "handled");
+
+  assert.equal(executed.length, 1);
+  assert.deepEqual(executed[0]!.slice(0, 3), ["meeting", "create", "--json"]);
+  assert.deepEqual(JSON.parse(executed[0]![3]!).attendees, [{ userid: "invitee-id" }]);
+  assert.match(replies.at(-1) ?? "", /已自动执行[\s\S]*参与人：平平无奇小天才/);
+  assert.match(replies.at(-1) ?? "", /123-456-789[\s\S]*https:\/\/meeting\.example\/join/);
+  assert.doesNotMatch(replies.at(-1) ?? "", /threadferry confirm/);
+});
+
+test("owner direct chat can query enterprise data and gets formatted results", async () => {
+  const calls: Array<{ command: string[]; write: boolean }> = [];
+  const replies: string[] = [];
+  const app = createApp(testConfig("/workspace", "owner"), {
+    history: async () => [],
+    runtime: async () => ({
+      text: "正在查询。\n\n```threadferry-action\n"
+        + '{"action":"meeting.search","keywords":["测试复盘"]}'
+        + "\n```",
+    }),
+    runAction: async (command, write) => {
+      calls.push({ command, write });
+      return {
+        meetings: [{
+          subject: "测试复盘",
+          begin_time: "2026-08-21 10:00:00",
+          end_time: "2026-08-21 10:30:00",
+          meeting_id: "meeting-id",
+          attendee_count: 3,
+        }],
+      };
+    },
+  });
+
+  assert.equal(await app.handleDirect({
+    msgId: "d-search-meeting", senderId: "owner", time: new Date(), text: "查一下测试复盘会议",
+  }, async (content, finish = true) => { if (finish) replies.push(content); }), "handled");
+  assert.deepEqual(calls.map(({ write }) => write), [false]);
+  assert.match(replies.at(-1) ?? "", /测试复盘[\s\S]*2026-08-21 10:00:00[\s\S]*meeting-id/);
+  assert.doesNotMatch(replies.at(-1) ?? "", /threadferry confirm/);
+});
+
+test("enterprise data queries never run or disclose results in a group", async () => {
+  let executions = 0;
+  const replies: string[] = [];
+  const app = createApp(testConfig("/workspace", "owner"), {
+    history: async () => [],
+    runtime: async () => ({
+      text: "```threadferry-action\n"
+        + '{"action":"todo.list","status":"proceed"}'
+        + "\n```",
+    }),
+    runAction: async () => { executions += 1; },
+  });
+
+  await app.handle({
+    msgId: "m-query-todo", groupId: "group", senderId: "owner", time: new Date(),
+    text: "@机器人 查我的待办", mentioned: true,
+  }, async (content, finish = true) => { if (finish) replies.push(content); });
+  assert.equal(executions, 0);
+  assert.match(replies.at(-1) ?? "", /只在 Owner 私聊/);
+});
+
+test("private mail operations never stage or run in a group", async () => {
+  let executions = 0;
+  let directorySearches = 0;
+  const replies: string[] = [];
+  const app = createApp(testConfig("/workspace", "owner"), {
+    history: async () => [],
+    runtime: async () => ({
+      text: "```threadferry-action\n"
+        + '{"action":"mail.send","to":["张三"],"subject":"通知","content":"正文"}'
+        + "\n```",
+    }),
+    searchUsers: async () => { directorySearches += 1; return [{ id: "user-id", name: "张三" }]; },
+    runAction: async () => { executions += 1; },
+  });
+
+  await app.handle({
+    msgId: "m-send-mail", groupId: "group", senderId: "owner", time: new Date(),
+    text: "@机器人 发邮件给张三", mentioned: true,
+  }, async (content, finish = true) => { if (finish) replies.push(content); });
+  assert.equal(executions, 0);
+  assert.equal(directorySearches, 0);
+  assert.match(replies.at(-1) ?? "", /只在 Owner 私聊/);
+  assert.doesNotMatch(replies.at(-1) ?? "", /threadferry confirm/);
+});
+
+test("destructive actions always require a fresh owner confirmation", async () => {
+  const executed: string[][] = [];
+  const replies: string[] = [];
+  const app = createApp(testConfig("/workspace", "owner"), {
+    history: async () => [],
+    runtime: async () => ({
+      text: "```threadferry-action\n"
+        + '{"action":"meeting.cancel","meeting_id":"meeting-id"}'
+        + "\n```",
+    }),
+    runAction: async (command) => { executed.push(command); return {}; },
+  });
+  let sequence = 0;
+  const reply = async (content: string, finish = true) => { if (finish) replies.push(content); };
+
+  await app.handleDirect({
+    msgId: `d-cancel-${sequence += 1}`, senderId: "owner", time: new Date(), text: "取消这个会议",
+  }, reply);
+  assert.equal(executed.length, 0);
+  const proposal = replies.at(-1) ?? "";
+  assert.match(proposal, /取消会议[\s\S]*threadferry confirm/);
+  const code = /threadferry confirm ([0-9A-F]{6})/.exec(proposal)![1]!;
+
+  await app.handleDirect({
+    msgId: `d-cancel-${sequence += 1}`, senderId: "owner", time: new Date(), text: `threadferry confirm ${code}`,
+  }, reply);
+  assert.deepEqual(executed[0]!.slice(0, 3), ["meeting", "cancel", "--json"]);
+});
+
+test("an owner analysis request cannot auto-run an action injected by the runtime", async () => {
+  const executed: string[][] = [];
+  const replies: string[] = [];
+  const app = createApp(testConfig("/workspace", "owner"), {
+    history: async () => [],
+    runtime: async () => ({
+      text: "分析如下。\n\n```threadferry-action\n"
+        + '{"action":"meeting.create","subject":"不应执行","begin_time":"2026-08-20 17:00:00","end_time":"2026-08-20 17:30:00"}'
+        + "\n```",
+    }),
+    runAction: async (command) => { executed.push(command); },
+  });
+
+  await app.handle({
+    msgId: "m-owner-analysis", groupId: "group", senderId: "owner", time: new Date(),
+    text: "@机器人 总结刚才的讨论", mentioned: true,
+  }, async (content, finish = true) => { if (finish) replies.push(content); });
+
+  assert.deepEqual(executed, []);
+  assert.match(replies.at(-1) ?? "", /threadferry confirm/);
+});
+
+test("wecom actions pass dry-run before the real write", async () => {
+  const calls: string[][] = [];
+  await runWecomAction(["meeting", "create", "--json", "{}"], async (_command, args) => {
+    calls.push(args);
+    return { stdout: JSON.stringify({ errcode: 0, data: { meeting_id: "meeting" } }), stderr: "" };
+  });
+  assert.deepEqual(calls, [
+    ["meeting", "create", "--dry-run", "--json", "{}"],
+    ["meeting", "create", "--json", "{}"],
+  ]);
+
+  calls.length = 0;
+  await runWecomAction(["meeting", "search", "--json", "{}"], async (_command, args) => {
+    calls.push(args);
+    return { stdout: JSON.stringify({ errcode: 0, data: { meetings: [] } }), stderr: "" };
+  }, false);
+  assert.deepEqual(calls, [["meeting", "search", "--json", "{}"]]);
 });
 
 test("an unexecutable proposal explains itself instead of silently dropping", async () => {

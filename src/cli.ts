@@ -45,7 +45,7 @@ import {
 import type { AgentView, CommandRunner, GroupMessage, IncomingMention, RuntimeName, ThreadFerryConfig } from "./types.js";
 import { findUpdate, installUpdate } from "./update.js";
 
-const VERSION = "0.18.1";
+const VERSION = "0.19.0";
 const UPDATE_INTERVAL_MS = 6 * 60 * 60 * 1_000;
 const USAGE = `ThreadFerry ${VERSION}
 
@@ -894,9 +894,9 @@ async function start(
       listGroups: () => listWecomGroups(runner),
       searchUsers: (keywords) => searchWecomUsers(keywords, runner),
       // 白名单动作由 ThreadFerry 用这个 Agent 自己的凭据执行；Runtime 沙箱不参与。
-      runAction: async (command) => {
+      runAction: async (command, write) => {
         try {
-          await runWecomAction(command, runner);
+          return await runWecomAction(command, runner, write);
         } catch (error) {
           throw new Error(wecomFailureReason(error));
         }
