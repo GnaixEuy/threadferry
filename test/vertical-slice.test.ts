@@ -340,6 +340,87 @@ test("owner toggles all-member access in direct chat", async () => {
   assert.doesNotMatch(replies.at(-1) ?? "", /全员可用/);
 });
 
+test("a write request is proposed, waits for the owner, and only then executes", async () => {
+  // Runtime 仍然只读：它只输出一个动作提议，执行由 ThreadFerry 在 Owner 确认后进行。
+  const config = testConfig("/workspace", "owner");
+  const executed: string[][] = [];
+  const groupNotices: Array<{ groupId: string; content: string }> = [];
+  const replies: string[] = [];
+  const app = createApp(config, {
+    history: async () => [],
+    runtime: async () => ({
+      text: "好的，我建议这样安排。\n\n```threadferry-action\n"
+        + '{"action":"schedule.create","subject":"回归测试复盘","begin_time":"2026-08-21 10:00:00","end_time":"2026-08-21 11:00:00"}'
+        + "\n```",
+    }),
+    runAction: async (command) => { executed.push(command); },
+    notifyGroup: async (groupId, content) => { groupNotices.push({ groupId, content }); },
+  });
+  const push = async (content: string, finish = true) => { if (finish) replies.push(content); };
+
+  const asked = await app.handle({
+    msgId: "m-action-1", groupId: "group", senderId: "owner", time: new Date(),
+    text: "@机器人 帮我建个日程，关于刚才的测试", mentioned: true,
+  }, push);
+  assert.equal(asked, "handled");
+  // 群里看到的是自然语言 + 待确认摘要，绝不能出现原始 JSON。
+  const proposal = replies.at(-1) ?? "";
+  assert.match(proposal, /好的，我建议这样安排/);
+  assert.match(proposal, /创建日程[\s\S]*回归测试复盘/);
+  assert.match(proposal, /threadferry confirm [0-9A-F]{6}/);
+  assert.ok(!proposal.includes("threadferry-action"));
+  assert.ok(!proposal.includes("\"action\""));
+  // 没确认之前一次都不能执行。
+  assert.deepEqual(executed, []);
+
+  const code = /threadferry confirm ([0-9A-F]{6})/.exec(proposal)![1]!;
+  // 每次都给新的 msgId：命令按 msgId 去重，重发同一条会被正确判成 duplicate。
+  let sequence = 0;
+  const direct = (text: string, senderId = "owner") => app.handleDirect(
+    { msgId: `d-${sequence += 1}`, senderId, time: new Date(), text }, push);
+
+  // 非 Owner 连确认命令都走不到（私聊管理命令本来就只对 Owner 开放）。
+  assert.equal(await direct(`threadferry confirm ${code}`, "someone-else"), "command");
+  assert.match(replies.at(-1) ?? "", /只有机器人创建者/);
+  assert.deepEqual(executed, []);
+
+  // 错误确认码不执行任何东西。
+  assert.equal(await direct("threadferry confirm 000000"), "command");
+  assert.match(replies.at(-1) ?? "", /确认码无效或已过期/);
+  assert.deepEqual(executed, []);
+
+  // Owner 确认后才真正执行，并把回执发回原来的群。
+  assert.equal(await direct(`threadferry confirm ${code}`), "command");
+  assert.deepEqual(executed, [["calendar", "schedules", "create", "--json",
+    JSON.stringify({ subject: "回归测试复盘", begin_time: "2026-08-21 10:00:00", end_time: "2026-08-21 11:00:00" })]]);
+  assert.match(replies.at(-1) ?? "", /已执行[\s\S]*回归测试复盘/);
+  assert.deepEqual(groupNotices.map((notice) => notice.groupId), ["group"]);
+  assert.match(groupNotices[0]!.content, /已按 Owner 确认执行/);
+
+  // 确认码是一次性的。
+  assert.equal(await direct(`threadferry confirm ${code}`), "command");
+  assert.match(replies.at(-1) ?? "", /确认码无效或已过期/);
+  assert.equal(executed.length, 1);
+});
+
+test("an unexecutable proposal explains itself instead of silently dropping", async () => {
+  const config = testConfig("/workspace", "owner");
+  const replies: string[] = [];
+  const app = createApp(config, {
+    history: async () => [],
+    runtime: async () => ({
+      text: "安排好了。\n\n```threadferry-action\n"
+        + '{"action":"schedule.create","subject":"会","begin_time":"明天十点","end_time":"2026-08-21 11:00:00"}'
+        + "\n```",
+    }),
+    runAction: async () => { throw new Error("不该被调用"); },
+  });
+  await app.handleDirect({ msgId: "d-bad", senderId: "owner", time: new Date(), text: "建个日程" },
+    async (content) => { replies.push(content); });
+  assert.match(replies.at(-1) ?? "", /这个动作我没法执行[\s\S]*2026-08-21 10:00:00/);
+  assert.ok(!(replies.at(-1) ?? "").includes("threadferry-action"));
+});
+
 test("both bots answer when one @ message mentions them together", async (t) => {
   // 群里同时 @ 两台机器人时，企业微信给每台各发一次回调，msgId 是同一条消息的。
   // 「已处理」的判定必须带上 Agent，否则第二台会被当成重复消息丢掉——用户看到的就是有一台不回话。

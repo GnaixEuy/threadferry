@@ -249,6 +249,18 @@ export async function pushWecomMessage(client: WSClient, chatId: string, content
   await client.sendMessage(chatId, { msgtype: "markdown", markdown: { content } });
 }
 
+/**
+ * 执行一个白名单动作（见 src/actions.ts）。命令参数由 ThreadFerry 组装并逐项校验过，
+ * Runtime 的沙箱不参与——它只负责提议，执行始终在这里，用该 Agent 自己的凭据。
+ */
+export async function runWecomAction(command: string[], runner: CommandRunner = runCommand): Promise<void> {
+  if (command.length === 0 || command.some((part) => typeof part !== "string")) {
+    throw new Error("动作命令无效");
+  }
+  const { stdout } = await runner("wecom-cli", command, { timeoutMs: 30_000 });
+  envelopeData(stdout, command.slice(0, 3).join("."));
+}
+
 export async function sendWecomReply(groupId: string, content: string, runner: CommandRunner = runCommand): Promise<void> {
   if (!groupId || groupId.length > 512 || !content || Buffer.byteLength(content) > 12_000) {
     throw new Error("企业微信主动回复参数无效");

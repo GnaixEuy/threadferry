@@ -3,9 +3,19 @@ import { authorize } from "./authorization.js";
 import { buildContext } from "./context-builder.js";
 import { resolveDirectoryUser } from "./directory.js";
 import { newErrorId, sessionScope, ThreadFerryState, type FailurePhase } from "./state.js";
+import { extractAction, prepareAction, type PreparedAction } from "./actions.js";
 import type { AgentView, DirectoryUser, GroupMessage, IncomingDirectMessage, IncomingMention, Reply, RuntimeRequest, RuntimeResult } from "./types.js";
 
 export type HandleResult = "handled" | "stale" | "failed" | "command" | "delivery_pending" | "duplicate" | "unauthorized_group" | "missing_mention" | "unauthorized_user";
+
+/** 待 Owner 确认的动作。Runtime 只能提议，执行永远由 ThreadFerry 在确认后进行。 */
+interface PendingAction {
+  prepared: PreparedAction;
+  /** 提议发生在哪个会话：群 ID，或私聊时为 undefined。确认后回执发回原处。 */
+  groupId?: string;
+  requestedBy: string;
+  expiresAt: number;
+}
 
 export interface AppDependencies {
   history: (groupId: string, options: { lookbackHours: number; maxMessages: number; endTime: Date }) => Promise<GroupMessage[]>;
@@ -15,14 +25,18 @@ export interface AppDependencies {
   bindGroup?: (groupId: string) => Promise<void>;
   listGroups?: () => Promise<Array<{ id: string; name?: string }>>;
   searchUsers?: (keywords: string[]) => Promise<DirectoryUser[]>;
+  /** 执行一个已校验的白名单动作（由 ThreadFerry 自己调 wecom-cli，不经过 Runtime 沙箱）。 */
+  runAction?: (command: string[]) => Promise<void>;
+  /** Owner 在私聊里确认后，把回执发回提议发生的那个群。 */
+  notifyGroup?: (groupId: string, content: string) => Promise<void>;
   onError?: (error: { errorId: string; phase: FailurePhase; reason?: string }) => void;
 }
 
-type ManagementCommand = "help" | "whoami" | "groups" | "agents" | "users" | "invite" | "join" | "add" | "remove" | "bind" | "open" | "close";
+type ManagementCommand = "help" | "whoami" | "groups" | "agents" | "users" | "invite" | "join" | "add" | "remove" | "bind" | "open" | "close" | "confirm";
 const USER_ID = /^[A-Za-z0-9_@.-]{1,512}$/;
 
 function managementCommand(text: string): { name: ManagementCommand; arguments: string[] } | undefined {
-  const match = text.match(/(?:^|[\s@])threadferry\s+(help|whoami|groups|agents|users|invite|join|add|remove|bind|open|close)(?:\s+(.+?))?\s*$/i);
+  const match = text.match(/(?:^|[\s@])threadferry\s+(help|whoami|groups|agents|users|invite|join|add|remove|bind|open|close|confirm)(?:\s+(.+?))?\s*$/i);
   if (!match) return undefined;
   return { name: match[1]!.toLowerCase() as ManagementCommand, arguments: match[2]?.trim().split(/\s+/) ?? [] };
 }
@@ -94,6 +108,9 @@ export function createApp(config: AgentView, dependencies: AppDependencies, stat
   const groupTails = new Map<string, Promise<void>>();
   const controllers = new Map<string, AbortController>();
   const invites = new Map<string, { groupId: string; expiresAt: number }>();
+  // Runtime 提议的动作在这里等 Owner 确认。只存在内存里：重启后未确认的提议自然作废，
+  // 这正是我们想要的——没人确认过的写操作不该跨重启存活。
+  const pendingActions = new Map<string, PendingAction>();
   const callbackDirectoryIds = new Map<string, string>();
   let accessTail = Promise.resolve();
   let shuttingDown = false;
@@ -137,6 +154,36 @@ export function createApp(config: AgentView, dependencies: AppDependencies, stat
     });
     accessTail = operation.then(() => undefined, () => undefined);
     return operation;
+  }
+
+  // Runtime 只会「提议」动作。这里把提议从回复里摘掉、校验参数、挂起等 Owner 确认。
+  // 校验失败就把原因当成普通回复发出去——绝不猜测用户意图，也绝不擅自执行。
+  async function stageAction(text: string, requestedBy: string, groupId?: string): Promise<string> {
+    const { reply: cleaned, action } = extractAction(text);
+    if (!action) return text;
+    if (!dependencies.runAction) return cleaned || "当前启动方式不支持代为执行企业微信动作。";
+    let prepared: PreparedAction;
+    try {
+      prepared = await prepareAction(action, (reference) => resolveDirectoryUser(reference, dependencies.searchUsers));
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : "动作参数无效";
+      return `${cleaned ? `${cleaned}\n\n` : ""}这个动作我没法执行：${reason}`;
+    }
+    for (const [known, item] of pendingActions) if (item.expiresAt < Date.now()) pendingActions.delete(known);
+    const code = randomBytes(3).toString("hex").toUpperCase();
+    pendingActions.set(code, {
+      prepared,
+      ...(groupId ? { groupId } : {}),
+      requestedBy,
+      expiresAt: Date.now() + 10 * 60_000,
+    });
+    return [
+      cleaned,
+      cleaned ? "" : undefined,
+      prepared.summary,
+      "",
+      `我不会自己动手。请 Owner 私聊我发送 \`threadferry confirm ${code}\` 执行（10 分钟内有效）。`,
+    ].filter((line) => line !== undefined).join("\n");
   }
 
   async function respond(reply: Reply, content: string): Promise<HandleResult> {
@@ -326,6 +373,28 @@ export function createApp(config: AgentView, dependencies: AppDependencies, stat
       const selfLine = selfId ? `你正在和 Agent \`${selfId}\` 对话，Workspace 是 ${self!.workspace}。\n\n` : "";
       return respond(reply, `${selfLine}直接发送普通消息即可让我在这个 Workspace 里分析。\n\n接入群聊：\n1. 请企业管理员批准机器人的数据访问权限，并把我加入目标内部群\n2. 发送 \`threadferry groups\` 查看群名或群 ID\n3. 发送 \`threadferry bind <群名或ID>\` 把该群绑定给我\n\n其他管理命令：\n- \`threadferry users <群名>\` 查看可使用用户\n- \`threadferry invite <群名>\` 生成一次性邀请码\n- \`threadferry add <群名> <姓名>\` 直接授权\n- \`threadferry remove <群名> <姓名>\` 移除授权\n- \`threadferry open <群名>\` 允许群内所有成员使用\n- \`threadferry close <群名>\` 恢复仅授权成员可用\n- \`threadferry whoami\` 查看自己的 userid\n\n每个 Agent 对应一个机器人：想用别的 Workspace，就去和那个机器人私聊。\n群或成员重名时，按我返回的 ID 重新发送即可。`);
     }
+    if (command.name === "confirm") {
+      const code = command.arguments[0]?.toUpperCase() ?? "";
+      const pending = pendingActions.get(code);
+      if (!pending || pending.expiresAt < Date.now()) {
+        pendingActions.delete(code);
+        return respond(reply, "确认码无效或已过期。请重新提出需求，我会给一个新的确认码。");
+      }
+      if (!dependencies.runAction) return respond(reply, "当前启动方式不支持代为执行企业微信动作。");
+      pendingActions.delete(code);
+      try {
+        await dependencies.runAction(pending.prepared.command);
+      } catch (error) {
+        const reason = failureReason(error);
+        return respond(reply, withReason("动作执行失败。", reason, "direct"));
+      }
+      // 提议发生在群里就把回执发回群里，省得群里的人不知道到底做没做。
+      if (pending.groupId) {
+        await dependencies.notifyGroup?.(pending.groupId, `已按 Owner 确认执行：\n${pending.prepared.summary}`)
+          .catch(() => undefined);
+      }
+      return respond(reply, `已执行：\n${pending.prepared.summary}`);
+    }
     if (command.name === "agents") {
       const lines = Object.entries(config.agents).map(([id, agent]) => `- \`${id}\`：${agent.runtime}${agent.model ? ` / ${agent.model}` : ""}\n  ${agent.workspace}`);
       return respond(reply, `可用 Agent：\n${lines.join("\n")}`);
@@ -471,7 +540,7 @@ export function createApp(config: AgentView, dependencies: AppDependencies, stat
         if (controllers.get(scope) === controller) controllers.delete(scope);
       }
       if (result.sessionId) await state.setSession(scope, scopeKey, result.sessionId);
-      await reply(limitUtf8(result.text), true);
+      await reply(limitUtf8(await stageAction(result.text, message.senderId)), true);
       return "handled";
     } catch (error) {
       const errorId = newErrorId();
@@ -556,7 +625,8 @@ export function createApp(config: AgentView, dependencies: AppDependencies, stat
       }
 
       phase = "reply";
-      return complete(message, reply, "handled", limitUtf8(result.text));
+      return complete(message, reply, "handled",
+        limitUtf8(await stageAction(result.text, message.senderId, message.groupId)));
     } catch (error) {
       return fail(message, reply, phase, error);
     }
