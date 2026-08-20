@@ -523,6 +523,34 @@ default	codex	default	/Users/gnaixeuy/Desktop/ThreadFerry	aibS5gFrdrjbT-Fluj16Lw
       跨 Agent 隔离、管理台按 Agent；第 35 项验证配置与环境变量里都没有 Bot Secret
 - [x] 版本升到 **0.16.0**，`CHANGELOG.md` 整理出发布章节（破坏性变更置顶），
       `release-notes.mjs 0.16.0` 抽取正常
+- [x] 管理台两个添加流程重做（0.17.0）：添加 Agent / 添加可使用用户都改成按钮 + 对话框；
+      Workspace 输入框自带本机目录选择菜单（点输入框展开、边打字边筛、↑↓ 回车进入），
+      用户输入框自带通讯录搜索；提交失败带值回填并把原因显示在对话框里；样式与脚本改为同源
+      `/admin.css`、`/admin.js`，CSP 去掉 `unsafe-inline`；新增只读 `/api/dirs`、`/api/users`
+- [x] 修掉群识别不到（0.17.0）：发现来源从 `message aibot sessions list`（只含互动过的会话、
+      上限 20）换成 `chat groups list`（最近 7 天有消息的群，游标翻页去重），机器人会话降级为
+      「已在群」的确认信号；绑定不再因未确认而拒绝；查询失败按 Agent 列出原因，空列表说明发现规则
+- [x] **一个群支持多台机器人（0.17.0）**：`loadConfig` 不再拒绝「同一个群挂在两个 Agent 下」；
+      内存结构改成 `groups[群].agents[agentId] = { allowUsers, allowAll }`，运行视图新增
+      `AgentView` 类型（形状与旧 `ThreadFerryConfig` 相同），**app.ts / authorization.ts 逻辑零改动**；
+      管理台群卡片按 Agent 分段、路由全部带 agentId；状态记录新增可选 `agent` 字段让中断恢复
+      回到同一台机器人。磁盘格式未变（v6 本来就按 Agent 嵌套）。
+      **这条即 Phase 1c 说的「将来出现新的消费者」——用的是「群内按 Agent 分授权」而不是整体嵌套。**
+- [x] 管理台待绑定候选改成复选框，一次可把一个群绑给多台机器人；Agent 卡片显示 Owner 顶层部门
+      （企业微信无企业名查询，由 whoami 的 Owner 姓名反查通讯录得到）和 Owner 姓名
+- [x] 归属信息抽成 `src/agent-origin.ts`：**通讯录权限是可选的，绝不阻塞**——页面只读缓存、
+      后台刷新、限时 5 秒、身份先落缓存再查通讯录、失败按 TTL 抑制重试、启动时后台预热
+- [x] 群成员名单显示姓名（`src/directory-names.ts`）：企业微信**不支持按 userid 反查通讯录**
+      （原 `fetchUserNames` 对加密 userid 永远为空，已删），改为从单聊会话列表、群历史消息、
+      按姓名添加用户三处顺手收集映射；同样是同步查表 + 后台收集 + 限时，收集不到就继续显示 id
+- [x] **修复同时 @ 两台机器人只有一台回话**：企业微信按机器人各发一次回调、msgId 相同，
+      而 turn / 待发送记录的身份只由 msgId 算，第二台被判重复丢弃。改为
+      `sha256(agentId + \0 + msgId)`，`claimCommand`/`enqueue`/`markRunning`/`finish`/
+      `finishWithDelivery` 全部按 Agent 分开，旧记录回退旧身份
+- [x] **实测 + 日志双重确认：企业微信只把一条群消息投给第一个被 @ 的机器人**（交换 @ 顺序回话的机器人跟着换，
+      且去重修复生效后每条消息仍只有一条 turn）。新增 `src/group-fanout.ts`：收到回调的 Agent
+      在进程内把同一条消息转交给其他被 @ 到且绑了该群的 Agent，各自用自己的凭据回复；
+      重复投递由按 Agent 的 turn 去重兜住
 - [ ] 提交并发版 ← **需要用户明确授权（AGENTS.md）**
 - [ ] Phase 1c 已主动放弃，见上方说明
 - [ ] 概览页按 agent 分组

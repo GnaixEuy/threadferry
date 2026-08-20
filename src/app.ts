@@ -3,7 +3,7 @@ import { authorize } from "./authorization.js";
 import { buildContext } from "./context-builder.js";
 import { resolveDirectoryUser } from "./directory.js";
 import { newErrorId, sessionScope, ThreadFerryState, type FailurePhase } from "./state.js";
-import type { DirectoryUser, GroupMessage, IncomingDirectMessage, IncomingMention, Reply, RuntimeRequest, RuntimeResult, ThreadFerryConfig } from "./types.js";
+import type { AgentView, DirectoryUser, GroupMessage, IncomingDirectMessage, IncomingMention, Reply, RuntimeRequest, RuntimeResult } from "./types.js";
 
 export type HandleResult = "handled" | "stale" | "failed" | "command" | "delivery_pending" | "duplicate" | "unauthorized_group" | "missing_mention" | "unauthorized_user";
 
@@ -87,7 +87,10 @@ function historyFingerprint(history: GroupMessage[], current: IncomingMention): 
   return createHash("sha256").update(JSON.stringify(normalized)).digest("hex");
 }
 
-export function createApp(config: ThreadFerryConfig, dependencies: AppDependencies, state = new ThreadFerryState()) {
+export function createApp(config: AgentView, dependencies: AppDependencies, state = new ThreadFerryState()) {
+  // 一个 app 实例只服务一个 Agent。群里同时 @ 两台机器人时，同一条消息（msgId 相同）
+  // 会被每台的连接各收一次，所以状态里的「已处理」判定必须带上 Agent，否则第二台不回话。
+  const selfAgent = () => Object.keys(config.agents)[0];
   const groupTails = new Map<string, Promise<void>>();
   const controllers = new Map<string, AbortController>();
   const invites = new Map<string, { groupId: string; expiresAt: number }>();
@@ -125,7 +128,7 @@ export function createApp(config: ThreadFerryConfig, dependencies: AppDependenci
   // 一个 app 实例只服务一个 Agent，所以绑定就是「绑到我」——不需要也不接受 Agent 参数。
   function bindGroup(groupId: string): Promise<void> {
     const operation = accessTail.then(async () => {
-      if (config.groups[groupId]) throw new Error("该群已经配置");
+      if (config.groups[groupId]) throw new Error("这个群已经绑给我了");
       const [agentId] = Object.entries(config.agents)[0] ?? [];
       if (!agentId) throw new Error("当前没有可用 Agent。");
       if (!dependencies.bindGroup) throw new Error("当前启动方式不支持群绑定");
@@ -179,7 +182,8 @@ export function createApp(config: ThreadFerryConfig, dependencies: AppDependenci
     if (matches.length > 1) {
       throw new Error(`有多个同名群“${reference}”，请改用群 ID：\n${matches.map((group) => `- \`${group.id}\``).join("\n")}`);
     }
-    throw new Error(`我看不到群“${reference}”。请确认已把我加入该内部群，然后发送 \`threadferry groups\`。`);
+    throw new Error(`我看不到群“${reference}”。把我拉进该内部群后，群里最近 7 天要有消息才能被发现——`
+      + `可以在群里随便发一条或 @ 我一次，然后发送 \`threadferry groups\`。`);
   }
 
   async function resolveGroupAndValue(arguments_: string[], label: string): Promise<{ group: { id: string; name?: string }; value: string }> {
@@ -301,7 +305,7 @@ export function createApp(config: ThreadFerryConfig, dependencies: AppDependenci
   }
 
   async function handleDirect(message: IncomingDirectMessage, reply: Reply): Promise<HandleResult> {
-    if (!(await state.claimCommand(message.msgId, `direct:${message.senderId}`))) return "duplicate";
+    if (!(await state.claimCommand(message.msgId, `direct:${message.senderId}`, selfAgent()))) return "duplicate";
     const command = managementCommand(message.text);
     if (!command) {
       if (!(await isOwner(message.senderId))) return respond(reply, ownerOnly("私聊 Agent", await authoritativeId(message.senderId)));
@@ -427,7 +431,7 @@ export function createApp(config: ThreadFerryConfig, dependencies: AppDependenci
 
   async function handleGroupCommand(message: IncomingMention, reply: Reply, command: { name: ManagementCommand; arguments: string[] }): Promise<HandleResult> {
     if (!config.groups[message.groupId]) return "unauthorized_group";
-    if (!(await state.claimCommand(message.msgId, message.groupId))) return "duplicate";
+    if (!(await state.claimCommand(message.msgId, message.groupId, selfAgent()))) return "duplicate";
     if (command.name === "whoami") return respond(reply, `你的 ThreadFerry userid：\`${await authoritativeId(message.senderId)}\``);
     if (command.name === "join") return join(message.senderId, command.arguments[0], reply, message.groupId);
     return respond(reply, "机器人权限管理请私聊 ThreadFerry，并发送 `threadferry help` 查看命令。");
@@ -474,7 +478,7 @@ export function createApp(config: ThreadFerryConfig, dependencies: AppDependenci
       const reason = failureReason(error);
       dependencies.onError?.({ errorId, phase: "runtime", ...(reason ? { reason } : {}) });
       // 原先私聊失败不落盘，于是回复里让用户跑 threadferry status 却查不到任何东西。
-      await state.finish(message.msgId, "failed", { errorId, phase: "runtime" }).catch(() => undefined);
+      await state.finish(message.msgId, "failed", { errorId, phase: "runtime" }, selfAgent()).catch(() => undefined);
       // 私聊对象只可能是 Owner，原因给全。
       await reply(withReason(`ThreadFerry 处理失败（错误编号 ${errorId}）。`, reason, "direct"), true).catch(() => undefined);
       return "failed";
@@ -488,7 +492,9 @@ export function createApp(config: ThreadFerryConfig, dependencies: AppDependenci
     content: string,
     failure?: { errorId: string; phase: FailurePhase },
   ): Promise<HandleResult> {
-    const deliveryId = await state.finishWithDelivery(message.msgId, message.groupId, status, content, failure);
+    // 待补发的回复要记住是哪台机器人算出来的：同群多机器人时不能用另一台的身份发出去。
+    const deliveryId = await state.finishWithDelivery(
+      message.msgId, message.groupId, status, content, failure, selfAgent());
     try {
       await reply(content, true);
       await state.completeDelivery(deliveryId);
@@ -514,7 +520,7 @@ export function createApp(config: ThreadFerryConfig, dependencies: AppDependenci
     try {
       return await complete(message, reply, "failed", content, { errorId, phase });
     } catch {
-      await state.finish(message.msgId, "failed", { errorId, phase }).catch(() => undefined);
+      await state.finish(message.msgId, "failed", { errorId, phase }, selfAgent()).catch(() => undefined);
       await reply(content, true).catch(() => undefined);
       return "failed";
     }
@@ -524,7 +530,7 @@ export function createApp(config: ThreadFerryConfig, dependencies: AppDependenci
     let phase: FailurePhase = "history";
     try {
       if (shuttingDown) throw new Error("ThreadFerry 正在停止");
-      await state.markRunning(message.msgId);
+      await state.markRunning(message.msgId, selfAgent());
       const history = await dependencies.history(message.groupId, { ...context, endTime: message.time });
       const fingerprint = historyFingerprint(history, message);
       const prompt = buildContext(history, message, context);
@@ -560,7 +566,7 @@ export function createApp(config: ThreadFerryConfig, dependencies: AppDependenci
     const authorization = await authorizeMessage(message);
     if (!authorization.allowed) {
       const errorId = newErrorId();
-      await state.finish(message.msgId, "failed", { errorId, phase: "host" }).catch(() => undefined);
+      await state.finish(message.msgId, "failed", { errorId, phase: "host" }, selfAgent()).catch(() => undefined);
       dependencies.onError?.({ errorId, phase: "host" });
       return authorization.reason === "group"
         ? "unauthorized_group"
@@ -584,7 +590,9 @@ export function createApp(config: ThreadFerryConfig, dependencies: AppDependenci
             ? "missing_mention"
             : "unauthorized_user";
       }
-      if (!(await state.enqueue(message))) return "duplicate";
+      // 状态里的身份一律用视图自己的 Agent（selfAgent），和后面的 markRunning / finish 保持一致；
+      // 混用群记录里的 agent 会算出两个不同的 turn id，收尾时找不到自己的记录。
+      if (!(await state.enqueue(message, selfAgent()))) return "duplicate";
 
       const queued = groupTails.has(message.groupId);
       try {
@@ -592,8 +600,7 @@ export function createApp(config: ThreadFerryConfig, dependencies: AppDependenci
       } catch (error) {
         return fail(message, reply, "ack", error);
       }
-      const agentId = authorization.group.agent;
-      return serial(message.groupId, () => process(message, reply, agentId, authorization.group.context));
+      return serial(message.groupId, () => process(message, reply, authorization.group.agent, authorization.group.context));
     },
     handleDirect,
     replay,

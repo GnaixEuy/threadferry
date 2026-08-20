@@ -128,8 +128,18 @@ The Owner can send these commands directly to the bot:
 | `threadferry close <group-name>` | Go back to authorized members only |
 | `threadferry whoami` | Show your callback userid |
 
-`bind` takes no agent argument — whichever bot you are talking to is the agent you bind to. To
-move a group to another agent, unbind it and bind again from the target bot.
+`bind` takes no agent argument — whichever bot you are talking to is the agent you bind to.
+
+**One group can run several bots at once**: add the bots to the group, then tick several of them on
+the group's pending card in the admin console and press "绑定所选" (or send
+`threadferry bind <group-name>` to each bot in a direct chat). Whichever bot gets @-mentioned
+answers, using its own workspace; each bot keeps its own allowlist, all-member switch, and session.
+Unbinding one leaves the others untouched.
+
+One message may mention several bots at once (`@叶翔 @悦翔 你们好`) and each answers separately.
+WeCom delivers such a message only to the **first** bot mentioned, so ThreadFerry hands it to the
+others in-process — which means bots mentioned together must be hosted by the same
+`threadferry start` process (the default).
 
 If multiple groups or members have the same name, ThreadFerry returns candidate IDs. Retry with `id:<userid>` or the group ID as instructed. Management commands and direct Agent messages only work for **that agent's own Owner**: agent A's Owner cannot manage agent B's groups. Directory permission is only needed for resolving member names in `add` and `remove`; pairing, direct Agent use, and group binding do not use it.
 
@@ -160,12 +170,39 @@ Bot Secret** — credentials stay encrypted in wecom-cli's own store and are onl
 a connection. Agent names double as directory names, so they may contain Chinese characters and
 spaces (up to 128 characters) but cannot contain path separators or control characters.
 
+Each agent card shows the **top-level department of its Owner** in the address book (for a small
+enterprise that is the company name), plus the Owner's display name rather than only the encrypted
+userid — useful when bots from several enterprises sit side by side. WeCom exposes no "which
+enterprise does this bot belong to" query, so that department is derived from the Owner name in
+`identity whoami` looked up in the address book.
+
+These labels are decoration only: **a bot without address-book permission simply loses the
+department badge**, everything else still shows, and pages do not get slower — the console only
+reads a cache refreshed in the background, never waiting on these lookups.
+
+Authorized-user lists on the groups page show display names too, with the encrypted userid kept
+underneath in small type. WeCom cannot look a userid up in the address book, so names are collected
+opportunistically from three places: the direct-chat session list, group history messages, and the
+moment a user is added by name. Anyone not covered keeps showing their id.
+
 The admin console has three pages: an overview with runtime status and pending actions, an agent
-workspaces page showing each agent's bot authorization state, Owner, workspace, and bound groups
-(the workspace field can be filled by browsing local directories), and a groups page for binding
-or unbinding groups, toggling all-member access, managing authorized users, and resetting group
-sessions. When binding an unbound group, the dropdown only lists agents whose bot is actually in
-that group. Changes take effect immediately.
+workspaces page showing each agent's bot authorization state, Owner, workspace, and bound groups,
+and a groups page for binding or unbinding groups, toggling all-member access, managing authorized
+users, and resetting group sessions. Changes take effect immediately.
+
+**How groups are discovered**: WeCom offers no "which groups is this bot in" query, so ThreadFerry
+lists groups that have messages in the last 7 days. After adding the bot to a new group, post
+anything there (or @ the bot once) before it shows up as bindable. Agents marked "机器人已在群" in
+the bind dropdown have a confirmed bot session; unmarked ones can still be bound — @ the bot once
+afterwards, and silence means that bot is not in the group yet. Failed lookups (for example, an
+enterprise that has not enabled conversation data access) are listed with their reason instead of
+being passed off as an empty, complete list.
+
+Adding things happens in a dialog: "＋ Add agent workspace" on the agents page and "＋ Add
+authorized user" on each group card. Both dialogs have a picker attached to the input itself —
+click the Workspace field to walk local directories (type to filter, arrow keys and Enter to move,
+"use this directory" to confirm), or the user field to search the address book and pick a person.
+If the form is rejected, the dialog reopens with what you typed and the reason shown inside it.
 
 You can also use the CLI:
 

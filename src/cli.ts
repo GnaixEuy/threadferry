@@ -7,9 +7,13 @@ import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { createApp } from "./app.js";
+import { AgentOriginCache } from "./agent-origin.js";
 import { startAdminServer, type ConfigUpdater } from "./admin.js";
+import { DirectoryNameCache } from "./directory-names.js";
+import { fanOutTargets, quotedReply } from "./group-fanout.js";
 import { authorizeHint, botConfigDir, botStatus, loadBotCredentials, validateAgentId, wecomEnv, type BotCredentials } from "./bots.js";
-import { listWecomGroups, searchWecomUsers, sendWecomReply, startWecomChannel } from "./channels/wecom.js";
+import type { WSClient } from "@wecom/aibot-node-sdk";
+import { listWecomGroups, pushWecomMessage, searchWecomUsers, sendWecomReply, startWecomChannel, wecomFailureReason } from "./channels/wecom.js";
 import {
   addAgent,
   adoptOwner,
@@ -38,10 +42,10 @@ import {
   waitForPair,
   type SetupPlan,
 } from "./setup-wizard.js";
-import type { CommandRunner, GroupMessage, IncomingMention, RuntimeName, ThreadFerryConfig } from "./types.js";
+import type { AgentView, CommandRunner, GroupMessage, IncomingMention, RuntimeName, ThreadFerryConfig } from "./types.js";
 import { findUpdate, installUpdate } from "./update.js";
 
-const VERSION = "0.16.0";
+const VERSION = "0.17.0";
 const UPDATE_INTERVAL_MS = 6 * 60 * 60 * 1_000;
 const USAGE = `ThreadFerry ${VERSION}
 
@@ -632,7 +636,7 @@ async function doctor(configPath?: string): Promise<boolean> {
   }
 
   const probeGroup = probeAgent
-    && Object.entries(loadedConfig?.groups ?? {}).find(([, group]) => group.agent === probeAgent)?.[0];
+    && Object.entries(loadedConfig?.groups ?? {}).find(([, group]) => group.agents[probeAgent])?.[0];
   if (wecomAuthorized && probeGroup && probeRunner) {
     try {
       await fetchWecomHistory(probeGroup, { lookbackHours: 1 / 60, maxMessages: 1, endTime: new Date() }, probeRunner);
@@ -672,8 +676,12 @@ async function doctor(configPath?: string): Promise<boolean> {
 }
 
 async function runMock(config: ThreadFerryConfig): Promise<void> {
-  const [groupId, group] = Object.entries(config.groups)[0]!;
-  const agent = config.agents[group.agent]!;
+  const [groupId, binding] = Object.entries(config.groups)[0]!;
+  const agentId = Object.keys(binding.agents)[0]!;
+  const agent = config.agents[agentId]!;
+  // mock 也走单 Agent 视图，和真实运行时同一条路径。
+  const view = agentView(config, agentId);
+  const group = view.groups[groupId]!;
   const currentTime = new Date();
   const at = (minutesAgo: number) => new Date(currentTime.getTime() - minutesAgo * 60_000);
   const history: GroupMessage[] = [
@@ -690,7 +698,7 @@ async function runMock(config: ThreadFerryConfig): Promise<void> {
     text: "@ThreadFerry 帮忙分析",
     mentioned: true,
   };
-  const app = createApp(config, {
+  const app = createApp(view, {
     history: async () => history,
     runtime: async ({ agentId, runtime, workspace, prompt }) => {
       if (!prompt.includes("张三") || !prompt.includes("李四") || !prompt.includes("王五")) {
@@ -725,11 +733,14 @@ async function resetSession(configPath: string | undefined, groupId: string): Pr
     const config = await loadConfig(resolve(configPath ?? defaultConfigPath()));
     const group = config.groups[groupId];
     if (!group) throw new Error("指定群未配置");
-    // 只重置该群所属 Agent 的 Session：两个机器人同在一个群时不能清掉对方的。
-    const agent = config.agents[group.agent]!;
-    const removed = await new ThreadFerryState(defaultStatePath())
-      .clearSession(groupId, sessionScope(group.agent, agent));
-    console.log(removed ? "该群 Runtime Session 已重置。" : "该群当前没有已保存的 Runtime Session。");
+    // 一个群里可以有多台机器人，每台各有自己的 Session；「重置这个群」就是把它们都清掉。
+    const state = new ThreadFerryState(defaultStatePath());
+    let removed = 0;
+    for (const agentId of Object.keys(group.agents)) {
+      const agent = config.agents[agentId];
+      if (agent && await state.clearSession(groupId, sessionScope(agentId, agent))) removed += 1;
+    }
+    console.log(removed > 0 ? `该群 ${removed} 个 Agent 的 Runtime Session 已重置。` : "该群当前没有已保存的 Runtime Session。");
   } finally {
     await lock.release();
   }
@@ -842,7 +853,7 @@ async function start(
       configTail = operation.then(() => undefined, () => undefined);
       return operation;
     };
-    const views = new Map<string, ThreadFerryConfig>();
+    const views = new Map<string, AgentView>();
     const state = new ThreadFerryState(defaultStatePath());
 
     // 每个 Agent 一套：配置视图 + 绑定自己凭据目录的 runner + 独立 app 实例 + 独立连接。
@@ -854,23 +865,26 @@ async function start(
       const app = createApp(view, {
       history: (groupId, options) => fetchWecomHistory(groupId, options, runner),
       runtime: (request) => request.runtime === "codex" ? runCodex(request) : runPi(request),
+      // 写回只动「这个 host 的 Agent」那一份：同群的另一台机器人有它自己的名单和开关。
       updateAllowUsers: (groupId, users) => updateConfig((latest) => {
-        const group = latest.groups[groupId];
-        if (!group) throw new Error("指定群未配置");
-        group.allowUsers = users;
+        const access = latest.groups[groupId]?.agents[agentId];
+        if (!access) throw new Error("指定群未绑定给该 Agent");
+        access.allowUsers = users;
       }),
       updateGroupAccess: (groupId, allowAll) => updateConfig((latest) => {
-        const group = latest.groups[groupId];
-        if (!group) throw new Error("指定群未配置");
-        if (allowAll) group.allowAll = true;
-        else delete group.allowAll;
+        const access = latest.groups[groupId]?.agents[agentId];
+        if (!access) throw new Error("指定群未绑定给该 Agent");
+        if (allowAll) access.allowAll = true;
+        else delete access.allowAll;
       }),
       // 绑定到「这个 host 的 Agent」，Agent 由闭包捕获，不从用户输入来。
       bindGroup: (groupId) => updateConfig((latest) => {
         const owner = latest.agents[agentId]?.ownerUser;
         if (!owner) throw new Error(`Agent ${agentId} 未配置`);
-        if (latest.groups[groupId]) throw new Error("指定群已配置");
-        latest.groups[groupId] = { agent: agentId, allowUsers: [owner], context: { lookbackHours: 6, maxMessages: 80 } };
+        const binding = latest.groups[groupId] ?? { agents: {}, context: { lookbackHours: 6, maxMessages: 80 } };
+        if (binding.agents[agentId]) throw new Error("这个群已经绑给我了");
+        binding.agents[agentId] = { allowUsers: [owner] };
+        latest.groups[groupId] = binding;
       }),
       listGroups: () => listWecomGroups(runner),
       searchUsers: (keywords) => searchWecomUsers(keywords, runner),
@@ -881,52 +895,122 @@ async function start(
 
     // 管理台看全量配置，但所有企业微信查询都按 Agent 走它自己的机器人。
     const runnerFor = (agentId: string) => hosts.find((host) => host.agentId === agentId)?.runner;
+    // 归属信息（机器人名 / Owner 姓名 / Owner 顶层部门）在后台预热一次，管理台首次打开就能显示。
+    // 没有通讯录权限的机器人只会少一个徽章，这里既不等它也不报错。
+    const origins = new AgentOriginCache();
+    for (const host of hosts) void origins.refresh(host.agentId, host.runner).catch(() => undefined);
+    // 加密 userid → 姓名：通讯录不支持按 id 反查，只能从单聊会话和群历史里顺手收集（见 directory-names.ts）。
+    // 同样是后台预热 + 只读缓存，没权限就一直显示 id。
+    const names = new DirectoryNameCache();
+    const groupsOf = (agentId: string) =>
+      Object.entries(config.groups).filter(([, group]) => group.agents[agentId]).map(([groupId]) => groupId);
+    for (const host of hosts) void names.refresh(host.agentId, host.runner, groupsOf(host.agentId)).catch(() => undefined);
     const admin = await startAdminServer(config, {
       updateConfig,
       listGroups: async (agentId) => {
         const runner = runnerFor(agentId);
-        return runner ? listWecomGroups(runner) : [];
+        if (!runner) return [];
+        // 顺手安排一次姓名收集；schedule 自己不等待，页面渲染不受影响。
+        names.schedule(agentId, runner, groupsOf(agentId));
+        try {
+          return await listWecomGroups(runner);
+        } catch (error) {
+          // 管理台只能显示 Error.message，所以在这里就把 wecom-cli 的真实原因和本项目的补救办法接上。
+          const reason = wecomFailureReason(error);
+          throw new Error(/授权|auth/i.test(reason) ? `${reason}（在终端执行 threadferry agent login ${agentId}）` : reason);
+        }
       },
       searchUsers: (keywords) => searchWecomUsers(keywords, hosts[0]!.runner),
+      userName: (userId) => names.name(userId),
+      rememberUser: (userId, name) => names.remember(userId, name),
       botStatus: async (agentId) => {
         const status = await botStatus(agentId, config.agents[agentId]?.configDir);
+        // 归属信息只读缓存：通讯录权限不是必须的，页面绝不等这两个调用（见 agent-origin.ts）。
+        const runner = runnerFor(agentId);
+        const origin = status.authorized && runner ? origins.read(agentId, runner) : {};
         return {
           authorized: status.authorized,
           ...(status.botId ? { botId: status.botId } : {}),
+          ...origin,
           ...(status.authorized ? {} : { hint: authorizeHint(agentId, config.agents[agentId]?.configDir) }),
         };
       },
       snapshot: () => state.snapshot(),
-      resetSession: (groupId) => {
-        const group = config.groups[groupId];
-        if (!group) throw new Error("指定群未配置");
-        return state.clearSession(groupId, sessionScope(group.agent, config.agents[group.agent]!));
+      resetSession: (groupId, agentId) => {
+        const agent = config.agents[agentId];
+        if (!config.groups[groupId]?.agents[agentId] || !agent) throw new Error("该群未绑定给这个 Agent");
+        return state.clearSession(groupId, sessionScope(agentId, agent));
       },
     }, port);
     console.log(`ThreadFerry 管理台: ${admin.url}`);
     try {
-      const clients = hosts.map(({ agentId, app, credentials }) => startWecomChannel(credentials, async (event, reply) => {
+      // 企业微信只把一条群消息投给**第一个被 @ 的机器人**（实测：交换 @ 顺序，回话的机器人跟着换，
+      // 状态里也始终只有一条 turn）。但群里 @ 了两台，用户期望两台都回。两个 Agent 本来就跑在同一个
+      // 进程里，所以这里把同一条消息在进程内转交给「也被 @ 到、也绑了这个群」的其他 Agent，
+      // 各自用自己的机器人凭据回复。
+      // 若企业微信将来改成投给所有被 @ 的机器人，重复的那份会被按 Agent 的 turn 去重挡掉，不会答两遍。
+      const clients = new Map<string, WSClient>();
+      const fanOut = async (receivedBy: string, message: IncomingMention) => {
+        const peers = fanOutTargets(
+          message.text,
+          receivedBy,
+          hosts.map((host) => ({ ...host, ...origins.read(host.agentId, host.runner) })),
+          (agentId) => Boolean(config.groups[message.groupId]?.agents[agentId]),
+        );
+        await Promise.all(peers.map(async (peer) => {
+          try {
+            const status = await peer.app.handle(message, async (content) => {
+              // 转交的机器人发不出「引用」气泡（见 group-fanout.ts），所以把原消息放进正文引用块，
+              // 群里才看得出它在回哪一条。
+              const body = quotedReply(message.text, content);
+              // 优先走这台机器人自己的 WS 连接：身份一样，但不用为每条回复起一个 wecom-cli 进程。
+              const client = clients.get(peer.agentId);
+              if (!client) return sendWecomReply(message.groupId, body, peer.runner);
+              try {
+                await pushWecomMessage(client, message.groupId, body);
+              } catch {
+                // 连接侧发不出去时退回 wecom-cli，别把这条回复丢了。
+                await sendWecomReply(message.groupId, body, peer.runner);
+              }
+            });
+            // duplicate 说明这台机器人自己也收到了同一条回调——那就意味着企业微信其实投给了所有被 @ 的
+            // 机器人，转交是多余的。把这件事直接写进日志，省得靠猜。
+            console.log(status === "duplicate"
+              ? `[wecom] Agent ${peer.agentId} 已自己收到同一条群 @ 消息，${receivedBy} 的转交被去重挡下（说明企业微信投给了所有被 @ 的机器人）`
+              : `[wecom] Agent ${peer.agentId} 接手 ${receivedBy} 转交的同一条群 @ 消息（说明企业微信没给它投这次回调），处理状态: ${status}`);
+          } catch (error) {
+            const errorId = newErrorId();
+            console.error(`[wecom] Agent ${peer.agentId} 接手同一条群 @ 消息失败 error=${errorId} reason=${wecomFailureReason(error)}`);
+          }
+        }));
+      };
+      const connections = hosts.map(({ agentId, app, credentials }) => startWecomChannel(credentials, async (event, reply) => {
+        if (event.chatType === "group") void fanOut(agentId, event.message);
         const status = event.chatType === "single"
           ? await app.handleDirect(event.message, reply)
           : await app.handle(event.message, reply);
         console.log(`[wecom] Agent ${agentId} 收到${event.chatType === "single" ? "单聊" : "群内 @"}消息，处理状态: ${status}`);
       }));
+      hosts.forEach((host, index) => clients.set(host.agentId, connections[index]!));
       for (const { agentId, view } of hosts) {
         console.log(`[bot] Agent ${agentId} 已连接，监听 ${Object.keys(view.groups).length} 个已配置群`);
       }
       console.log(`ThreadFerry 已启动，${hosts.length} 个 Agent 各自一条企业微信机器人连接。`);
 
-      const hostForGroup = (groupId: string) => {
-        const agentId = config.groups[groupId]?.agent;
-        return agentId ? hosts.find((host) => host.agentId === agentId) : undefined;
+      // 一个群可能挂着多台机器人，所以恢复优先认状态记录里的 Agent；
+      // 旧记录没有这个字段时，只有群里恰好只有一个 Agent 才敢兜底，否则宁可不发也不冒名。
+      const hostForGroup = (groupId: string, agent?: string) => {
+        if (agent) return hosts.find((host) => host.agentId === agent);
+        const candidates = Object.keys(config.groups[groupId]?.agents ?? {});
+        return candidates.length === 1 ? hosts.find((host) => host.agentId === candidates[0]) : undefined;
       };
       const recovery = (async () => {
         for (const delivery of await state.pendingDeliveries()) {
           // 必须用该群所属 Agent 的机器人补发；用别的机器人会从错误身份发出去。
-          const host = hostForGroup(delivery.groupId);
+          const host = hostForGroup(delivery.groupId, delivery.agent);
           if (!host) {
             await state.completeDelivery(delivery.id);
-            console.error("[state] 已丢弃未配置群或所属 Agent 未启动的待发送回复");
+            console.error("[state] 已丢弃待发送回复：群未配置、对应 Agent 未启动，或无法确定该由哪台机器人补发");
             continue;
           }
           try {
@@ -942,10 +1026,10 @@ async function start(
 
         const pending = await state.recoverPending();
         if (pending.length > 0) console.log(`[state] 正在恢复 ${pending.length} 个上次中断的任务`);
-        await Promise.all(pending.map(async (message) => {
-          const host = hostForGroup(message.groupId);
+        await Promise.all(pending.map(async ({ message, agent }) => {
+          const host = hostForGroup(message.groupId, agent);
           if (!host) {
-            console.error("[state] 跳过恢复：该群未配置或所属 Agent 未启动");
+            console.error("[state] 跳过恢复：群未配置、对应 Agent 未启动，或无法确定该由哪台机器人接手");
             return;
           }
           const result = await host.app.replay(message, async (content, finish = true) => {
@@ -966,7 +1050,7 @@ async function start(
           if (stopping) return;
           stopping = true;
           clearInterval(updateTimer);
-          for (const client of clients) client.disconnect();
+          for (const connection of connections) connection.disconnect();
           void admin.close();
           void Promise.all([...hosts.map(({ app }) => app.shutdown(cancel)), recovery, updateCheck]).finally(done);
         };
