@@ -91,6 +91,12 @@ Every missing item is reported with a next action. The command must fail until r
 35. Verify `~/.threadferry/threadferry.yaml` contains no Bot Secret, and that no `THREADFERRY_WECOM_BOT_*` environment variable is set by ThreadFerry.
 36. 分别用 `runtime: claude` 和 `runtime: grok` 完成一次真实私聊分析，重启后追问并确认恢复的是各自 Session。
 37. 在测试 Workspace 放置 `.env` 和写入诱导指令，确认 Claude/Grok 均不能读取敏感文件、写文件、执行命令、访问 Web 或 MCP。
+38. Owner 私聊机器人发送一张截图并提问图片内容，确认 Runtime 能识别真实画面，回复中不再出现“没有收到图片”。
+39. Owner 私聊机器人发送 UTF-8 Markdown 或日志文件并提问文件内容，确认 Runtime 读到正文；再发送不支持的二进制文件，确认回复明确说明“已收到但当前 Runtime 不能解析”，而不是误报附件缺失。
+40. 在已配置群中附图并 `@机器人`，再分别引用一张图片和一个文件提问，确认当前资源与引用资源都进入同一轮分析；同消息 `@` 两个机器人时，两边均完成后资源才清理。
+41. 先在群里发送图片或文件，再用一条纯文本 `@机器人` 要求结合刚才资源分析，确认 ThreadFerry 通过 `chat messages list` + `message files get` 补取历史内容，并且分析后的新鲜度检查不会再次下载。
+42. Owner 私聊发送图片或文件，下一条纯文本要求继续分析；重启 ThreadFerry 后再次追问，确认两次都能从该 Agent 的历史中读取资源。用同一聊天 ID 构造的群历史和另一 Agent 均不得读到该资源。
+43. 分别让分析成功、Runtime 失败和结果过期，确认单轮临时目录均被删除；检查 `~/.threadferry/state-v3.json`、终端日志、Runtime 提示词和 `~/.threadferry/history/<Agent>/index.json`，不得出现临时路径、资源 URL、AES Key 或 `media_id`；历史目录/索引/内容权限应为 0700/0600，过期与孤立内容会清理。
 
 V0.1 的真实 WebSocket 接收、群历史拉取、Codex 执行和原群回复已在目标企业手工打通。V0.2～V0.9
 新增的队列、Session 续接、崩溃恢复、创建者私聊管理、Pi/Claude/Grok Runtime、本机管理台、安装向导和项目

@@ -28,7 +28,9 @@ export function buildContext(
     .filter((message) => {
       const time = message.time.getTime();
       return time >= earliest && time <= current.time.getTime()
-        && !(message.senderId === current.senderId && time === current.time.getTime() && message.text === current.text);
+        && !(message.senderId === current.senderId
+          && Math.floor(time / 1_000) === Math.floor(current.time.getTime() / 1_000)
+          && message.text === current.text);
     })
     .sort((left, right) => left.time.getTime() - right.time.getTime());
   const historyLimit = options.maxMessages - 1;

@@ -21,12 +21,20 @@ credentials, groups, workspace, runtime, and sessions — strictly 1:1 and isola
 
 ## Install
 
-Requirements: macOS or Linux, Node.js 22+, a WeCom AI bot, and one runtime: Codex CLI `0.138.0+`,
-Pi CLI `0.84.2+`, Claude Code `2.1.233+`, or Grok Build `1.0.5+`. The installer adds the official
+Requirements: macOS, Linux, or Windows, Node.js 22+, a WeCom AI bot, and one runtime: Codex CLI
+`0.138.0+`, Pi CLI `0.84.2+`, Claude Code `2.1.233+`, or Grok Build `1.0.5+`. The installer adds the official
 `wecom-cli 1.1.0+` when needed.
+
+macOS or Linux:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/GnaixEuy/threadferry/main/install.sh | bash
+```
+
+Windows PowerShell (no WSL required):
+
+```powershell
+irm https://raw.githubusercontent.com/GnaixEuy/threadferry/main/install.ps1 | iex
 ```
 
 The onboarding wizard authorizes the bot, confirms its Owner, selects a runtime and workspace,
@@ -59,8 +67,24 @@ In a configured group, mention the bot:
 @Bot Summarize the discussion and inspect the relevant code.
 ```
 
-ThreadFerry adds up to 80 messages from the preceding 6 hours as untrusted context. Regular group
-messages do not invoke the runtime.
+ThreadFerry adds up to 80 messages from the preceding 6 hours as untrusted group context. Direct
+chat uses up to 80 messages from the preceding 7 days. Regular group messages do not invoke the runtime.
+
+### Images and files
+
+Send an image or file in Owner direct chat, or attach/reply to it while mentioning the bot in a
+configured group. ThreadFerry downloads and decrypts current and quoted resources, and can retrieve
+the 10 most recent media items in direct or group context. UTF-8 text files are supplied to every runtime;
+images use each runtime's native visual input. Unsupported binary formats are reported as received
+instead of being misreported as missing.
+
+Each resource is limited to 20 MB and one analysis turn to 50 MB. To survive restarts and an empty
+upstream direct-history response, each agent keeps up to 7 days, 1,000 messages, and 200 MB of the
+authorized chat resources it actually received under `~/.threadferry/history/<agent>/`. Chats and
+agents never share this history. History directories, indexes, and blobs use 0700/0600 permissions;
+runtime copies are removed after analysis and multi-bot fan-out. Resource URLs, AES keys, media IDs,
+and temporary paths are never stored. Grok Build's JSON image transport has a 700 KB encoded request
+ceiling; use Codex, Pi, or Claude for larger images.
 
 ### Bots and groups
 

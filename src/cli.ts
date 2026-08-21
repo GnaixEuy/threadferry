@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { spawn } from "node:child_process";
+import spawn from "cross-spawn";
 import { randomBytes } from "node:crypto";
 import { existsSync, type Dirent } from "node:fs";
 import { mkdir, readdir, rename, rm, writeFile } from "node:fs/promises";
@@ -24,7 +24,7 @@ import {
   resolveWorkspace,
   saveConfig,
 } from "./config.js";
-import { fetchWecomHistory } from "./history/wecom-cli.js";
+import { fetchWecomHistory, WecomHistory } from "./history/wecom-cli.js";
 import { describeIdentity, fetchWecomIdentity } from "./identity.js";
 import { runCommand } from "./process.js";
 import { runClaude } from "./runtimes/claude.js";
@@ -49,7 +49,7 @@ import type { AgentView, CommandRunner, GroupMessage, IncomingMention, RuntimeNa
 import { findUpdate, installUpdate } from "./update.js";
 import { runWorkflowTick } from "./workflow.js";
 
-const VERSION = "0.23.1";
+const VERSION = "0.25.1";
 const UPDATE_INTERVAL_MS = 6 * 60 * 60 * 1_000;
 const WORKFLOW_INTERVAL_MS = 30_000;
 const USAGE = `ThreadFerry ${VERSION}
@@ -964,9 +964,11 @@ async function start(
       const view = agentView(config, agentId);
       views.set(agentId, view);
       const runner = wecomRunner(configDir);
+      const history = new WecomHistory(agentId, runner);
       await confirmOwnerIdentity(config, agentId, updateConfig);
       const app = createApp(view, {
-      history: (groupId, options) => fetchWecomHistory(groupId, options, runner),
+      history: (chatId, options) => history.list(chatId, options),
+      rememberHistory: (chatType, chatId, message) => history.remember(chatType, chatId, message),
       runtime: runAgentRuntime,
       // 写回只动「这个 host 的 Agent」那一份：同群的另一台机器人有它自己的名单和开关。
       updateAllowUsers: (groupId, users) => updateConfig((latest) => {
@@ -1113,10 +1115,13 @@ async function start(
         }));
       };
       const connections = hosts.map(({ agentId, app, credentials }) => startWecomChannel(credentials, async (event, reply) => {
-        if (event.chatType === "group") void fanOut(agentId, event.message);
-        const status = event.chatType === "single"
-          ? await app.handleDirect(event.message, reply)
-          : await app.handle(event.message, reply);
+        const handling = event.chatType === "single"
+          ? app.handleDirect(event.message, reply)
+          : app.handle(event.message, reply);
+        const [status] = await Promise.all([
+          handling,
+          ...(event.chatType === "group" ? [fanOut(agentId, event.message)] : []),
+        ]);
         console.log(`[wecom] Agent ${agentId} 收到${event.chatType === "single" ? "单聊" : "群内 @"}消息，处理状态: ${status}`);
       }));
       hosts.forEach((host, index) => clients.set(host.agentId, connections[index]!));

@@ -1,18 +1,101 @@
 import { mkdtemp, readFile, realpath, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, relative } from "node:path";
-import { WSClient, generateReqId, type QuoteContent, type TextMessage, type WsFrame } from "@wecom/aibot-node-sdk";
+import { WSClient, generateReqId, type BaseMessage, type QuoteContent, type WsFrame } from "@wecom/aibot-node-sdk";
+import {
+  cleanupAttachmentResources,
+  createAttachmentRoot,
+  MAX_ATTACHMENT_COUNT,
+  MAX_ATTACHMENT_TOTAL_BYTES,
+  saveAttachmentResource,
+} from "../attachments.js";
 import { CommandExecutionError, runCommand } from "../process.js";
-import type { CommandRunner, DirectoryUser, IncomingMention, IncomingWecomEvent, QuoteMetadata, Reply } from "../types.js";
+import type { AttachmentResource, AttachmentSource, AttachmentType, CommandRunner, DirectoryUser, IncomingMention, IncomingWecomEvent, QuoteMetadata, Reply } from "../types.js";
 
 function quoteMetadata(quote: QuoteContent | undefined): QuoteMetadata | undefined {
   if (!quote) return undefined;
-  return { type: quote.msgtype, ...(quote.text?.content ? { text: quote.text.content } : {}) };
+  const mixed = quote.mixed?.msg_item.flatMap((item) => item.text?.content ?? []).join("\n");
+  const text = quote.text?.content ?? quote.voice?.content ?? mixed;
+  return { type: quote.msgtype, ...(text ? { text } : {}) };
 }
 
-function standardize(frame: WsFrame<TextMessage>): IncomingWecomEvent | undefined {
+interface RemoteAttachment {
+  type: AttachmentType;
+  source: AttachmentSource;
+  url: string;
+  aesKey?: string;
+}
+
+type AttachmentDownloader = (url: string, aesKey?: string) => Promise<{ buffer: Buffer; filename?: string }>;
+
+function remoteAttachment(value: unknown, type: AttachmentType, source: AttachmentSource): RemoteAttachment[] {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return [];
+  const item = value as { url?: unknown; aeskey?: unknown };
+  if (typeof item.url !== "string" || !item.url) return [];
+  return [{ type, source, url: item.url, ...(typeof item.aeskey === "string" && item.aeskey ? { aesKey: item.aeskey } : {}) }];
+}
+
+function messageAttachments(body: BaseMessage): RemoteAttachment[] {
+  if (body.msgtype === "image") return remoteAttachment(body.image, "image", "message");
+  if (body.msgtype === "file") return remoteAttachment(body.file, "file", "message");
+  if (body.msgtype === "video") return remoteAttachment(body.video, "video", "message");
+  if (body.msgtype !== "mixed") return [];
+  return (body.mixed?.msg_item ?? []).flatMap((item: { msgtype?: string; image?: unknown }) =>
+    item.msgtype === "image" ? remoteAttachment(item.image, "image", "message") : []);
+}
+
+function quotedAttachments(quote: QuoteContent | undefined): RemoteAttachment[] {
+  if (!quote) return [];
+  if (quote.msgtype === "image") return remoteAttachment(quote.image, "image", "quote");
+  if (quote.msgtype === "file") return remoteAttachment(quote.file, "file", "quote");
+  if (quote.msgtype !== "mixed") return [];
+  return (quote.mixed?.msg_item ?? []).flatMap((item) =>
+    item.msgtype === "image" ? remoteAttachment(item.image, "image", "quote") : []);
+}
+
+function messageText(body: BaseMessage): string {
+  if (body.msgtype === "text") return body.text?.content ?? "";
+  if (body.msgtype === "voice") return body.voice?.content || "[用户发送了一段语音]";
+  if (body.msgtype === "mixed") {
+    const text = (body.mixed?.msg_item ?? []).flatMap((item: { text?: { content?: string } }) => item.text?.content ?? []).join("\n");
+    return text || "[用户发送了图文消息]";
+  }
+  if (body.msgtype === "image") return "[用户发送了一张图片]";
+  if (body.msgtype === "file") return "[用户发送了一个文件]";
+  if (body.msgtype === "video") return "[用户发送了一段视频]";
+  return "";
+}
+
+export async function standardizeMessage(frame: WsFrame<BaseMessage>, download: AttachmentDownloader): Promise<IncomingWecomEvent | undefined> {
   const body = frame.body;
-  if (!body) return undefined;
+  if (!body || !["text", "image", "mixed", "voice", "file", "video"].includes(String(body.msgtype))) return undefined;
+  if (body.chattype !== "single" && (body.chattype !== "group" || !body.chatid)) return undefined;
+  const pending = [...messageAttachments(body), ...quotedAttachments(body.quote)].slice(0, MAX_ATTACHMENT_COUNT);
+  const resources: AttachmentResource[] = [];
+  let root: string | undefined;
+  let totalBytes = 0;
+  try {
+    for (const [index, item] of pending.entries()) {
+      const downloaded = await download(item.url, item.aesKey);
+      totalBytes += downloaded.buffer.length;
+      if (totalBytes > MAX_ATTACHMENT_TOTAL_BYTES) throw new Error(`企业微信附件总量超过 ${MAX_ATTACHMENT_TOTAL_BYTES / 1024 / 1024} MB 安全上限`);
+      root ??= await createAttachmentRoot();
+      resources.push(await saveAttachmentResource(root, downloaded.buffer, {
+        type: item.type,
+        source: item.source,
+        ...(downloaded.filename ? { name: downloaded.filename } : {}),
+        index: index + 1,
+      }));
+    }
+  } catch (error) {
+    await cleanupAttachmentResources(resources.length ? resources : root ? [{ root }] : []);
+    throw error;
+  }
+  const text = messageText(body);
+  const quote = quoteMetadata(body.quote);
+  const attachments = resources.map(({ type, name, source }) => ({ type, ...(name ? { name } : {}), source }));
+  if (body.msgtype === "voice") attachments.unshift({ type: "voice", source: "message" });
+  if (body.quote?.msgtype === "voice") attachments.push({ type: "voice", source: "quote" });
   if (body.chattype === "single") {
     return {
       chatType: "single",
@@ -20,19 +103,22 @@ function standardize(frame: WsFrame<TextMessage>): IncomingWecomEvent | undefine
         msgId: body.msgid,
         senderId: body.from.userid,
         time: new Date((body.create_time ?? Math.floor(Date.now() / 1000)) * 1000),
-        text: body.text.content,
+        text,
+        ...(quote ? { quote } : {}),
+        ...(attachments.length ? { attachments } : {}),
+        ...(resources.length ? { resources } : {}),
       },
     };
   }
-  if (!body.chatid) return undefined;
-  const quote = quoteMetadata(body.quote);
   const message: IncomingMention = {
     msgId: body.msgid,
-    groupId: body.chatid,
+    groupId: body.chatid!,
     senderId: body.from.userid,
     time: new Date((body.create_time ?? Math.floor(Date.now() / 1000)) * 1000),
-    text: body.text.content,
+    text,
     ...(quote ? { quote } : {}),
+    ...(attachments.length ? { attachments } : {}),
+    ...(resources.length ? { resources } : {}),
     // 企业微信群文本回调只在 @机器人时产生；普通群消息不进入该 SDK 回调。
     mentioned: true,
   };
@@ -381,18 +467,24 @@ export function startWecomChannel(
     secret: credentials.secret,
     logger: { debug() {}, info() {}, warn() {}, error() {} },
   });
-  client.on("message.text", (frame) => {
-    const event = standardize(frame);
-    if (!event) return;
+  client.on("message", (frame) => {
     const streamId = generateReqId("threadferry");
     const reply: Reply = (content, finish = true) => client.replyStream(frame, streamId, content, finish).then(() => undefined);
-    void handle(event, reply).catch(async () => {
+    void (async () => {
+      let event: IncomingWecomEvent | undefined;
       try {
-        await reply("ThreadFerry 处理失败。请在运行 ThreadFerry 的机器上执行 `threadferry doctor` 检查依赖和授权。");
+        event = await standardizeMessage(frame, (url, aesKey) => client.downloadFile(url, aesKey));
+        if (event) await handle(event, reply);
       } catch {
-        // SDK 会负责连接错误与重连；不把凭据或原始帧写入日志。
+        try {
+          await reply("ThreadFerry 已收到消息，但资源下载、解密或分析失败。请在运行 ThreadFerry 的机器上执行 `threadferry doctor` 检查依赖和授权。");
+        } catch {
+          // SDK 会负责连接错误与重连；不把凭据、资源 URL、密钥或原始帧写入日志。
+        }
+      } finally {
+        if (event) await cleanupAttachmentResources(event.message.resources ?? []);
       }
-    });
+    })();
   });
   client.on("event", (frame) => {
     const event = standardizeAuthChange(frame);
