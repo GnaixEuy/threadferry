@@ -4,9 +4,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { createApp } from "../src/app.js";
-import { listWecomGroups, runWecomAction, searchWecomUsers, sendWecomReply, standardizeAuthChange, wecomFailureReason } from "../src/channels/wecom.js";
+import { cleanupAttachmentResources, createAttachmentRoot } from "../src/attachments.js";
+import { listWecomGroups, runWecomAction, searchWecomUsers, sendWecomReply, standardizeAuthChange, standardizeMessage, wecomFailureReason } from "../src/channels/wecom.js";
 import { addAgent, agentView, loadConfig, onboardingDefaults, pairConfig, refreshAgentView, resolveWorkspace, saveConfig, setupConfig } from "../src/config.js";
-import { fetchWecomHistory } from "../src/history/wecom-cli.js";
+import { fetchWecomHistory, WecomHistory } from "../src/history/wecom-cli.js";
+import { LocalWecomHistory } from "../src/history/local.js";
 import { CommandExecutionError, runCommand } from "../src/process.js";
 import { runClaude } from "../src/runtimes/claude.js";
 import { runCodex } from "../src/runtimes/codex.js";
@@ -14,7 +16,7 @@ import { runGrok } from "../src/runtimes/grok.js";
 import { allowedReadPath } from "../src/runtimes/pi-readonly-extension.js";
 import { runPi } from "../src/runtimes/pi.js";
 import { ThreadFerryState } from "../src/state.js";
-import type { AgentView, CommandRunner, GroupMessage, IncomingMention, ThreadFerryConfig } from "../src/types.js";
+import type { AgentView, AttachmentResource, CommandRunner, GroupMessage, IncomingMention, ThreadFerryConfig } from "../src/types.js";
 
 function testConfig(workspace = "/workspace", ownerUser = "user", groupId = "group"): AgentView {
   return {
@@ -106,6 +108,82 @@ test("mock WeCom -> history -> context -> Codex -> reply vertical slice", async 
   assert.equal(await app.handle({ ...message, msgId: "no-mention", mentioned: false }, reply), "missing_mention");
   assert.equal(runtimeCalls, 2);
   assert.equal(replies.length, 4);
+});
+
+test("group analysis passes current and history resources and cleans history files", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "threadferry-group-resources-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const currentRoot = join(root, "current");
+  const [actualCurrentRoot, actualHistoryRoot] = await Promise.all([mkdtemp(`${currentRoot}-`), createAttachmentRoot()]);
+  const currentPath = join(actualCurrentRoot, "current.png");
+  const historyPath = join(actualHistoryRoot, "history.md");
+  await writeFile(currentPath, Buffer.from([0x89, 0x50, 0x4e, 0x47]), { mode: 0o600 });
+  await writeFile(historyPath, "history resource", { mode: 0o600 });
+  const currentResource: AttachmentResource = {
+    type: "image", name: "current.png", source: "message", path: currentPath, root: actualCurrentRoot, size: 4, contentType: "image/png",
+  };
+  const historyResource: AttachmentResource = {
+    type: "file", name: "history.md", source: "history", path: historyPath, root: actualHistoryRoot, size: 16, contentType: "text/markdown",
+  };
+  const historyTime = new Date(Date.now() - 1_000);
+  const historyOptions: boolean[] = [];
+  let runtimeResources: AttachmentResource[] = [];
+  const app = createApp(testConfig(), {
+    history: async (_groupId, options) => {
+      historyOptions.push(options.includeResources);
+      return options.includeResources
+        ? [{ senderId: "other", time: historyTime, text: "历史文件", attachments: [{ type: "file", name: "history.md", source: "history" }], resources: [historyResource] }]
+        : [{ senderId: "other", time: historyTime, text: "历史文件", attachments: [{ type: "file", name: "history.md", source: "history" }] }];
+    },
+    runtime: async (request) => {
+      runtimeResources = request.resources ?? [];
+      return { text: "分析完成" };
+    },
+  });
+  const result = await app.handle({
+    msgId: "group-resources", groupId: "group", senderId: "user", time: new Date(), text: "@ThreadFerry 看附件", mentioned: true,
+    attachments: [{ type: "image", name: "current.png", source: "message" }], resources: [currentResource],
+  }, async () => undefined);
+  assert.equal(result, "handled");
+  assert.deepEqual(historyOptions, [true, false]);
+  assert.deepEqual(runtimeResources.map((resource) => resource.name), ["history.md", "current.png"]);
+  await assert.rejects(stat(historyPath), /ENOENT/);
+  assert.equal((await stat(currentPath)).isFile(), true);
+});
+
+test("owner direct chat receives historical messages and resources", async () => {
+  const historyRoot = await createAttachmentRoot();
+  const historyPath = join(historyRoot, "earlier.md");
+  await writeFile(historyPath, "earlier direct attachment", { mode: 0o600 });
+  const historyResource: AttachmentResource = {
+    type: "file", name: "earlier.md", source: "history", path: historyPath, root: historyRoot,
+    size: 25, contentType: "text/markdown",
+  };
+  let prompt = "";
+  let resources: AttachmentResource[] = [];
+  const app = createApp(testConfig("/workspace", "owner"), {
+    history: async (chatId, options) => {
+      assert.equal(chatId, "owner");
+      assert.equal(options.chatType, "single");
+      assert.equal(options.includeResources, true);
+      return [{
+        senderId: "owner", time: new Date(Date.now() - 60_000), text: "前一条私聊文件",
+        attachments: [{ type: "file", name: "earlier.md", source: "history" }], resources: [historyResource],
+      }];
+    },
+    runtime: async (request) => {
+      prompt = request.prompt;
+      resources = request.resources ?? [];
+      return { text: "已结合历史文件回答" };
+    },
+  });
+
+  assert.equal(await app.handleDirect({
+    msgId: "direct-history", senderId: "owner", time: new Date(), text: "继续分析刚才的文件",
+  }, async () => undefined), "handled");
+  assert.match(prompt, /UNTRUSTED_DIRECT_HISTORY[\s\S]*前一条私聊文件/);
+  assert.deepEqual(resources.map((resource) => resource.name), ["earlier.md"]);
+  await assert.rejects(stat(historyPath), /ENOENT/);
 });
 
 test("robot owner manages per-group users in direct chat", async () => {
@@ -1306,15 +1384,99 @@ test("wecom history uses chat.messages.list arguments and keeps attachment metad
   }, runner);
   assert.equal(messages[0]?.senderName, "张三");
   assert.equal(messages[0]?.text, "接口异常");
-  assert.deepEqual(messages[1]?.attachments, [{ type: "file", name: "trace.log" }]);
+  assert.deepEqual(messages[1]?.attachments, [{ type: "file", name: "trace.log", source: "history" }]);
   assert.doesNotMatch(JSON.stringify(messages), /metadata-only/);
+});
+
+test("wecom history downloads media content only for the analysis pass", async () => {
+  let mediaCalls = 0;
+  const runner: CommandRunner = async (_command, args) => {
+    if (args.slice(0, 3).join(".") === "chat.messages.list") {
+      return {
+        stdout: JSON.stringify({
+          errcode: 0,
+          data: {
+            messages: [{
+              msg_type: "file", send_time: "2026-08-18 10:01:00", userid: "user-2", user_name: "李四",
+              file: { file_name: "trace.log", media_id: "history-media" },
+            }],
+            has_more: false,
+          },
+        }),
+        stderr: "",
+      };
+    }
+    assert.deepEqual(args.slice(0, 3), ["message", "files", "get"]);
+    assert.equal(args[args.indexOf("--media-id") + 1], "history-media");
+    const outputDirectory = args[args.indexOf("--output-dir") + 1]!;
+    const downloaded = join(outputDirectory, "msg_media");
+    await writeFile(downloaded, "downloaded log content", { mode: 0o600 });
+    mediaCalls += 1;
+    return {
+      stdout: JSON.stringify({ file_path: downloaded, size: 22, content_type: "text/plain" }),
+      stderr: "",
+    };
+  };
+
+  const messages = await fetchWecomHistory("group_allowed", {
+    lookbackHours: 6,
+    maxMessages: 80,
+    endTime: new Date("2026-08-18T10:05:00+08:00"),
+    includeResources: true,
+  }, runner);
+  assert.equal(mediaCalls, 1);
+  assert.equal(messages[0]?.resources?.[0]?.name, "trace.log");
+  assert.equal(await readFile(messages[0]!.resources![0]!.path, "utf8"), "downloaded log content");
+  await cleanupAttachmentResources(messages.flatMap((message) => message.resources ?? []));
+
+  await fetchWecomHistory("group_allowed", {
+    lookbackHours: 6,
+    maxMessages: 80,
+    endTime: new Date("2026-08-18T10:05:00+08:00"),
+  }, runner);
+  assert.equal(mediaCalls, 1);
+});
+
+test("wecom history accepts small UTF-8 files returned inline", async () => {
+  const runner: CommandRunner = async (_command, args) => {
+    if (args.slice(0, 3).join(".") === "chat.messages.list") {
+      return {
+        stdout: JSON.stringify({
+          errcode: 0,
+          data: {
+            messages: [{
+              msg_type: "file", send_time: "2026-08-18 10:01:00", userid: "user-2",
+              file: { file_name: "inline.md", media_id: "inline-media" },
+            }],
+            has_more: false,
+          },
+        }),
+        stderr: "",
+      };
+    }
+    return {
+      stdout: JSON.stringify({
+        errcode: 0,
+        data: { media_item: { content: "inline history content", file_name: "inline.md", media_type: "file" } },
+      }),
+      stderr: "",
+    };
+  };
+
+  const messages = await fetchWecomHistory("direct-user", {
+    lookbackHours: 6,
+    maxMessages: 80,
+    endTime: new Date("2026-08-18T10:05:00+08:00"),
+    includeResources: true,
+  }, runner);
+  assert.equal(await readFile(messages[0]!.resources![0]!.path, "utf8"), "inline history content");
+  await cleanupAttachmentResources(messages.flatMap((message) => message.resources ?? []));
 });
 
 test("wecom history reports unavailable corporation permission", async () => {
   const runner: CommandRunner = async () => {
     throw new CommandExecutionError("wecom-cli", 1, JSON.stringify({
-      errcode: 853006,
-      errmsg: "this tool is not available for your corporation",
+      error: { code: 853006, message: "this tool is not available for your corporation" },
     }), "");
   };
 
@@ -1420,6 +1582,107 @@ test("document permission changes resume only the authenticated user's direct se
   }), undefined);
 });
 
+test("realtime image, file and quoted resources are downloaded and standardized", async () => {
+  const downloaded: string[] = [];
+  const event = await standardizeMessage({
+    headers: { req_id: "resource-1" },
+    body: {
+      msgid: "resource-message",
+      aibotid: "bot",
+      chattype: "single",
+      from: { userid: "owner" },
+      create_time: 1_787_210_000,
+      msgtype: "image",
+      image: { url: "https://resource.example/current", aeskey: "current-key" },
+      quote: {
+        msgtype: "file",
+        file: { url: "https://resource.example/quoted", aeskey: "quote-key" },
+      },
+    },
+  }, async (url, aesKey) => {
+    downloaded.push(`${url}:${aesKey}`);
+    return url.endsWith("current")
+      ? { buffer: Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1]), filename: "screen.png" }
+      : { buffer: Buffer.from("# quoted attachment\n"), filename: "notes.md" };
+  });
+
+  assert.equal(event?.chatType, "single");
+  assert.equal(event?.message.text, "[用户发送了一张图片]");
+  assert.deepEqual(event?.message.attachments, [
+    { type: "image", name: "screen.png", source: "message" },
+    { type: "file", name: "notes.md", source: "quote" },
+  ]);
+  assert.deepEqual(downloaded, [
+    "https://resource.example/current:current-key",
+    "https://resource.example/quoted:quote-key",
+  ]);
+  assert.equal(event?.message.resources?.length, 2);
+  for (const resource of event?.message.resources ?? []) {
+    assert.equal((await stat(resource.path)).isFile(), true);
+    assert.equal((await stat(resource.path)).mode & 0o777, 0o600);
+    assert.doesNotMatch(resource.path, /screen\.png\.\.|notes\.md\.\./);
+  }
+  const resources = event?.message.resources ?? [];
+  await cleanupAttachmentResources(resources);
+  for (const resource of resources) await assert.rejects(stat(resource.path), /ENOENT/);
+});
+
+test("attachment paths never enter durable group state", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "threadferry-resource-state-test-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const path = join(root, "private-resource.png");
+  await writeFile(path, Buffer.from([0x89, 0x50, 0x4e, 0x47]));
+  const statePath = join(root, "state.json");
+  const state = new ThreadFerryState(statePath);
+  const resource: AttachmentResource = {
+    type: "image", name: "private-resource.png", source: "message", path, root, size: 4, contentType: "image/png",
+  };
+  await state.enqueue({
+    msgId: "resource-state", groupId: "group", senderId: "owner", time: new Date(), text: "看图", mentioned: true,
+    attachments: [{ type: "image", name: "private-resource.png", source: "message" }],
+    resources: [resource],
+  });
+  const stored = await readFile(statePath, "utf8");
+  assert.doesNotMatch(stored, /threadferry-resource-state-test/);
+  assert.match(stored, /private-resource\.png/);
+});
+
+test("local WeCom history survives restart and isolates direct resources from groups", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "threadferry-local-history-test-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const sourceRoot = await createAttachmentRoot();
+  const sourcePath = join(sourceRoot, "screen.png");
+  await writeFile(sourcePath, Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), { mode: 0o600 });
+  const resource: AttachmentResource = {
+    type: "image", name: "screen.png", source: "message", path: sourcePath, root: sourceRoot,
+    size: 8, contentType: "image/png",
+  };
+  const now = new Date();
+  await new LocalWecomHistory(root).remember("single", "same-chat-id", {
+    msgId: "stored-direct-image", senderId: "owner", time: now, text: "看这张历史图片",
+    attachments: [{ type: "image", name: "screen.png", source: "message" }], resources: [resource],
+  });
+  await cleanupAttachmentResources([resource]);
+
+  const restarted = new WecomHistory("history-test-agent", async () => ({
+    stdout: JSON.stringify({ errcode: 0, data: { messages: [], has_more: false } }), stderr: "",
+  }), root);
+  const options = { lookbackHours: 168, maxMessages: 80, endTime: new Date(now.getTime() + 1_000), includeResources: true };
+  assert.deepEqual(await restarted.list("same-chat-id", { ...options, chatType: "group" }), []);
+  const [message] = await restarted.list("same-chat-id", { ...options, chatType: "single" });
+  assert.equal(message?.text, "看这张历史图片");
+  assert.equal(message?.resources?.[0]?.source, "history");
+  assert.equal((await readFile(message!.resources![0]!.path)).subarray(0, 4).toString("hex"), "89504e47");
+  const stored = await readFile(join(root, "index.json"), "utf8");
+  assert.doesNotMatch(stored, /threadferry-attachment-|sourcePath|aeskey|media_id/);
+  const blob = JSON.parse(stored).messages[0].resources[0].blob as string;
+  assert.equal((await stat(root)).mode & 0o777, 0o700);
+  assert.equal((await stat(join(root, "index.json"))).mode & 0o777, 0o600);
+  assert.equal((await stat(join(root, "blobs"))).mode & 0o777, 0o700);
+  assert.equal((await stat(join(root, "blobs", blob))).mode & 0o777, 0o600);
+  await cleanupAttachmentResources(message?.resources ?? []);
+});
+
 test("Codex starts a fresh session only when a saved session is definitely missing", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "threadferry-codex-resume-test-"));
   t.after(() => rm(root, { recursive: true, force: true }));
@@ -1499,9 +1762,15 @@ test("Grok Build runs in the strict read-only sandbox and creates a resumable se
   const root = await mkdtemp(join(tmpdir(), "threadferry-grok-test-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   const workspace = await realpath(root);
-  let received: { command: string; args: string[]; cwd?: string; input?: string; secret?: string } | undefined;
+  let received: { command: string; args: string[]; cwd?: string; prompt?: string; promptPath?: string; secret?: string } | undefined;
   const runner: CommandRunner = async (command, args, options) => {
-    received = { command, args, cwd: options?.cwd, input: options?.input, secret: options?.env?.THREADFERRY_WECOM_BOT_SECRET };
+    const promptPath = args[args.indexOf("--prompt-file") + 1];
+    received = {
+      command, args, cwd: options?.cwd,
+      prompt: promptPath ? await readFile(promptPath, "utf8") : undefined,
+      promptPath,
+      secret: options?.env?.THREADFERRY_WECOM_BOT_SECRET,
+    };
     const sessionId = args[args.indexOf("--session-id") + 1];
     return { stdout: JSON.stringify({ text: "Grok 只读分析", sessionId, stopReason: "end_turn" }), stderr: "" };
   };
@@ -1510,13 +1779,81 @@ test("Grok Build runs in the strict read-only sandbox and creates a resumable se
   assert.match(result.sessionId ?? "", /^[0-9a-f-]{36}$/);
   assert.equal(received?.command, "grok");
   assert.equal(received?.cwd, workspace);
-  assert.equal(received?.input, "分析");
+  assert.equal(received?.prompt, "分析");
+  await assert.rejects(stat(received?.promptPath ?? ""), /ENOENT/);
   assert.equal(received?.secret, undefined);
   assert.equal(received?.args[received.args.indexOf("--sandbox") + 1], "strict");
   assert.equal(received?.args[received.args.indexOf("--permission-mode") + 1], "dontAsk");
   assert.equal(received?.args[received.args.indexOf("--tools") + 1], "Read,Grep");
   assert.ok(received?.args.includes("--disable-web-search"));
   assert.equal(received?.args[received.args.indexOf("--model") + 1], "grok-4.6");
+});
+
+test("all runtimes receive images and safe text attachment content", async (t) => {
+  const workspaceRoot = await mkdtemp(join(tmpdir(), "threadferry-runtime-workspace-"));
+  const attachmentRoot = await mkdtemp(join(tmpdir(), "threadferry-runtime-attachments-"));
+  t.after(() => Promise.all([
+    rm(workspaceRoot, { recursive: true, force: true }),
+    rm(attachmentRoot, { recursive: true, force: true }),
+  ]));
+  const workspace = await realpath(workspaceRoot);
+  const imagePath = join(attachmentRoot, "screen.png");
+  const textPath = join(attachmentRoot, "summary.md");
+  await writeFile(imagePath, Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1]), { mode: 0o600 });
+  await writeFile(textPath, "# 业务内容\n正在下载 model.bin", { mode: 0o600 });
+  const resources: AttachmentResource[] = [
+    { type: "image", name: "screen.png", source: "message", path: imagePath, root: attachmentRoot, size: 9, contentType: "image/png" },
+    { type: "file", name: "summary.md", source: "quote", path: textPath, root: attachmentRoot, size: 31, contentType: "text/markdown" },
+  ];
+
+  let codexArgs: string[] = [];
+  let codexInput = "";
+  await runCodex({ workspace, prompt: "分析附件", sessionId: "codex-session", resources }, async (_command, args, options) => {
+    codexArgs = args;
+    codexInput = options?.input ?? "";
+    return {
+      stdout: `${JSON.stringify({ type: "thread.started", thread_id: "codex-session" })}\n${JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: "ok" } })}\n`,
+      stderr: "",
+    };
+  });
+  assert.equal(codexArgs[codexArgs.indexOf("--image") + 1], imagePath);
+  assert.match(codexInput, /正在下载 model\.bin/);
+
+  let piArgs: string[] = [];
+  let piInput = "";
+  await runPi({ agentId: "reviewer", workspace, prompt: "分析附件", resources }, async (_command, args, options) => {
+    piArgs = args;
+    piInput = options?.input ?? "";
+    return {
+      stdout: `${JSON.stringify({ type: "session", id: "pi-session" })}\n${JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "ok" }] } })}\n`,
+      stderr: "",
+    };
+  }, join(workspaceRoot, "sessions"));
+  assert.ok(piArgs.includes(`@${imagePath}`));
+  assert.match(piInput, /正在下载 model\.bin/);
+
+  let claudeArgs: string[] = [];
+  let claudeInput = "";
+  await runClaude({ workspace, prompt: "分析附件", resources }, async (_command, args, options) => {
+    claudeArgs = args;
+    claudeInput = options?.input ?? "";
+    return { stdout: JSON.stringify({ result: "ok", session_id: "claude-session" }), stderr: "" };
+  });
+  assert.equal(claudeArgs[claudeArgs.indexOf("--add-dir") + 1], attachmentRoot);
+  assert.match(claudeInput, /正在下载 model\.bin/);
+  assert.match(claudeInput, /screen\.png/);
+
+  let grokArgs: string[] = [];
+  await runGrok({ workspace, prompt: "分析附件", resources }, async (_command, args) => {
+    grokArgs = args;
+    return { stdout: JSON.stringify({ text: "ok", sessionId: "grok-session" }), stderr: "" };
+  });
+  const promptJson = JSON.parse(grokArgs[grokArgs.indexOf("--prompt-json") + 1]!) as Array<Record<string, unknown>>;
+  assert.equal(promptJson[0]?.type, "text");
+  assert.match(String(promptJson[0]?.text), /正在下载 model\.bin/);
+  assert.equal(promptJson[1]?.type, "image");
+  assert.equal(promptJson[1]?.mimeType, "image/png");
+  assert.equal(promptJson[1]?.data, Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1]).toString("base64"));
 });
 
 test("Pi read guard rejects workspace escapes, symlinks, and sensitive files", async (t) => {
@@ -1707,6 +2044,13 @@ test("failure replies carry the reason, with local paths masked in group chats",
   }, group.push);
   assert.match(group.replies.at(-1) ?? "", /原因：Workspace 不存在: <本机路径>/);
   assert.doesNotMatch(group.replies.at(-1) ?? "", /SecretProject/);
+
+  const windowsPath = build(new Error("Workspace 不存在: C:\\Users\\somebody\\Desktop\\SecretProject\\sub"));
+  await windowsPath.app.handle({
+    msgId: "g2", groupId: "group", senderId: "owner", time: new Date(), text: "@bot 分析", mentioned: true,
+  }, windowsPath.push);
+  assert.match(windowsPath.replies.at(-1) ?? "", /原因：Workspace 不存在: <本机路径>/);
+  assert.doesNotMatch(windowsPath.replies.at(-1) ?? "", /SecretProject/);
 
   // 额度耗尽这类外部限制，群里也应该看到完整原话（不含路径，无需遮掩）。
   const limited = build(quota);

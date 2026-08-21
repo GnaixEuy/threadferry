@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import spawn from "cross-spawn";
 import type { CommandRunner } from "./types.js";
 
 const MAX_OUTPUT_BYTES = 4 * 1024 * 1024;
@@ -58,8 +58,8 @@ export const runCommand: CommandRunner = (command, args, options = {}) =>
       target.push(chunk);
     };
 
-    child.stdout.on("data", collect(stdout));
-    child.stderr.on("data", collect(stderr));
+    child.stdout!.on("data", collect(stdout));
+    child.stderr!.on("data", collect(stderr));
     child.on("error", (error) => {
       clearTimeout(timeout);
       if (forceKill) clearTimeout(forceKill);
@@ -98,6 +98,6 @@ export const runCommand: CommandRunner = (command, args, options = {}) =>
       }
     });
 
-    child.stdin.on("error", () => undefined);
-    child.stdin.end(options.input);
+    child.stdin!.on("error", () => undefined);
+    child.stdin!.end(options.input);
   });

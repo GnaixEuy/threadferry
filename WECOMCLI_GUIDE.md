@@ -159,7 +159,9 @@ wecom-cli chat messages list \
   --json '{"chat_id":"<CHAT_ID>","begin_time":"2026-08-20 09:00:00","end_time":"2026-08-20 18:00:00"}'
 ```
 
-消息查询仅支持最近 7 天。`chat_id` 必须来自会话查询、回调或可信上下文，不得自行构造。
+消息查询仅支持最近 7 天，`chat_id` 可以是群 ID，也可以是单聊对方的 userid。`chat_id` 必须来自
+会话查询、回调或可信上下文，不得自行构造。当前目标企业实测群聊能返回消息和 `media_id`，但机器人
+Owner 私聊可能成功返回空列表；ThreadFerry 因此仍调用远端接口，同时合并所属 Agent 的本机历史。
 
 ### 读取在线表格范围
 
@@ -227,7 +229,19 @@ wecom-cli message send --dry-run \
 
 ## 8. 文件、分页和错误处理
 
-- 下载附件时优先指定 `--output-dir`。完成后主动告诉用户完整路径，并询问是否清理临时文件。
+- 人工执行下载时优先指定 `--output-dir`，完成后说明保存位置和清理方式。ThreadFerry 自动分析资源时
+  不向用户或 Runtime 暴露临时目录，由所属 Agent 在单轮处理结束后自动清理。
+- 实时回调中的图片、文件及引用资源使用 SDK `downloadFile(url, aeskey)` 下载和解密；私聊与群历史
+  先用 `chat messages list` 读取 `media_id`，再用 `message files get --media-id ... --output-dir ...`
+  取回内容。目标环境实测下载成功时直接返回顶层 `file_path`；当前 Schema 还声明了
+  `media_item.file_path`，小型 UTF-8 文件可能返回 `media_item.content`，三种结构都必须处理。失败时
+  还可能返回顶层 `error.code` / `error.message`。禁止把 URL、AES Key 或 `media_id` 写入状态、日志和提示词。
+- 自动分析最多取 10 个资源，单个 20 MB、单轮合计 50 MB；临时目录 0700、文件 0600。完成、失败、
+  过期结果和同消息多机器人分发都必须进入同一清理路径。
+- 为补足远端私聊空历史，ThreadFerry 只在授权消息进入 Runtime 前，把该 Agent 实际收到的消息与资源
+  保存到 `~/.threadferry/history/<Agent>/`：保留 7 天、最多 1,000 条和 200 MB，资源按 SHA-256
+  去重校验，私聊和群聊分区，Agent 之间不共享。索引不得保存 URL、AES Key、`media_id` 或临时路径；
+  Runtime 仍只读取单轮临时副本。
 - 不把历史附件重新发送给其他会话，除非用户明确要求并确认发送对象。
 - 分页响应中的 `has_more`、`next_cursor` 是继续读取的依据；自动分页输出是 NDJSON，不能当成
   单个 JSON 对象解析。

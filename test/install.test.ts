@@ -48,6 +48,17 @@ test("installer supports curl-pipe execution", () => {
   assert.match(result.stdout, /threadferry onboard/);
 });
 
+test("Windows installer uses native PowerShell without WSL", () => {
+  const script = readFileSync(fileURLToPath(new URL("../../install.ps1", import.meta.url)), "utf8");
+  assert.match(script, /param\([\s\S]*\[switch\] \$NoOnboard[\s\S]*\[switch\] \$DryRun/);
+  assert.match(script, /releases\/latest\/download\/threadferry\.tgz/);
+  assert.match(script, /@wecom\/cli/);
+  assert.match(script, /"--global", "--ignore-scripts", \$ReleasePackageUrl/);
+  assert.match(script, /"\$Name\.cmd"/);
+  assert.match(script, /ThreadFerry will ask whether to reuse its saved credentials/);
+  assert.doesNotMatch(script, /\/bin\/bash|wsl\.exe|install\.sh\s*\|/i);
+});
+
 test("installer installs the official wecom CLI when it is missing", () => {
   const temporary = mkdtempSync(join(tmpdir(), "threadferry-wecom-dependency-"));
   try {
@@ -132,6 +143,7 @@ test("release package contains the compiled CLI without a consumer build hook", 
   assert.equal(packed.status, 0, packed.stderr);
   const [{ files }] = JSON.parse(packed.stdout) as [{ files: Array<{ path: string }> }];
   assert.ok(files.some(({ path }) => path === "dist/src/cli.js"));
+  assert.ok(files.some(({ path }) => path === "install.ps1"));
   assert.ok(files.every(({ path }) => !path.startsWith("src/")));
 });
 
@@ -156,6 +168,7 @@ test("main pushes trigger build verification", () => {
   assert.match(workflow, /npm ci --ignore-scripts/);
   assert.match(workflow, /npm run typecheck/);
   assert.match(workflow, /npm test/);
+  assert.match(workflow, /runs-on: windows-latest[\s\S]*\.\\install\.ps1 -DryRun -NoOnboard/);
   assert.doesNotMatch(workflow, /gh release create/);
 });
 

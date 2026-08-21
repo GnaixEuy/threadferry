@@ -1,6 +1,21 @@
+export type AttachmentType = "image" | "file" | "voice" | "video";
+export type AttachmentSource = "message" | "quote" | "history";
+
 export interface AttachmentMetadata {
-  type: "image" | "file" | "voice" | "video";
+  type: AttachmentType;
   name?: string;
+  source?: AttachmentSource;
+}
+
+/**
+ * 已下载、仅在当前处理轮次存活的企业微信资源。路径和临时目录绝不写入状态文件或提示词。
+ */
+export interface AttachmentResource extends AttachmentMetadata {
+  source: AttachmentSource;
+  path: string;
+  root: string;
+  size: number;
+  contentType: string;
 }
 
 export interface QuoteMetadata {
@@ -15,6 +30,17 @@ export interface GroupMessage {
   text: string;
   quote?: QuoteMetadata;
   attachments?: AttachmentMetadata[];
+  resources?: AttachmentResource[];
+}
+
+export type HistoryChatType = "single" | "group";
+
+export interface HistoryQuery {
+  chatType: HistoryChatType;
+  lookbackHours: number;
+  maxMessages: number;
+  endTime: Date;
+  includeResources: boolean;
 }
 
 export interface IncomingMention extends GroupMessage {
@@ -23,11 +49,8 @@ export interface IncomingMention extends GroupMessage {
   mentioned: boolean;
 }
 
-export interface IncomingDirectMessage {
+export interface IncomingDirectMessage extends GroupMessage {
   msgId: string;
-  senderId: string;
-  time: Date;
-  text: string;
 }
 
 export type IncomingWecomEvent =
@@ -135,6 +158,7 @@ export interface RuntimeResult {
 export interface RuntimeRequest extends Omit<AgentDefinition, "configDir"> {
   agentId: string;
   prompt: string;
+  resources?: AttachmentResource[];
   sessionId?: string;
   signal?: AbortSignal;
 }

@@ -3,6 +3,7 @@ import { lstat, mkdir } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { prepareRuntimeResources } from "../attachments.js";
 import { resolveWorkspace } from "../config.js";
 import { runCommand } from "../process.js";
 import { runtimeFailure, structuredRuntimeError } from "./runtime-error.js";
@@ -11,6 +12,8 @@ import type { CommandRunner, RuntimeRequest, RuntimeResult } from "../types.js";
 function safeEnvironment(): NodeJS.ProcessEnv {
   const allowed = [
     "PATH", "HOME", "TMPDIR", "LANG", "LC_ALL", "PI_CODING_AGENT_DIR",
+    "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "APPDATA", "LOCALAPPDATA", "TEMP", "TMP",
+    "SystemRoot", "WINDIR", "ComSpec", "PATHEXT",
     "SSL_CERT_FILE", "NODE_EXTRA_CA_CERTS", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
     "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GOOGLE_API_KEY", "GEMINI_API_KEY",
   ];
@@ -33,6 +36,7 @@ export async function runPi(
   sessionRootInput = join(homedir(), ".threadferry", "pi-sessions"),
 ): Promise<RuntimeResult> {
   const workspace = await resolveWorkspace(request.workspace);
+  const prepared = await prepareRuntimeResources(request.prompt, request.resources);
   const sessionRoot = resolve(sessionRootInput);
   await mkdir(sessionRoot, { recursive: true, mode: 0o700 });
   if ((await lstat(sessionRoot)).isSymbolicLink()) throw new Error("Pi Session 目录不能是符号链接");
@@ -48,6 +52,7 @@ export async function runPi(
     "--session-dir", sessionDir,
     ...(request.model ? ["--model", request.model] : []),
     ...(request.sessionId ? ["--session-id", request.sessionId] : []),
+    ...prepared.images.map((resource) => `@${resource.path}`),
   ];
   // Pi 原先完全没处理非零退出：runner 抛出的 CommandExecutionError 直接冒泡，
   // 结果只剩「pi 执行失败（退出码 N）」，stdout 里的真实原因被丢掉。
@@ -56,7 +61,7 @@ export async function runPi(
     ({ stdout } = await runner("pi", args, {
       cwd: workspace,
       env: safeEnvironment(),
-      input: request.prompt,
+      input: prepared.prompt,
       timeoutMs: 10 * 60_000,
       signal: request.signal,
     }));

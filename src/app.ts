@@ -1,11 +1,12 @@
 import { createHash, randomBytes } from "node:crypto";
+import { cleanupAttachmentResources, MAX_ATTACHMENT_COUNT, MAX_ATTACHMENT_TOTAL_BYTES } from "./attachments.js";
 import { decideAction } from "./action-policy.js";
 import { authorize } from "./authorization.js";
 import { buildContext } from "./context-builder.js";
 import { resolveDirectoryUser } from "./directory.js";
 import { newErrorId, sessionScope, ThreadFerryState, type FailurePhase } from "./state.js";
 import { actionMode, actionPrivate, extractAction, isExplicitActionRequest, prepareAction, type PreparedAction } from "./actions.js";
-import type { AgentView, DirectoryUser, GroupMessage, IncomingDirectMessage, IncomingMention, Reply, RuntimeRequest, RuntimeResult } from "./types.js";
+import type { AgentView, AttachmentResource, DirectoryUser, GroupMessage, HistoryChatType, HistoryQuery, IncomingDirectMessage, IncomingMention, Reply, RuntimeRequest, RuntimeResult } from "./types.js";
 
 export type HandleResult = "handled" | "stale" | "failed" | "command" | "delivery_pending" | "duplicate" | "unauthorized_group" | "missing_mention" | "unauthorized_user";
 
@@ -19,7 +20,8 @@ interface PendingAction {
 }
 
 export interface AppDependencies {
-  history: (groupId: string, options: { lookbackHours: number; maxMessages: number; endTime: Date }) => Promise<GroupMessage[]>;
+  history: (chatId: string, options: HistoryQuery) => Promise<GroupMessage[]>;
+  rememberHistory?: (chatType: HistoryChatType, chatId: string, message: IncomingDirectMessage | IncomingMention) => Promise<void>;
   runtime: (request: RuntimeRequest) => Promise<RuntimeResult>;
   updateAllowUsers?: (groupId: string, users: string[]) => Promise<void>;
   updateGroupAccess?: (groupId: string, allowAll: boolean) => Promise<void>;
@@ -36,6 +38,8 @@ export interface AppDependencies {
   notifyGroup?: (groupId: string, content: string) => Promise<void>;
   onError?: (error: { errorId: string; phase: FailurePhase; reason?: string }) => void;
 }
+
+const DIRECT_CONTEXT = { lookbackHours: 7 * 24, maxMessages: 80 };
 
 type ManagementCommand = "help" | "whoami" | "groups" | "agents" | "users" | "invite" | "join" | "add" | "remove" | "bind" | "open" | "close" | "confirm";
 const USER_ID = /^[A-Za-z0-9_@.-]{1,512}$/;
@@ -55,7 +59,7 @@ function managementCommand(text: string): { name: ManagementCommand; arguments: 
 // 唯一需要小心的是**群聊**：群里有非 Owner 的同事。原因文本来自 Runtime CLI 的固定文案
 // 或 wecom-cli 的错误说明，不含群消息内容；但配置类错误可能带 Workspace 绝对路径，
 // 所以群聊回复里把看起来像本机路径的片段替换掉。
-const HOME_LIKE_PATH = /(?:\/(?:Users|home)\/[^\s"']+|\/(?:private\/)?(?:var|tmp)\/[^\s"']+)/g;
+const HOME_LIKE_PATH = /(?:\/(?:Users|home)\/[^\s"']+|\/(?:private\/)?(?:var|tmp)\/[^\s"']+|(?:[A-Za-z]:\\|\\\\)[^\s"']+)/g;
 
 function publicReason(reason: string): string {
   return reason.replace(HOME_LIKE_PATH, "<本机路径>");
@@ -88,11 +92,8 @@ function limitUtf8(input: string, maxBytes = 12_000): string {
 }
 
 function historyFingerprint(history: GroupMessage[], current: IncomingMention): string {
-  const currentSecond = Math.floor(current.time.getTime() / 1000);
   const normalized = history
-    .filter((message) => !(message.senderId === current.senderId
-      && Math.floor(message.time.getTime() / 1000) === currentSecond
-      && message.text === current.text))
+    .filter((message) => !sameMessage(message, current))
     .map((message) => [
       message.time.toISOString(),
       message.senderId,
@@ -104,6 +105,31 @@ function historyFingerprint(history: GroupMessage[], current: IncomingMention): 
     ])
     .sort((left, right) => JSON.stringify(left).localeCompare(JSON.stringify(right)));
   return createHash("sha256").update(JSON.stringify(normalized)).digest("hex");
+}
+
+function sameMessage(left: GroupMessage, right: GroupMessage): boolean {
+  return left.senderId === right.senderId
+    && Math.floor(left.time.getTime() / 1_000) === Math.floor(right.time.getTime() / 1_000)
+    && left.text === right.text;
+}
+
+function analysisResources(history: GroupMessage[], current: GroupMessage): AttachmentResource[] {
+  const selected: AttachmentResource[] = [];
+  let totalBytes = 0;
+  for (const resource of (current.resources ?? []).slice(0, MAX_ATTACHMENT_COUNT)) {
+    if (totalBytes + resource.size > MAX_ATTACHMENT_TOTAL_BYTES) break;
+    selected.push(resource);
+    totalBytes += resource.size;
+  }
+  const historical = history.filter((message) => !sameMessage(message, current)).flatMap((message) => message.resources ?? []);
+  const prior: AttachmentResource[] = [];
+  for (let index = historical.length - 1; index >= 0 && prior.length + selected.length < MAX_ATTACHMENT_COUNT; index -= 1) {
+    const resource = historical[index]!;
+    if (totalBytes + resource.size > MAX_ATTACHMENT_TOTAL_BYTES) continue;
+    prior.push(resource);
+    totalBytes += resource.size;
+  }
+  return [...prior.reverse(), ...selected];
 }
 
 const MAX_ACTION_ROUNDS = 8;
@@ -373,7 +399,12 @@ export function createApp(config: AgentView, dependencies: AppDependencies, stat
     let sessionId = request.sessionId;
     const completedReads = new Map<string, string>();
     for (let round = 0; round < MAX_ACTION_ROUNDS; round += 1) {
-      const result = await dependencies.runtime({ ...request, prompt, ...(sessionId ? { sessionId } : {}) });
+      const result = await dependencies.runtime({
+        ...request,
+        prompt,
+        ...(round === 0 && request.resources?.length ? { resources: request.resources } : { resources: undefined }),
+        ...(sessionId ? { sessionId } : {}),
+      });
       sessionId = result.sessionId ?? sessionId;
       const extracted = extractAction(result.text);
       const action = extracted.action;
@@ -750,10 +781,19 @@ export function createApp(config: AgentView, dependencies: AppDependencies, stat
     const entry = Object.entries(config.agents)[0];
     if (!entry) return respond(reply, "当前没有可用 Agent。");
     const [agentId, agent] = entry;
+    let phase: FailurePhase = "history";
+    let historyResources: AttachmentResource[] = [];
     try {
       if (shuttingDown) throw new Error("ThreadFerry 正在停止");
+      const history = await dependencies.history(message.senderId, {
+        ...DIRECT_CONTEXT, chatType: "single", endTime: message.time, includeResources: true,
+      });
+      historyResources = history.flatMap((item) => item.resources ?? []);
+      await dependencies.rememberHistory?.("single", message.senderId, message);
       const scopeKey = sessionScope(agentId, agent);
       const sessionId = await state.session(scope, scopeKey);
+      phase = "runtime";
+      const resources = analysisResources(history, message);
       const controller = new AbortController();
       controllers.set(scope, controller);
       await state.recordActivity({ agent: agentId, type: "runtime.started", outcome: "info", resource: "direct" }).catch(() => undefined);
@@ -762,7 +802,8 @@ export function createApp(config: AgentView, dependencies: AppDependencies, stat
         result = await runRuntimeWithActions({
           agentId,
           ...agent,
-          prompt: buildContext([], message, { lookbackHours: 0, maxMessages: 1 }, "direct"),
+          prompt: buildContext(history, message, DIRECT_CONTEXT, "direct"),
+          ...(resources.length ? { resources } : {}),
           ...(sessionId ? { sessionId } : {}),
           signal: controller.signal,
         }, message.text, message.senderId);
@@ -777,13 +818,15 @@ export function createApp(config: AgentView, dependencies: AppDependencies, stat
       const errorId = newErrorId();
       const reason = failureReason(error);
       const agentId = selfAgent();
-      if (agentId) await state.recordActivity({ agent: agentId, type: "runtime.completed", outcome: "failure", resource: "direct" }).catch(() => undefined);
-      dependencies.onError?.({ errorId, phase: "runtime", ...(reason ? { reason } : {}) });
+      if (agentId && phase === "runtime") await state.recordActivity({ agent: agentId, type: "runtime.completed", outcome: "failure", resource: "direct" }).catch(() => undefined);
+      dependencies.onError?.({ errorId, phase, ...(reason ? { reason } : {}) });
       // 原先私聊失败不落盘，于是回复里让用户跑 threadferry status 却查不到任何东西。
-      await state.finish(message.msgId, "failed", { errorId, phase: "runtime" }, selfAgent()).catch(() => undefined);
+      await state.finish(message.msgId, "failed", { errorId, phase }, selfAgent()).catch(() => undefined);
       // 私聊对象只可能是 Owner，原因给全。
       await reply(withReason(`ThreadFerry 处理失败（错误编号 ${errorId}）。`, reason, "direct"), true).catch(() => undefined);
       return "failed";
+    } finally {
+      await cleanupAttachmentResources(historyResources);
     }
   }
 
@@ -830,10 +873,15 @@ export function createApp(config: AgentView, dependencies: AppDependencies, stat
 
   async function process(message: IncomingMention, reply: Reply, agentId: string, context: { lookbackHours: number; maxMessages: number }): Promise<HandleResult> {
     let phase: FailurePhase = "history";
+    let historyResources: AttachmentResource[] = [];
     try {
       if (shuttingDown) throw new Error("ThreadFerry 正在停止");
       await state.markRunning(message.msgId, selfAgent());
-      const history = await dependencies.history(message.groupId, { ...context, endTime: message.time });
+      const history = await dependencies.history(message.groupId, {
+        ...context, chatType: "group", endTime: message.time, includeResources: true,
+      });
+      historyResources = history.flatMap((item) => item.resources ?? []);
+      await dependencies.rememberHistory?.("group", message.groupId, message);
       const fingerprint = historyFingerprint(history, message);
       const prompt = buildContext(history, message, context);
       const agent = config.agents[agentId];
@@ -841,13 +889,21 @@ export function createApp(config: AgentView, dependencies: AppDependencies, stat
       const scopeKey = sessionScope(agentId, agent);
       const sessionId = await state.session(message.groupId, scopeKey);
       phase = "runtime";
+      const resources = analysisResources(history, message);
       const controller = new AbortController();
       controllers.set(message.groupId, controller);
       await state.recordActivity({ agent: agentId, type: "runtime.started", outcome: "info", resource: `group:${message.groupId}` }).catch(() => undefined);
       let result: RuntimeResult;
       try {
         result = await runRuntimeWithActions(
-          { agentId, ...agent, prompt, ...(sessionId ? { sessionId } : {}), signal: controller.signal },
+          {
+            agentId,
+            ...agent,
+            prompt,
+            ...(resources.length ? { resources } : {}),
+            ...(sessionId ? { sessionId } : {}),
+            signal: controller.signal,
+          },
           message.text,
           message.senderId,
           message.groupId,
@@ -859,7 +915,9 @@ export function createApp(config: AgentView, dependencies: AppDependencies, stat
       await state.recordActivity({ agent: agentId, type: "runtime.completed", outcome: "success", resource: `group:${message.groupId}` }).catch(() => undefined);
 
       phase = "freshness";
-      const latest = await dependencies.history(message.groupId, { ...context, endTime: new Date() });
+      const latest = await dependencies.history(message.groupId, {
+        ...context, chatType: "group", endTime: new Date(), includeResources: false,
+      });
       if (historyFingerprint(latest, message) !== fingerprint) {
         return complete(message, reply, "stale", "分析期间群里出现了新消息。为避免发送过期结论，请重新 @机器人。");
       }
@@ -872,6 +930,8 @@ export function createApp(config: AgentView, dependencies: AppDependencies, stat
         await state.recordActivity({ agent: agentId, type: "runtime.completed", outcome: "failure", resource: `group:${message.groupId}` }).catch(() => undefined);
       }
       return fail(message, reply, phase, error);
+    } finally {
+      await cleanupAttachmentResources(historyResources);
     }
   }
 

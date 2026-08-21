@@ -1,4 +1,5 @@
 import { resolveWorkspace } from "../config.js";
+import { prepareRuntimeResources } from "../attachments.js";
 import { CommandExecutionError, runCommand } from "../process.js";
 import { runtimeFailure, structuredRuntimeError } from "./runtime-error.js";
 import type { CommandRunner, RuntimeRequest, RuntimeResult } from "../types.js";
@@ -6,6 +7,8 @@ import type { CommandRunner, RuntimeRequest, RuntimeResult } from "../types.js";
 function safeEnvironment(): NodeJS.ProcessEnv {
   const allowed = [
     "PATH", "HOME", "CODEX_HOME", "TMPDIR", "LANG", "LC_ALL",
+    "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "APPDATA", "LOCALAPPDATA", "TEMP", "TMP",
+    "SystemRoot", "WINDIR", "ComSpec", "PATHEXT",
     "SSL_CERT_FILE", "NODE_EXTRA_CA_CERTS", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
   ];
   return Object.fromEntries(allowed.flatMap((key) => process.env[key] === undefined ? [] : [[key, process.env[key]]]));
@@ -29,6 +32,7 @@ export async function runCodex(
   runner: CommandRunner = runCommand,
 ): Promise<RuntimeResult> {
   const workspace = await resolveWorkspace(request.workspace);
+  const prepared = await prepareRuntimeResources(request.prompt, request.resources);
   const profile = "threadferry-read-only";
   const filesystemPolicy = `{":minimal"="read",glob_scan_max_depth=8,":workspace_roots"={"."="read",".env"="deny",".env.*"="deny","**/.env"="deny","**/.env.*"="deny",".npmrc"="deny","**/.npmrc"="deny",".git-credentials"="deny","**/.git-credentials"="deny","*.pem"="deny","**/*.pem"="deny","*.key"="deny","**/*.key"="deny","*.p12"="deny","**/*.p12"="deny","id_rsa*"="deny","**/id_rsa*"="deny","id_ed25519*"="deny","**/id_ed25519*"="deny"}}`;
   const baseArgs = [
@@ -54,13 +58,14 @@ export async function runCodex(
     "--skip-git-repo-check",
   ];
 
+  const images = prepared.images.flatMap((resource) => ["--image", resource.path]);
   const execute = (sessionId?: string) => runner("codex", [
     ...baseArgs,
-    ...(sessionId ? ["resume", sessionId, "-"] : ["-"]),
+    ...(sessionId ? ["resume", ...images, sessionId, "-"] : [...images, "-"]),
   ], {
     cwd: workspace,
     env: safeEnvironment(),
-    input: request.prompt,
+    input: prepared.prompt,
     timeoutMs: 10 * 60_000,
     signal: request.signal,
   });

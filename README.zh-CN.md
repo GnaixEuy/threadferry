@@ -21,12 +21,20 @@ Workspace、Runtime 和 Session，严格 1:1，互不串用。
 
 ## 安装
 
-需要 macOS 或 Linux、Node.js 22+、企业微信智能机器人，以及以下任一 Runtime：Codex CLI
-`0.138.0+`、Pi CLI `0.84.2+`、Claude Code `2.1.233+` 或 Grok Build `1.0.5+`。
+需要 macOS、Linux 或 Windows、Node.js 22+、企业微信智能机器人，以及以下任一 Runtime：
+Codex CLI `0.138.0+`、Pi CLI `0.84.2+`、Claude Code `2.1.233+` 或 Grok Build `1.0.5+`。
 安装器会在需要时补装企业微信官方 `wecom-cli 1.1.0+`。
+
+macOS 或 Linux：
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/GnaixEuy/threadferry/main/install.sh | bash
+```
+
+Windows PowerShell（不需要 WSL）：
+
+```powershell
+irm https://raw.githubusercontent.com/GnaixEuy/threadferry/main/install.ps1 | iex
 ```
 
 初始化向导会授权机器人、确认 Owner、选择 Runtime 和 Workspace、完成诊断并启动 ThreadFerry。
@@ -59,7 +67,22 @@ Owner 可以直接私聊机器人：
 @机器人 总结刚才的讨论，并检查相关代码。
 ```
 
-ThreadFerry 会补充最近 6 小时、最多 80 条消息作为不可信背景。普通群消息不会启动 Runtime。
+群聊会补充最近 6 小时、最多 80 条消息作为不可信背景；私聊会补充最近 7 天、最多 80 条消息。
+普通群消息不会启动 Runtime。
+
+### 图片和文件
+
+可以在 Owner 私聊中直接发送图片或文件，也可以在已配置群中附带资源或引用资源并 `@机器人`。
+ThreadFerry 会下载并解密当前消息和引用消息中的资源，也能补取私聊或群上下文最近 10 个媒体文件。
+UTF-8 文本文件会交给所有 Runtime，图片走各 Runtime 的原生视觉输入；遇到 Runtime 不支持的
+二进制格式会明确说明“已收到但无法解析”，不会再误报“没有收到”。
+
+单个资源最大 20 MB，单轮合计最大 50 MB。为支持重启后的追问，并在企业微信私聊历史暂时返回空时
+继续工作，每个 Agent 会在 `~/.threadferry/history/<Agent>/` 保留自己实际收到的授权消息和资源，
+最多 7 天、1,000 条消息和 200 MB；私聊、群聊和 Agent 之间互不共享。历史目录、索引和内容文件
+分别使用 0700/0600，交给 Runtime 的临时副本会在分析和多机器人分发结束后删除；资源 URL、AES Key、
+`media_id` 和临时路径不会持久化。Grok Build 的 JSON 图片传输受命令行参数长度限制，编码后最大
+700 KB；更大的图片请使用 Codex、Pi 或 Claude。
 
 ### 机器人和群
 

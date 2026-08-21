@@ -1,4 +1,4 @@
-import { isAbsolute, join } from "node:path";
+import { isAbsolute, join, win32 } from "node:path";
 import { runCommand } from "./process.js";
 import type { CommandRunner } from "./types.js";
 
@@ -10,6 +10,10 @@ const TAG = /^v\d+\.\d+\.\d+$/;
 export interface UpdateRelease {
   version: string;
   packageUrl: string;
+}
+
+export function globalBinaryPath(prefix: string, platform: NodeJS.Platform = process.platform): string {
+  return platform === "win32" ? win32.join(prefix, "threadferry.cmd") : join(prefix, "bin", "threadferry");
 }
 
 function version(value: string): [number, number, number] {
@@ -56,7 +60,7 @@ export async function installUpdate(update: UpdateRelease, runner: CommandRunner
   await runner("npm", ["install", "--global", "--ignore-scripts", update.packageUrl], { timeoutMs: 300_000 });
   const prefix = (await runner("npm", ["prefix", "--global"], { timeoutMs: 10_000 })).stdout.trim();
   if (!isAbsolute(prefix)) throw new Error("npm 全局安装目录无效");
-  const binary = join(prefix, "bin", "threadferry");
+  const binary = globalBinaryPath(prefix);
   const installedVersion = (await runner(binary, ["--version"], { timeoutMs: 10_000 })).stdout.trim();
   if (installedVersion !== update.version) {
     throw new Error(`更新失败：安装后版本为 ${installedVersion || "unknown"}，预期 ${update.version}`);

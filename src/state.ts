@@ -176,9 +176,10 @@ function validAttachments(value: unknown): value is AttachmentMetadata[] {
   return Array.isArray(value) && value.length <= 32 && value.every((item) => {
     if (!item || typeof item !== "object" || Array.isArray(item)) return false;
     const attachment = item as Record<string, unknown>;
-    return Object.keys(attachment).every((field) => field === "type" || field === "name")
+    return Object.keys(attachment).every((field) => field === "type" || field === "name" || field === "source")
       && ["image", "file", "voice", "video"].includes(String(attachment.type))
-      && (attachment.name === undefined || (typeof attachment.name === "string" && attachment.name.length <= 512));
+      && (attachment.name === undefined || (typeof attachment.name === "string" && attachment.name.length <= 512))
+      && (attachment.source === undefined || ["message", "quote", "history"].includes(String(attachment.source)));
   });
 }
 
@@ -307,7 +308,8 @@ function validateState(value: unknown): StateDocument {
 }
 
 function storeMention(message: IncomingMention, agent?: string): StoredMention {
-  const stored: StoredMention = { ...message, time: message.time.toISOString(), mentioned: true, ...(agent ? { agent } : {}) };
+  const { resources: _resources, ...durable } = message;
+  const stored: StoredMention = { ...durable, time: message.time.toISOString(), mentioned: true, ...(agent ? { agent } : {}) };
   if (!validMention(stored)) throw new Error("企业微信消息结构超过安全上限");
   return stored;
 }

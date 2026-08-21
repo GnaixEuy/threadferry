@@ -4,6 +4,100 @@ ThreadFerry 的每个 GitHub Release 都使用这里对应版本的内容，不�
 
 ## Unreleased
 
+## 0.25.1
+
+修复 Windows 用户在 PowerShell 中执行 Unix 安装命令时被转交给 WSL、并因缺少 `/bin/bash` 而
+无法安装的问题，提供不依赖 WSL 的原生 Windows 安装入口。
+
+### 主要变化
+
+- 新增 `install.ps1`：检查 Node.js 22+、补装或升级官方 `wecom-cli 1.1.0+`，从 GitHub Latest
+  Release 安装预编译的 ThreadFerry，并继续进入现有初始化向导。
+- Windows 安装器优先调用 npm 生成的 `.cmd` 入口，避免 PowerShell 执行策略拦截 `npm.ps1`；同时
+  检查 npm 全局目录，并在缺失时加入当前用户 PATH。
+- ThreadFerry 启动 `wecom-cli`、npm 和各 Runtime 时统一兼容 Windows `.cmd` shim；自动升级按
+  Windows 的 npm 全局目录回读新版本，Grok 的提示文件也不再依赖 Unix `/dev/stdin`。
+- Windows Runtime 子进程保留必要的用户目录和系统环境变量；群聊错误会遮盖 Windows 绝对路径，
+  不向非 Owner 暴露本机目录。
+- 中英文 README 按 macOS/Linux 与 Windows 分开给出安装命令，明确 PowerShell 路径不需要 WSL。
+- Build 工作流增加 Windows 原生 `-DryRun` 验证，防止 PowerShell 安装入口发生语法或流程回归。
+
+### 安装与升级
+
+Windows PowerShell：
+
+```powershell
+irm https://raw.githubusercontent.com/GnaixEuy/threadferry/main/install.ps1 | iex
+```
+
+macOS 或 Linux 继续使用：
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/GnaixEuy/threadferry/main/install.sh | bash
+```
+
+配置、机器人凭据、Runtime Session 和本机历史均无需迁移。
+
+[查看 v0.25.0...v0.25.1 的完整变更](https://github.com/GnaixEuy/threadferry/compare/v0.25.0...v0.25.1)
+
+## 0.25.0
+
+让私聊与群聊使用同一条历史链路，并为企业微信未返回的私聊资源增加 Agent 隔离的 7 天本机历史，
+解决后续追问或重启后仍被误报“没有收到图片/文件”的问题。
+
+### 主要变化
+
+- Owner 私聊不再只把当前消息交给 Runtime；现在会读取最近 7 天、最多 80 条远端与本机历史，群聊
+  继续按各群配置的时间窗口读取，两者都能把历史图片和文件交给 Runtime。
+- 每个 Agent 在 `~/.threadferry/history/<Agent>/` 保留自己实际收到的授权消息与资源，私聊和群聊
+  分区存储，重启后仍可回读，不跨 Agent、会话或 Workspace 共享。
+- 本机历史最多保留 7 天、1,000 条消息和 200 MB 资源；目录、索引和内容文件分别使用 0700/0600，
+  资源按 SHA-256 去重并校验，过期记录和孤立内容自动清理。每轮仍只向 Runtime 提供最多 10 个、
+  合计 50 MB 的临时副本，完成或失败后删除副本。
+- `message files get` 同时兼容实测顶层 `file_path`、文档结构 `media_item.file_path` 和小型 UTF-8
+  文件的 `media_item.content`；CLI 的顶层 `error.code` 也会转换为明确错误，不再丢失真实响应。
+- 历史索引不保存企业微信资源 URL、AES Key 或 `media_id`。如果企业微信远端私聊历史暂时返回空，
+  当前消息仍会正常处理，并从本机已留存的历史补齐后续上下文。
+
+### 安装与升级
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/GnaixEuy/threadferry/main/install.sh | bash
+```
+
+配置格式、机器人凭据和既有 Runtime Session 无需迁移；首次收到授权消息时自动创建本机历史目录。
+升级前已过期且企业微信接口不再返回的资源无法追溯恢复，需要重新发送一次。
+
+## 0.24.0
+
+补全企业微信图片和文件从实时回调、引用消息、群历史到本地 Runtime 的完整处理链，替换原先只保留
+附件类型和文件名、实际内容无法进入分析的旧实现。
+
+### 主要变化
+
+- WebSocket 入口统一接收文本、图片、图文、语音、文件和视频消息；图片、文件及其引用资源通过官方
+  SDK 下载和解密，下载失败会返回明确的资源处理错误。
+- 群历史使用 `chat messages list` 返回的 `media_id`，再通过 `message files get` 取回最近资源；
+  分析后的新鲜度复查不重复下载附件。
+- Codex、Pi 和 Grok 接收真实图片输入，Claude Code 通过受控临时目录读取资源；UTF-8 文本文件直接
+  作为不可信数据交给所有 Runtime。Runtime 不支持的二进制格式会明确说明，不能再误报“没有收到”。
+- 资源单文件限制 20 MB、单轮合计限制 50 MB，最多处理 10 个；临时目录与文件分别使用 0700/0600，
+  当前消息完成多机器人分发、历史分析结束或失败后都会清理。
+- 状态库、群历史上下文和错误信息只保留资源类型、文件名与来源，不持久化临时路径、下载 URL、
+  AES Key 或 `media_id`。
+- Grok Build 使用官方 ACP JSON 图片块；由于 `--prompt-json` 受操作系统参数长度限制，编码后的请求
+  超过 700 KB 时会明确提示改用 Codex、Pi 或 Claude，不会静默丢图。
+
+### 安装与升级
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/GnaixEuy/threadferry/main/install.sh | bash
+```
+
+配置格式、机器人凭据和既有 Session 无需迁移。
+
+[查看 v0.23.1...v0.24.0 的完整变更](https://github.com/GnaixEuy/threadferry/compare/v0.23.1...v0.24.0)
+
 ## 0.23.1
 
 补齐项目首页的四 Runtime 能力海报，让群聊、私聊、1:1 机器人模型和支持的本地 Runtime 在

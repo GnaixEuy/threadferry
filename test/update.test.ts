@@ -1,12 +1,20 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { findUpdate, installUpdate } from "../src/update.js";
+import { findUpdate, globalBinaryPath, installUpdate } from "../src/update.js";
 import type { CommandRunner } from "../src/types.js";
 
 const latest = (tag: string): typeof fetch => (async () => new Response(null, {
   status: 302,
   headers: { location: `https://github.com/GnaixEuy/threadferry/releases/tag/${tag}` },
 })) as typeof fetch;
+
+test("global package binaries use the native npm layout", () => {
+  assert.equal(globalBinaryPath("/install", "linux"), "/install/bin/threadferry");
+  assert.equal(
+    globalBinaryPath("C:\\Users\\runner\\AppData\\Roaming\\npm", "win32"),
+    "C:\\Users\\runner\\AppData\\Roaming\\npm\\threadferry.cmd",
+  );
+});
 
 test("findUpdate returns only a newer stable release", async () => {
   assert.deepEqual(await findUpdate("0.10.1", latest("v0.10.2")), {
