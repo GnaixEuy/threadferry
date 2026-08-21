@@ -49,7 +49,7 @@ import type { AgentView, CommandRunner, GroupMessage, IncomingMention, RuntimeNa
 import { findUpdate, installUpdate } from "./update.js";
 import { runWorkflowTick } from "./workflow.js";
 
-const VERSION = "0.23.0";
+const VERSION = "0.23.1";
 const UPDATE_INTERVAL_MS = 6 * 60 * 60 * 1_000;
 const WORKFLOW_INTERVAL_MS = 30_000;
 const USAGE = `ThreadFerry ${VERSION}

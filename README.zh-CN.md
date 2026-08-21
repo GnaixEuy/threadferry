@@ -15,6 +15,10 @@
 ThreadFerry 把企业微信连接到本地只读 AI Agent。每个 Agent 独立拥有机器人、Owner、凭据、群、
 Workspace、Runtime 和 Session，严格 1:1，互不串用。
 
+<p align="center">
+  <img src="./docs/assets/threadferry-poster.png" alt="ThreadFerry 支持企业微信群聊、私聊以及 Codex、Pi、Claude、Grok" width="560">
+</p>
+
 ## 安装
 
 需要 macOS 或 Linux、Node.js 22+、企业微信智能机器人，以及以下任一 Runtime：Codex CLI

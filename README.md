@@ -15,6 +15,10 @@
 ThreadFerry connects WeCom to read-only local AI agents. Each agent has its own bot, Owner,
 credentials, groups, workspace, runtime, and sessions — strictly 1:1 and isolated.
 
+<p align="center">
+  <img src="./docs/assets/threadferry-poster.png" alt="ThreadFerry supports WeCom group and direct chat with Codex, Pi, Claude, and Grok" width="560">
+</p>
+
 ## Install
 
 Requirements: macOS or Linux, Node.js 22+, a WeCom AI bot, and one runtime: Codex CLI `0.138.0+`,

@@ -4,6 +4,26 @@ ThreadFerry 的每个 GitHub Release 都使用这里对应版本的内容，不�
 
 ## Unreleased
 
+## 0.23.1
+
+补齐项目首页的四 Runtime 能力海报，让群聊、私聊、1:1 机器人模型和支持的本地 Runtime 在
+README 中直接可见。
+
+### 主要变化
+
+- 中英文 README 在产品说明下加入 Codex、Pi、Claude、Grok 能力海报。
+- 海报作为正式文档资产纳入仓库和 npm 发布包，避免安装包中的 README 图片失效。
+
+### 安装与升级
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/GnaixEuy/threadferry/main/install.sh | bash
+```
+
+本次仅调整文档与发布资产，配置、机器人凭据、Runtime 和 Session 均无需迁移。
+
+[查看 v0.23.0...v0.23.1 的完整变更](https://github.com/GnaixEuy/threadferry/compare/v0.23.0...v0.23.1)
+
 ## 0.23.0
 
 新增 Claude Code 与 Grok Build 原生 Runtime，在保留每个 Agent 独立 Workspace 和 Session 的同时，
