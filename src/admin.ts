@@ -8,9 +8,13 @@ import { CLIENT_SCRIPT, STYLESHEET } from "./admin-assets.js";
 import { addAgent, resolveWorkspace } from "./config.js";
 import { resolveDirectoryUser } from "./directory.js";
 import type { StateSnapshot } from "./state.js";
-import type { DirectoryUser, GroupAccess, RuntimeName, ThreadFerryConfig } from "./types.js";
+import type { DirectoryUser, GroupAccess, GroupBinding, RuntimeName, ThreadFerryConfig } from "./types.js";
 
 export type ConfigUpdater = (change: (latest: ThreadFerryConfig) => void | Promise<void>) => Promise<void>;
+
+export type BotAuthorization =
+  | { mode: "qr" }
+  | { mode: "manual"; botId: string; secret: string };
 
 export interface AgentBotStatus {
   authorized: boolean;
@@ -40,6 +44,8 @@ export interface AdminDependencies {
   /** 按姓名添加成功时把映射记下来，之后就能显示名字。 */
   rememberUser?: (userId: string, name: string) => void;
   botStatus?: (agentId: string) => Promise<AgentBotStatus>;
+  /** 凭据只交给该 Agent 的 wecom-cli 加密存储，不写入 ThreadFerry 配置或日志。 */
+  authorizeBot?: (agentId: string, authorization: BotAuthorization) => Promise<void>;
   snapshot?: () => Promise<StateSnapshot>;
   /** 按「群 + Agent」重置：同一个群里每台机器人各有自己的 Session。 */
   resetSession?: (groupId: string, agentId: string) => Promise<boolean>;
@@ -47,6 +53,7 @@ export interface AdminDependencies {
 
 const GROUP_ID = /^[^\s\u0000-\u001f]{1,512}$/;
 const USER_ID = /^[A-Za-z0-9_@.-]{1,512}$/;
+const BOT_ID = /^[A-Za-z0-9_-]{1,256}$/;
 const MAX_DIRECTORY_ENTRIES = 500;
 const MAX_USER_RESULTS = 20;
 
@@ -123,24 +130,37 @@ function required(input: URLSearchParams, name: string): string {
   return value;
 }
 
+function botAuthorization(input: URLSearchParams): BotAuthorization | undefined {
+  const mode = input.get("authMode")?.trim() || "later";
+  if (mode === "later") return undefined;
+  if (mode === "qr") return { mode };
+  if (mode !== "manual") throw new Error("机器人授权方式无效");
+  const botId = input.get("botId")?.trim() ?? "";
+  const secret = input.get("secret") ?? "";
+  input.delete("secret");
+  if (!BOT_ID.test(botId)) throw new Error("Bot ID 无效");
+  if (!secret.trim() || secret.length > 1024 || /[\r\n\u0000]/.test(secret)) throw new Error("Bot Secret 无效");
+  return { mode, botId, secret };
+}
+
 
 function field(token: string): string {
   return `<input type="hidden" name="csrf" value="${token}">`;
 }
 
 function groupAnchor(groupId: string): string {
-  return `/groups#${encodeURIComponent(groupId)}`;
+  return `/groups/detail?id=${encodeURIComponent(groupId)}`;
 }
 
 // 添加用户失败时回到「这个群这台机器人的对话框还开着」的状态，报错就显示在对话框上方。
 // 一个群可能挂多台机器人，所以定位键是 Agent + 群。
 function groupUserAnchor(groupId: string, agentId: string): string {
-  return `/groups?user=${encodeURIComponent(`${agentId}\n${groupId}`)}#${encodeURIComponent(groupId)}`;
+  return `${groupAnchor(groupId)}&user=${encodeURIComponent(`${agentId}\n${groupId}`)}`;
 }
 
 function carryParams(url: URL, extra?: Record<string, string>): string {
   const params = new URLSearchParams();
-  for (const key of ["name", "runtime", "model", "workspace", "new"]) {
+  for (const key of ["name", "runtime", "model", "workspace", "configDir", "authMode", "new"]) {
     const value = url.searchParams.get(key)?.trim();
     if (value) params.set(key, value);
   }
@@ -370,15 +390,25 @@ function shell(
 ): string {
   const notice = url.searchParams.get("ok");
   const error = options.errorInDialog ? null : url.searchParams.get("error");
-  const tabs: Array<[string, typeof active, string]> = [["/", "overview", "概览"], ["/agents", "agents", "Agent 工作区"], ["/groups", "groups", "群聊管理"]];
-  const nav = tabs.map(([href, key, label]) => `<a href="${href}"${key === active ? ` class="active"` : ""}>${label}</a>`).join("");
+  const tabs: Array<[string, typeof active, string, string]> = [
+    ["/", "overview", "概览", "⌂"],
+    ["/agents", "agents", "机器人管理", "◇"],
+    ["/groups", "groups", "群聊管理", "◎"],
+  ];
+  const current = tabs.find(([, key]) => key === active)!;
+  const nav = tabs.map(([href, key, label, icon]) => `<a href="${href}"${key === active ? ` class="active" aria-current="page"` : ""}><span class="nav-icon" aria-hidden="true">${icon}</span><span>${label}</span></a>`).join("");
   return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>ThreadFerry 管理台</title><link rel="stylesheet" href="/admin.css"><script src="/admin.js"></script></head>
-  <body><main><header class="top"><div><h1>ThreadFerry</h1><div class="sub">本机管理台 · 仅监听 127.0.0.1</div></div><code>${html(Object.keys(config.agents).length)} 个 Agent · 每个对应一个机器人</code></header>
-  <nav class="tabs">${nav}</nav>
-  ${notice ? `<div class="notice">${html(notice)}</div>` : ""}${error ? errorBar(error) : ""}
-  ${content}
-  </main></body></html>`;
+  <title>ThreadFerry 管理台</title><script src="/admin.js"></script><link rel="stylesheet" href="/admin.css"></head>
+  <body><div class="app-shell">
+    <aside class="sidebar"><a class="brand" href="/"><span class="brand-mark">TF</span><span><b>ThreadFerry</b><small>本机管理台</small></span></a>
+      <nav class="side-nav" aria-label="管理台导航">${nav}</nav>
+      <div class="sidebar-bottom"><button class="theme-toggle ghost" type="button" data-theme-toggle aria-label="切换明暗主题"><span data-theme-icon aria-hidden="true">☀</span><span data-theme-label>亮色主题</span></button><div class="sidebar-foot"><span class="status-dot"></span><span>仅监听 127.0.0.1</span></div></div>
+    </aside>
+    <main><header class="top"><div><p class="eyebrow">管理台</p><h1>${current[2]}</h1></div><div class="instance"><b>${html(Object.keys(config.agents).length)}</b><span>个机器人</span><small>1 个机器人对应 1 个 Agent</small></div></header>
+      ${notice ? `<div class="notice">${html(notice)}</div>` : ""}${error ? errorBar(error) : ""}
+      <div class="page-content">${content}</div>
+    </main>
+  </div></body></html>`;
 }
 
 async function overviewPage(config: ThreadFerryConfig, dependencies: AdminDependencies, token: string, url: URL): Promise<string> {
@@ -394,7 +424,7 @@ async function overviewPage(config: ThreadFerryConfig, dependencies: AdminDepend
   const workItems = (snapshot?.workItems ?? []).filter((item) => item.status !== "completed" && item.status !== "failed");
   const activities = (snapshot?.activities ?? []).slice(-20).reverse();
   const stats: Array<[string, string, string]> = [
-    [String(Object.keys(config.agents).length), "Agent 工作区", "/agents"],
+    [String(Object.keys(config.agents).length), "机器人", "/agents"],
     [String(boundIds.size), "已绑定群", "/groups"],
     [String(unbound.length), "待绑定群", "/groups"],
   ];
@@ -425,7 +455,7 @@ async function overviewPage(config: ThreadFerryConfig, dependencies: AdminDepend
     <div class="stats">${stats.map(([value, label, href]) => href
       ? `<a class="stat" href="${href}"><b>${value}</b><span>${label}</span></a>`
       : `<div class="stat"><b>${value}</b><span>${label}</span></div>`).join("")}</div>
-    ${snapshot ? "" : `<p class="sub mt">运行状态暂不可用；Agent 工作区和群配置管理不受影响。</p>`}
+    ${snapshot ? "" : `<p class="sub mt">运行状态暂不可用；机器人和群配置管理不受影响。</p>`}
     <h2>待处理</h2>${todos.length ? `<div class="grid">${todos.join("")}</div>` : `<p class="sub">没有待处理事项。</p>`}
     <h2>主动工作</h2>${proactive.length ? `<div class="grid">${proactive.join("")}</div>` : `<p class="sub">没有运行中的提醒或协作任务。</p>`}
     <h2>最近 Activity</h2>${activityList}`);
@@ -433,9 +463,24 @@ async function overviewPage(config: ThreadFerryConfig, dependencies: AdminDepend
 
 // 添加表单放进对话框，页面上只留一个按钮。开着的状态由 ?new=1 决定：没有脚本时点按钮就是
 // 跳这个链接，表单校验失败时也带着填过的值回到这里，两种情况都不会让人重填。
+function botAuthFields(selected: string, allowLater: boolean): string {
+  return `
+    <fieldset class="auth-options" data-auth-form>
+      <legend>企业微信授权</legend>
+      <label><input type="radio" name="authMode" value="qr"${selected === "qr" ? " checked" : ""}> 扫码授权（推荐）</label>
+      <label><input type="radio" name="authMode" value="manual"${selected === "manual" ? " checked" : ""}> 输入 Bot ID / Secret</label>
+      ${allowLater ? `<label><input type="radio" name="authMode" value="later"${selected === "later" ? " checked" : ""}> 稍后授权</label>` : ""}
+      <div class="manual-auth-fields" data-manual-fields>
+        <label class="field"><span>Bot ID</span><input name="botId" autocomplete="off" maxlength="256" placeholder="aib..."></label>
+        <label class="field"><span>Bot Secret</span><input name="secret" type="password" autocomplete="new-password" maxlength="1024"></label>
+      </div>
+      <p class="hint">扫码会直接打开企业微信授权页。手工填写的 Secret 只转交给该机器人的 wecom-cli 加密存储，不写入 ThreadFerry 配置或日志。</p>
+    </fieldset>`;
+}
+
 function addAgentDialog(
   token: string,
-  prefill: { name: string; runtime: string; model: string; workspace: string },
+  prefill: { name: string; runtime: string; model: string; workspace: string; configDir: string; authMode: string },
   browseLink: string,
   open: boolean,
   error?: string,
@@ -443,11 +488,11 @@ function addAgentDialog(
   return `
     <dialog id="add-agent" class="modal" aria-labelledby="add-agent-title"${open ? " open" : ""}>
       <form method="post" action="/agents/add">${field(token)}
-        <h3 id="add-agent-title">添加 Agent 工作区</h3>
-        <p class="lede">一个 Agent 独占一台企业微信机器人。添加完成后在终端执行 <code>threadferry agent login &lt;名称&gt;</code> 扫码授权它的机器人。</p>
+        <h3 id="add-agent-title">添加机器人</h3>
+        <p class="lede">一个机器人对应一个独立 Agent；凭据、Owner、群、Workspace 和 Session 互相隔离。</p>
         ${error ? errorBar(error) : ""}
         <div class="fields">
-          <label class="field"><span>名称</span><input name="agentId" value="${html(prefill.name)}" maxlength="128" placeholder="1-128 个字符，支持中文和空格" required autofocus></label>
+          <label class="field"><span>机器人名称</span><input name="agentId" value="${html(prefill.name)}" maxlength="128" placeholder="1-128 个字符，支持中文和空格" required autofocus></label>
           <label class="field"><span>Runtime</span><select name="runtime">
             <option value="codex"${prefill.runtime === "codex" ? " selected" : ""}>Codex</option><option value="pi"${prefill.runtime === "pi" ? " selected" : ""}>Pi</option>
           </select></label>
@@ -459,8 +504,23 @@ function addAgentDialog(
             <p class="hint">点输入框选目录，也可以直接输入绝对路径；必须是已存在的目录。<a class="no-js" href="${html(browseLink)}">整页浏览目录</a></p>
           </div>
           <label class="field"><span>模型（可选）</span><input name="model" value="${html(prefill.model)}" placeholder="provider/model"></label>
+          <label class="field"><span>wecom-cli 配置目录（可选）</span><input name="configDir" value="${html(prefill.configDir)}" placeholder="留空则使用 ~/.threadferry/wecom/机器人名称"></label>
+          ${botAuthFields(prefill.authMode, true)}
         </div>
-        <div class="modal-actions"><a class="button ghost" href="/agents" data-close-dialog>取消</a><button>添加</button></div>
+        <div class="modal-actions"><a class="button ghost" href="/agents" data-close-dialog>取消</a><button>添加机器人</button></div>
+      </form>
+    </dialog>`;
+}
+
+function botAuthDialog(token: string, dialogId: string, agentId: string, open: boolean, error?: string): string {
+  return `
+    <dialog id="${html(dialogId)}" class="modal" aria-labelledby="${html(dialogId)}-title"${open ? " open" : ""}>
+      <form method="post" action="/agents/auth">${field(token)}<input type="hidden" name="agentId" value="${html(agentId)}">
+        <h3 id="${html(dialogId)}-title">授权机器人 ${html(agentId)}</h3>
+        <p class="lede">凭据只写入这台机器人的独立 wecom-cli 配置目录。授权后重启 ThreadFerry，即会建立它自己的企业微信连接。</p>
+        ${error ? errorBar(error) : ""}
+        ${botAuthFields("qr", false)}
+        <div class="modal-actions"><a class="button ghost" href="/agents" data-close-dialog>取消</a><button>开始授权</button></div>
       </form>
     </dialog>`;
 }
@@ -512,6 +572,10 @@ async function agentsPage(config: ThreadFerryConfig, dependencies: AdminDependen
     runtime: url.searchParams.get("runtime")?.trim() === "pi" ? "pi" : "codex",
     model: url.searchParams.get("model")?.trim() ?? "",
     workspace: url.searchParams.get("workspace")?.trim() ?? "",
+    configDir: url.searchParams.get("configDir")?.trim() ?? "",
+    authMode: ["qr", "manual", "later"].includes(url.searchParams.get("authMode") ?? "")
+      ? url.searchParams.get("authMode")!
+      : "qr",
   };
   const browseLink = `/agents/browse?${carryParams(url, { ...(prefill.workspace ? { path: prefill.workspace } : {}), new: "1" })}`;
   // 每个 Agent 一个机器人：授权状态与 Owner 都是 Agent 自己的属性，必须显示出来。
@@ -524,7 +588,10 @@ async function agentsPage(config: ThreadFerryConfig, dependencies: AdminDependen
       // 单个 Agent 查询失败不影响整页。
     }
   }));
-  const cards = Object.entries(config.agents).map(([id, agent]) => {
+  const openAuth = url.searchParams.get("auth")?.trim();
+  const error = url.searchParams.get("error") ?? undefined;
+  const authDialogs: string[] = [];
+  const cards = Object.entries(config.agents).map(([id, agent], index) => {
     const bound = boundByAgent.get(id) ?? [];
     const removable = bound.length === 0 && total > 1;
     const bot = botStatuses.get(id);
@@ -533,6 +600,9 @@ async function agentsPage(config: ThreadFerryConfig, dependencies: AdminDependen
       : bot.authorized
         ? `<p>机器人 ${bot.botName && bot.botName !== id ? `<b>${html(bot.botName)}</b> ` : ""}<span class="badge ok">已授权</span> <code>${html(bot.botId ?? "")}</code></p>`
         : `<p>机器人 <span class="badge warning">未授权</span></p><p class="muted">${html(bot.hint ?? `在终端执行 threadferry agent login ${id}`)}</p>`;
+    const dialogId = `auth-bot-${index}`;
+    const authOpen = openAuth === id;
+    authDialogs.push(botAuthDialog(token, dialogId, id, authOpen, authOpen ? error : undefined));
     return `
     <article class="card">
       <div class="row"><h3>${html(id)}</h3><span>${bot?.org ? `<span class="badge org">${html(bot.org)}</span> ` : ""}<span class="badge">${html(agent.runtime)}</span></span></div>
@@ -543,20 +613,22 @@ async function agentsPage(config: ThreadFerryConfig, dependencies: AdminDependen
       ${bound.length
         ? `<ul class="links">${bound.map((group) => `<li><a href="${groupAnchor(group.id)}">${html(group.label)}</a><code>${html(group.id)}</code></li>`).join("")}</ul>`
         : `<p class="muted">未被任何群使用</p>`}
-      ${removable
-        ? `<div class="actions"><form method="post" action="/agents/remove">${field(token)}<input type="hidden" name="agentId" value="${html(id)}"><button class="danger">删除 Agent 工作区</button></form></div>`
-        : ""}
+      <div class="actions">
+        <a class="button ghost" href="/agents?auth=${encodeURIComponent(id)}" data-dialog="${dialogId}">${bot?.authorized ? "重新授权" : "授权机器人"}</a>
+        ${removable ? `<form method="post" action="/agents/remove">${field(token)}<input type="hidden" name="agentId" value="${html(id)}"><button class="danger">删除机器人</button></form>` : ""}
+      </div>
     </article>`;
   }).join("");
   const open = url.searchParams.get("new") === "1";
-  const error = url.searchParams.get("error") ?? undefined;
+  const errorInDialog = (open || (openAuth !== undefined && config.agents[openAuth] !== undefined)) && error !== undefined;
   return shell("agents", config, url, `
     <div class="toolbar">
-      <div><h2 class="flush">Agent 工作区</h2><p class="sub">每个 Agent 独占一台机器人，凭据、Owner、群和 Session 互相隔离。卡片右上角是 Owner 在通讯录里的顶层部门——企业微信不提供企业名查询，这是最接近的可得信息。</p></div>
-      <a class="button" href="/agents?${carryParams(url, { new: "1" })}" data-dialog="add-agent">＋ 添加 Agent 工作区</a>
+      <div><h2 class="flush">机器人管理</h2><p class="sub">每台机器人对应一个独立 Agent，凭据、Owner、群、Workspace 和 Session 互相隔离。卡片右上角是 Owner 在通讯录里的顶层部门。</p></div>
+      <a class="button" href="/agents?${carryParams(url, { new: "1" })}" data-dialog="add-agent">＋ 添加机器人</a>
     </div>
     <div class="grid">${cards}</div>
-    ${addAgentDialog(token, prefill, browseLink, open, open ? error : undefined)}`, { errorInDialog: open && error !== undefined });
+    ${authDialogs.join("")}
+    ${addAgentDialog(token, prefill, browseLink, open, open ? error : undefined)}`, { errorInDialog });
 }
 
 // 无脚本时的目录浏览回退页：选中目录后带着已填的值回到添加对话框。
@@ -569,7 +641,7 @@ async function browsePage(config: ThreadFerryConfig, url: URL): Promise<string> 
       <h3>选择 Workspace 目录</h3>
       ${listing.note ? `<p class="muted">${html(listing.note)}</p>` : ""}
       <p>当前目录：<code>${html(listing.current)}</code></p>
-      <p><a class="button" href="${html(choose)}">使用此目录</a> <a href="/agents">返回 Agent 工作区</a></p>
+      <p><a class="button" href="${html(choose)}">使用此目录</a> <a href="/agents">返回机器人管理</a></p>
       ${listing.parent ? `<p><a href="${html(browse(listing.parent))}">↑ 上级目录</a></p>` : ""}
       <ul class="links">${listing.entries.map((entry) => `<li><a href="${html(browse(entry.path))}">${html(entry.name)}/</a></li>`).join("") || `<li class="muted">没有可进入的子目录</li>`}</ul>
       ${listing.truncated ? `<p class="muted">子目录过多，仅显示前 ${MAX_DIRECTORY_ENTRIES} 个。</p>` : ""}
@@ -619,55 +691,72 @@ function agentSection(
       </section>`;
 }
 
-async function groupsPage(config: ThreadFerryConfig, dependencies: AdminDependencies, token: string, url: URL): Promise<string> {
+function groupListItem(id: string, label: string, group: GroupBinding | undefined, visible: Set<string>, confirmed: Set<string>): string {
+  const agents = Object.keys(group?.agents ?? {});
+  const bound = agents.length > 0;
+  const available = [...visible].filter((agentId) => !group?.agents[agentId]);
+  return `<a class="group-row" href="${html(groupAnchor(id))}">
+    <span class="group-main"><span class="group-avatar" aria-hidden="true">群</span><span><b>${html(label)}</b><code>${html(id)}</code></span></span>
+    <span class="group-agents">${bound
+      ? agents.map((agentId) => `<span class="badge${confirmed.has(agentId) ? " ok" : ""}">${html(agentId)}</span>`).join("")
+      : `<span class="muted">${available.length} 台机器人可绑定</span>`}</span>
+    <span class="group-state"><span class="badge ${bound ? "ok" : "warning"}">${bound ? `${agents.length} 台已启用` : "待绑定"}</span><span class="row-arrow" aria-hidden="true">›</span></span>
+  </a>`;
+}
+
+async function groupsPage(config: ThreadFerryConfig, dependencies: AdminDependencies, url: URL): Promise<string> {
   const { sessions, visibleTo, confirmedBy, failures } = await fetchSessions(config, dependencies);
   const byId = new Map(sessions.map((session) => [session.id, session]));
   const groupIds = [...new Set([...sessions.map((session) => session.id), ...Object.keys(config.groups)])];
-  const openDialog = url.searchParams.get("user")?.trim() ?? "";
-  const error = url.searchParams.get("error") ?? undefined;
   const unbound: string[] = [];
   const bound: string[] = [];
-  const dialogs: string[] = [];
-  let openedInDialog = false;
   for (const id of groupIds) {
     const group = config.groups[id];
-    const label = byId.get(id)?.name ?? "未获取群名";
-    const visible = visibleTo.get(id) ?? new Set<string>();
-    const confirmed = confirmedBy.get(id) ?? new Set<string>();
-    if (!group || Object.keys(group.agents).length === 0) {
-      unbound.push(bindCard(config, token, id, label, visible, confirmed, unbound.length));
-      continue;
-    }
-    const sections = Object.entries(group.agents).map(([agentId, access]) => {
-      const dialogId = `add-user-${dialogs.length}`;
-      // 对话框按「群 + Agent」定位：同一个群里两台机器人各有各的名单。
+    const item = groupListItem(id, byId.get(id)?.name ?? "未获取群名", group,
+      visibleTo.get(id) ?? new Set(), confirmedBy.get(id) ?? new Set());
+    (group && Object.keys(group.agents).length > 0 ? bound : unbound).push(item);
+  }
+  return shell("groups", config, url, `
+    ${failures.length > 0 ? `<h2>群查询失败</h2><div class="grid">${failureCard(failures)}</div>` : ""}
+    <div class="section-head"><div><h2>待绑定</h2><p class="sub">进入群聊后选择要启用的机器人。</p></div><a class="button ghost" href="/groups">↻ 刷新群列表</a></div>
+    <div class="list-panel">${unbound.join("") || `<p class="empty-state">${sessions.length > 0 ? "已发现的群都绑定完了。" : `还没发现任何群。${DISCOVERY_HINT}`}</p>`}</div>
+    <h2>已配置群</h2><div class="list-panel">${bound.join("") || `<p class="empty-state">暂无已配置群；可在上方待绑定区选择群聊，或私聊机器人发送 threadferry bind 命令。</p>`}</div>`);
+}
+
+async function groupDetailPage(config: ThreadFerryConfig, dependencies: AdminDependencies, token: string, url: URL): Promise<string> {
+  const id = url.searchParams.get("id")?.trim() ?? "";
+  if (!GROUP_ID.test(id)) return shell("groups", config, url, `<p><a class="back-link" href="/groups">← 返回群聊列表</a></p>${errorBar("群 ID 无效")}`);
+  const { sessions, visibleTo, confirmedBy, failures } = await fetchSessions(config, dependencies);
+  const session = sessions.find((item) => item.id === id);
+  const group = config.groups[id];
+  if (!session && !group) return shell("groups", config, url, `<p><a class="back-link" href="/groups">← 返回群聊列表</a></p>${errorBar("群聊不存在或当前不可见")}`);
+  const label = session?.name ?? "未获取群名";
+  const visible = visibleTo.get(id) ?? new Set<string>();
+  const confirmed = confirmedBy.get(id) ?? new Set<string>();
+  const openDialog = url.searchParams.get("user")?.trim() ?? "";
+  const error = url.searchParams.get("error") ?? undefined;
+  const dialogs: string[] = [];
+  let openedInDialog = false;
+  let body: string;
+  if (!group || Object.keys(group.agents).length === 0) {
+    body = bindCard(config, token, id, label, visible, confirmed, 0);
+  } else {
+    const sections = Object.entries(group.agents).map(([agentId, access], index) => {
+      const dialogId = `add-user-${index}`;
       const openHere = openDialog === `${agentId}\n${id}`;
       if (openHere && error !== undefined) openedInDialog = true;
       dialogs.push(addUserDialog(token, dialogId, id, agentId, label, openHere, openHere ? error : undefined));
       return agentSection(token, id, agentId, access, config.agents[agentId]?.ownerUser,
         config.agents[agentId]?.runtime, dialogId, dependencies.userName, Boolean(dependencies.resetSession), confirmed.has(agentId));
     }).join("");
-    // 还能再加的机器人：能看到这个群、但还没绑的 Agent。
     const spare = [...visible].filter((agentId) => config.agents[agentId] && !group.agents[agentId]);
-    const count = Object.keys(group.agents).length;
-    bound.push(`
-      <article class="card" id="${html(id)}">
-        <div class="row"><div><h3>${html(label)}</h3><code>${html(id)}</code></div><span class="badge ok">${count} 台机器人已启用</span></div>
-        <p class="muted">群里 @ 哪台机器人，就由它用自己的 Workspace 回答；名单、开关和 Session 各自独立。</p>
-        ${sections}
-        ${spare.length > 0 ? `
-        <form method="post" action="/groups/bind">${field(token)}<input type="hidden" name="groupId" value="${html(id)}">
-          <div class="field"><span>再加机器人</span>${agentChoices(spare, confirmed, `more-${bound.length}`)}</div><button>绑定所选</button>
-        </form>` : ""}
-      </article>`);
+    body = `<article class="card group-detail"><div class="row"><div><h3>${html(label)}</h3><code>${html(id)}</code></div><span class="badge ok">${Object.keys(group.agents).length} 台机器人已启用</span></div>
+      <p class="muted">群里 @ 哪台机器人，就由它用自己的 Workspace 回答；名单、开关和 Session 各自独立。</p>${sections}
+      ${spare.length > 0 ? `<form method="post" action="/groups/bind">${field(token)}<input type="hidden" name="groupId" value="${html(id)}"><div class="field"><span>再加机器人</span>${agentChoices(spare, confirmed, "more")}</div><button>绑定所选</button></form>` : ""}</article>`;
   }
-  return shell("groups", config, url, `
-    ${failures.length > 0 ? `<h2>群查询失败</h2><div class="grid">${failureCard(failures)}</div>` : ""}
-    <h2>待绑定</h2><div class="grid">${unbound.join("") || `<p class="sub">${sessions.length > 0
-      ? "已发现的群都绑定完了。"
-      : `还没发现任何群。${DISCOVERY_HINT}`}</p>`}</div>
-    <h2>已配置群</h2><div class="grid">${bound.join("") || `<p class="sub">暂无已配置群；可在上方待绑定区完成绑定，或私聊机器人发送 threadferry bind 命令。</p>`}</div>
-    ${dialogs.join("")}`, { errorInDialog: openedInDialog });
+  return shell("groups", config, url, `<p><a class="back-link" href="/groups">← 返回群聊列表</a></p>
+    <div class="detail-title"><div><p class="eyebrow">群聊详情</p><h2>${html(label)}</h2><code>${html(id)}</code></div><a class="button ghost" href="${html(groupAnchor(id))}">↻ 刷新</a></div>
+    ${failures.length > 0 ? failureCard(failures) : ""}${body}${dialogs.join("")}`, { errorInDialog: openedInDialog });
 }
 
 export async function startAdminServer(
@@ -688,7 +777,8 @@ export async function startAdminServer(
         if (url.pathname === "/") return send(response, 200, await overviewPage(config, dependencies, token, url));
         if (url.pathname === "/agents") return send(response, 200, await agentsPage(config, dependencies, token, url));
         if (url.pathname === "/agents/browse") return send(response, 200, await browsePage(config, url));
-        if (url.pathname === "/groups") return send(response, 200, await groupsPage(config, dependencies, token, url));
+        if (url.pathname === "/groups") return send(response, 200, await groupsPage(config, dependencies, url));
+        if (url.pathname === "/groups/detail") return send(response, 200, await groupDetailPage(config, dependencies, token, url));
         return send(response, 404, "Not found");
       } catch {
         return send(response, 500, "ThreadFerry 管理台暂时无法读取配置");
@@ -716,28 +806,57 @@ export async function startAdminServer(
           ...(input.get("runtime")?.trim() ? { runtime: input.get("runtime")!.trim() } : {}),
           ...(input.get("workspace")?.trim() ? { workspace: input.get("workspace")!.trim() } : {}),
           ...(input.get("model")?.trim() ? { model: input.get("model")!.trim() } : {}),
+          ...(input.get("configDir")?.trim() ? { configDir: input.get("configDir")!.trim() } : {}),
+          ...(input.get("authMode")?.trim() ? { authMode: input.get("authMode")!.trim() } : {}),
         })}`;
         const agentId = required(input, "agentId");
         const runtime = required(input, "runtime") as RuntimeName;
         if (runtime !== "codex" && runtime !== "pi") throw new Error("runtime 仅支持 codex 或 pi");
         const workspace = await resolveWorkspace(required(input, "workspace"));
         const model = input.get("model")?.trim() || undefined;
+        const configDir = input.get("configDir")?.trim() || undefined;
+        const authorization = botAuthorization(input);
         await dependencies.updateConfig((latest) => {
-          latest.agents = addAgent(latest, agentId, { runtime, workspace, ...(model ? { model } : {}) }).agents;
+          latest.agents = addAgent(latest, agentId, {
+            runtime,
+            workspace,
+            ...(model ? { model } : {}),
+            ...(configDir ? { configDir } : {}),
+          }).agents;
         });
-        message = `Agent 工作区 ${agentId} 已添加`;
+        message = `机器人 ${agentId} 已添加`;
+        if (authorization) {
+          errorTarget = `/agents?auth=${encodeURIComponent(agentId)}`;
+          if (!dependencies.authorizeBot) throw new Error("当前启动方式不支持机器人授权");
+          await dependencies.authorizeBot(agentId, authorization);
+          message = authorization.mode === "qr"
+            ? `机器人 ${agentId} 已添加，扫码授权页已打开；完成后刷新本页并重启 ThreadFerry`
+            : `机器人 ${agentId} 已添加并授权；重启 ThreadFerry 后启用`;
+        }
+      } else if (url.pathname === "/agents/auth") {
+        target = "/agents";
+        const agentId = required(input, "agentId");
+        if (!config.agents[agentId]) throw new Error("机器人不存在");
+        const authorization = botAuthorization(input);
+        if (!authorization) throw new Error("请选择机器人授权方式");
+        errorTarget = `/agents?auth=${encodeURIComponent(agentId)}`;
+        if (!dependencies.authorizeBot) throw new Error("当前启动方式不支持机器人授权");
+        await dependencies.authorizeBot(agentId, authorization);
+        message = authorization.mode === "qr"
+          ? `机器人 ${agentId} 的扫码授权页已打开；完成后刷新本页并重启 ThreadFerry`
+          : `机器人 ${agentId} 已授权；重启 ThreadFerry 后启用`;
       } else if (url.pathname === "/agents/remove") {
         target = "/agents";
         const agentId = required(input, "agentId");
         await dependencies.updateConfig((latest) => {
-          if (!latest.agents[agentId]) throw new Error("Agent 工作区不存在");
+          if (!latest.agents[agentId]) throw new Error("机器人不存在");
           if (Object.values(latest.groups).some((group) => group.agents[agentId])) {
-            throw new Error("仍有群绑定此 Agent 工作区，请先在群里解绑它");
+            throw new Error("仍有群绑定此机器人，请先在群里解绑它");
           }
-          if (Object.keys(latest.agents).length <= 1) throw new Error("至少保留一个 Agent 工作区");
+          if (Object.keys(latest.agents).length <= 1) throw new Error("至少保留一个机器人");
           delete latest.agents[agentId];
         });
-        message = `Agent 工作区 ${agentId} 已删除`;
+        message = `机器人 ${agentId} 已删除`;
       } else if (url.pathname === "/groups/bind") {
         const groupId = required(input, "groupId");
         // 一次可以勾多台机器人：表单是复选框，这里按提交上来的全部处理。

@@ -8,7 +8,7 @@ import { basename, dirname, join, resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { createApp } from "./app.js";
 import { AgentOriginCache } from "./agent-origin.js";
-import { startAdminServer, type ConfigUpdater } from "./admin.js";
+import { startAdminServer, type BotAuthorization, type ConfigUpdater } from "./admin.js";
 import { DirectoryNameCache } from "./directory-names.js";
 import { fanOutTargets, quotedReply } from "./group-fanout.js";
 import { authorizeHint, botConfigDir, botStatus, loadBotCredentials, validateAgentId, wecomEnv, type BotCredentials } from "./bots.js";
@@ -46,7 +46,7 @@ import type { AgentView, CommandRunner, GroupMessage, IncomingMention, RuntimeNa
 import { findUpdate, installUpdate } from "./update.js";
 import { runWorkflowTick } from "./workflow.js";
 
-const VERSION = "0.20.3";
+const VERSION = "0.22.0";
 const UPDATE_INTERVAL_MS = 6 * 60 * 60 * 1_000;
 const WORKFLOW_INTERVAL_MS = 30_000;
 const USAGE = `ThreadFerry ${VERSION}
@@ -809,6 +809,29 @@ async function loginAgentBot(agentId: string, override?: string): Promise<void> 
   console.log(`\nAgent ${agentId} 已绑定机器人 ${status.botId}。`);
 }
 
+async function authorizeBotFromAdmin(agentId: string, override: string | undefined, authorization: BotAuthorization): Promise<void> {
+  const configDir = botConfigDir(agentId, override);
+  await mkdir(configDir, { recursive: true, mode: 0o700 });
+  if (authorization.mode === "manual") {
+    await runCommand("wecom-cli", ["auth", "init", "--manual"], {
+      env: wecomEnv(configDir),
+      input: `${authorization.botId}\n${authorization.secret}\n`,
+    });
+    if (!(await botStatus(agentId, override)).authorized) throw new Error("授权结束但未检测到可用机器人凭据");
+    return;
+  }
+  const child = spawn("wecom-cli", ["auth", "init", "--noninteractive"], {
+    stdio: "ignore",
+    env: wecomEnv(configDir),
+    shell: false,
+  });
+  await new Promise<void>((resolve, reject) => {
+    child.once("spawn", resolve);
+    child.once("error", (error) => reject(new Error(`无法启动 wecom-cli: ${error.message}`)));
+  });
+  child.unref();
+}
+
 // 保证该 Agent 有机器人凭据：已有则跳过，没有则先预告再扫码授权。
 async function authorizeBot(agentId: string, configDir?: string): Promise<BotCredentials> {
   const existing = await loadBotCredentials(agentId, configDir);
@@ -965,6 +988,11 @@ async function start(
           ...origin,
           ...(status.authorized ? {} : { hint: authorizeHint(agentId, config.agents[agentId]?.configDir) }),
         };
+      },
+      authorizeBot: (agentId, authorization) => {
+        const agent = config.agents[agentId];
+        if (!agent) throw new Error("机器人不存在");
+        return authorizeBotFromAdmin(agentId, agent.configDir, authorization);
       },
       snapshot: () => state.snapshot(),
       resetSession: (groupId, agentId) => {

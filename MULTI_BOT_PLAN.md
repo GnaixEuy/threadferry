@@ -575,6 +575,9 @@ default	codex	default	/Users/gnaixeuy/Desktop/ThreadFerry	aibS5gFrdrjbT-Fluj16Lw
       且去重修复生效后每条消息仍只有一条 turn）。新增 `src/group-fanout.ts`：收到回调的 Agent
       在进程内把同一条消息转交给其他被 @ 到且绑了该群的 Agent，各自用自己的凭据回复；
       重复投递由按 Agent 的 turn 去重兜住
+- [x] 管理台机器人新增链路补全（0.21.0）：页面统一改称「机器人管理」；添加时可覆盖独立
+      `config_dir`，并直接选择扫码、Bot ID / Secret 或稍后授权。扫码复用 wecom-cli 官方浏览器流程，
+      手工 Secret 仅经 localhost + CSRF 保护的 POST 临时转交给 wecom-cli，不进入配置、日志、状态或 URL
 - [x] 提交并发版：0.16.0 已发布；0.17.0 经 PR #11 合入 main，Build 通过后打 `v0.17.0`，
       Release 工作流产出 `threadferry.tgz` + `SHA256SUMS`，校验和与包内版本已核验
 - [ ] Phase 1c 已主动放弃，见上方说明

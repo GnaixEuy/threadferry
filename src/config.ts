@@ -41,6 +41,9 @@ function validateAgent(agentId: string, agent: AgentDefinition): void {
   if (agent.model !== undefined && (!agent.model.trim() || agent.model.length > 256 || /[\r\n]/.test(agent.model))) {
     throw new Error(`Agent ${agentId} 的 model 无效`);
   }
+  if (agent.configDir !== undefined && !isAbsolute(agent.configDir)) {
+    throw new Error(`Agent ${agentId} 的 config_dir 必须是绝对路径`);
+  }
 }
 
 export function onboardingDefaults(current: ThreadFerryConfig | undefined, cwd: string): {

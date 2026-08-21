@@ -24,6 +24,7 @@ test("localhost admin manages agents, groups, and users with CSRF protection", a
   const remembered = new Map([["owner", "苏粤翔"]]);
   const now = new Date().toISOString();
   const resetCalls: string[] = [];
+  const authCalls: Array<{ agentId: string; mode: string; botId?: string; secret?: string }> = [];
   const admin = await startAdminServer(config, {
     updateConfig: async (change) => { await change(config); },
     listGroups: async (agentId) => agentId === "default"
@@ -32,6 +33,9 @@ test("localhost admin manages agents, groups, and users with CSRF protection", a
     botStatus: async (agentId) => agentId === "default"
       ? { authorized: true, botId: "aib-default", botName: "默认助手", ownerName: "苏粤翔", org: "月相工作室" }
       : { authorized: false, hint: `请执行 threadferry agent login ${agentId}` },
+    authorizeBot: async (agentId, authorization) => {
+      authCalls.push({ agentId, ...authorization });
+    },
     searchUsers: async (keywords) => keywords.includes("张三")
       ? [{ id: "zhangsan", name: "张三", matchedKeywords: ["张三"] }]
       : [],
@@ -56,6 +60,12 @@ test("localhost admin manages agents, groups, and users with CSRF protection", a
   const overview = await (await fetch(`${admin.url}/`)).text();
   assert.match(overview, /ThreadFerry 管理台/);
   assert.match(overview, /概览/);
+  assert.match(overview, /class="app-shell"/);
+  assert.match(overview, /class="sidebar"/);
+  assert.match(overview, /aria-current="page"/);
+  assert.match(overview, /data-theme-toggle/);
+  assert.match(overview, /class="sidebar-bottom"/);
+  assert.doesNotMatch(overview, /class="top-actions"/);
   assert.match(overview, /待绑定群/);
   assert.match(overview, /新群/);
   assert.match(overview, /排队 \/ 运行中/);
@@ -64,12 +74,16 @@ test("localhost admin manages agents, groups, and users with CSRF protection", a
   assert.match(overview, /最近 Activity[\s\S]*action\.read[\s\S]*doc:doc-1/);
 
   const agentsPage = await (await fetch(`${admin.url}/agents`)).text();
-  assert.match(agentsPage, /Agent 工作区/);
+  assert.match(agentsPage, /机器人管理/);
   assert.match(agentsPage, /default/);
   assert.match(agentsPage, /AI Coding/);
   // 添加表单只在对话框里，页面上只留一个按钮；默认关着。
   assert.match(agentsPage, /data-dialog="add-agent"/);
   assert.match(agentsPage, /<dialog id="add-agent" class="modal"/);
+  assert.match(agentsPage, /name="configDir"/);
+  assert.match(agentsPage, /name="authMode" value="qr" checked/);
+  assert.match(agentsPage, /name="botId"/);
+  assert.match(agentsPage, /name="secret" type="password"/);
   assert.doesNotMatch(agentsPage, /aria-labelledby="add-agent-title" open/);
   assert.match(await (await fetch(`${admin.url}/agents?new=1`)).text(), /aria-labelledby="add-agent-title" open/);
 
@@ -81,7 +95,9 @@ test("localhost admin manages agents, groups, and users with CSRF protection", a
   const script = await fetch(`${admin.url}/admin.js`);
   assert.equal(script.status, 200);
   assert.match(script.headers.get("content-type") ?? "", /javascript/);
-  assert.match(await script.text(), /showModal/);
+  const clientScript = await script.text();
+  assert.match(clientScript, /showModal/);
+  assert.match(clientScript, /threadferry-theme/);
 
   const first = await fetch(`${admin.url}/groups`);
   const page = await first.text();
@@ -90,25 +106,33 @@ test("localhost admin manages agents, groups, and users with CSRF protection", a
   assert.match(first.headers.get("content-security-policy") ?? "", /script-src 'self'/);
   assert.match(page, /AI Coding/);
   assert.match(page, /待绑定/);
-  assert.match(page, /重置 Session/);
-  assert.match(page, /解绑/);
-  // 群卡片按 Agent 分段，标出这个群启用了几台机器人。
-  assert.match(page, /1 台机器人已启用/);
-  assert.match(page, /仅授权成员/);
-  assert.match(page, /开启全员可用/);
+  assert.match(page, /href="\/groups">↻ 刷新群列表<\/a>/);
+  assert.match(page, /class="list-panel"/);
+  assert.match(page, /href="\/groups\/detail\?id=group"/);
+  assert.match(page, /href="\/groups\/detail\?id=new-group"/);
+  assert.doesNotMatch(page, /重置 Session|解绑|开启全员可用/);
+
+  const groupDetail = await (await fetch(`${admin.url}/groups/detail?id=group`)).text();
+  assert.match(groupDetail, /返回群聊列表/);
+  assert.match(groupDetail, /重置 Session/);
+  assert.match(groupDetail, /解绑/);
+  assert.match(groupDetail, /1 台机器人已启用/);
+  assert.match(groupDetail, /仅授权成员/);
+  assert.match(groupDetail, /开启全员可用/);
   // 名单里有名字就把名字放主位、加密 id 退成次要信息。
-  assert.match(page, /<b>苏粤翔<\/b><code class="faint">owner<\/code>/);
+  assert.match(groupDetail, /<b>苏粤翔<\/b><code class="faint">owner<\/code>/);
   // 添加用户同样收进对话框，输入框挂着通讯录搜索菜单。
-  assert.match(page, /data-dialog="add-user-0"/);
-  assert.match(page, /<dialog id="add-user-0"/);
-  assert.match(page, /data-picker="users"/);
+  assert.match(groupDetail, /data-dialog="add-user-0"/);
+  assert.match(groupDetail, /<dialog id="add-user-0"/);
+  assert.match(groupDetail, /data-picker="users"/);
   // 候选是复选框：一个群可以一次勾多台机器人。new-group 还没人 @ 过，不能声称机器人在群里。
-  assert.match(page, /<input type="checkbox" id="bind-0-0" name="agentId" value="default" checked>/);
-  assert.match(page, /绑定所选/);
-  assert.doesNotMatch(page, /id="add-user-0"[^>]*open>/);
+  const pendingDetail = await (await fetch(`${admin.url}/groups/detail?id=new-group`)).text();
+  assert.match(pendingDetail, /<input type="checkbox" id="bind-0-0" name="agentId" value="default" checked>/);
+  assert.match(pendingDetail, /绑定所选/);
+  assert.doesNotMatch(groupDetail, /id="add-user-0"[^>]*open>/);
   // 对话框按「Agent + 群」定位：同一个群里两台机器人各有各的添加入口。
   const userKey = encodeURIComponent("default\ngroup");
-  assert.match(await (await fetch(`${admin.url}/groups?user=${userKey}`)).text(), /id="add-user-0"[^>]*open>/);
+  assert.match(await (await fetch(`${admin.url}/groups/detail?id=group&user=${userKey}`)).text(), /id="add-user-0"[^>]*open>/);
 
   const found = await (await fetch(`${admin.url}/api/users?q=${encodeURIComponent("张三")}`)).json();
   assert.deepEqual(found.users.map((user: { id: string }) => user.id), ["zhangsan"]);
@@ -120,7 +144,7 @@ test("localhost admin manages agents, groups, and users with CSRF protection", a
     request.end();
   });
   assert.equal(hostileStatus, 403);
-  const csrf = page.match(/name="csrf" value="([a-f0-9]{64})"/)?.[1];
+  const csrf = groupDetail.match(/name="csrf" value="([a-f0-9]{64})"/)?.[1];
   assert.ok(csrf);
 
   const post = (path: string, values: Record<string, string>, withCsrf = true) => fetch(admin.url + path, {
@@ -133,11 +157,34 @@ test("localhost admin manages agents, groups, and users with CSRF protection", a
   assert.equal((await post("/agents/add", { agentId: "blocked", runtime: "pi", workspace }, false)).status, 403);
   assert.equal(config.agents.blocked, undefined);
 
-  const added = await post("/agents/add", { agentId: "reviewer", runtime: "pi", workspace, model: "provider/model" });
+  const badSecret = await post("/agents/add", {
+    agentId: "bad-secret", runtime: "pi", workspace, authMode: "manual", botId: "aib-bad", secret: "",
+  });
+  assert.match(badSecret.headers.get("location") ?? "", /error=/);
+  assert.equal(config.agents["bad-secret"], undefined);
+  const badConfigDir = await post("/agents/add", {
+    agentId: "bad-config", runtime: "pi", workspace, authMode: "later", configDir: "relative/wecom",
+  });
+  assert.match(badConfigDir.headers.get("location") ?? "", /error=/);
+  assert.equal(config.agents["bad-config"], undefined);
+
+  const configDir = join(root, "reviewer-wecom");
+  const added = await post("/agents/add", {
+    agentId: "reviewer",
+    runtime: "pi",
+    workspace,
+    model: "provider/model",
+    configDir,
+    authMode: "manual",
+    botId: "aib-reviewer",
+    secret: "super-secret",
+  });
   assert.equal(added.status, 303);
   assert.match(added.headers.get("location") ?? "", /^\/agents\?ok=/);
+  assert.doesNotMatch(added.headers.get("location") ?? "", /super-secret|aib-reviewer/);
   // 新增 Agent 的机器人还没授权，Owner 先继承主 Agent 的；该 Agent 授权后启动时会提示更正。
-  assert.deepEqual(config.agents.reviewer, { runtime: "pi", workspace, model: "provider/model", ownerUser: "owner" });
+  assert.deepEqual(config.agents.reviewer, { runtime: "pi", workspace, model: "provider/model", configDir, ownerUser: "owner" });
+  assert.deepEqual(authCalls, [{ agentId: "reviewer", mode: "manual", botId: "aib-reviewer", secret: "super-secret" }]);
 
   // 1:1 之后没有「切换 Agent」这个路由：换 Agent 等于换机器人，而那台机器人未必在这个群。
   assert.equal((await post("/groups/agent", { groupId: "group", agentId: "reviewer" })).status, 404);
@@ -152,13 +199,20 @@ test("localhost admin manages agents, groups, and users with CSRF protection", a
   assert.match(agentCards, /Owner <b>苏粤翔<\/b>/);
   assert.match(agentCards, /threadferry agent login reviewer/);
   assert.match(agentCards, /Owner[\s\S]*owner/);
+  assert.match(agentCards, /授权机器人/);
+  assert.doesNotMatch(agentCards, /super-secret/);
+
+  const qr = await post("/agents/auth", { agentId: "reviewer", authMode: "qr" });
+  assert.equal(qr.status, 303);
+  assert.match(qr.headers.get("location") ?? "", /^\/agents\?ok=/);
+  assert.deepEqual(authCalls.at(-1), { agentId: "reviewer", mode: "qr" });
 
   // 名单是「群 + Agent」的，所以每个写操作都带 agentId。
   await post("/groups/users/add", { groupId: "group", agentId: "default", user: "张三" });
   assert.deepEqual(config.groups.group?.agents.default?.allowUsers, ["owner", "zhangsan"]);
   // 按姓名添加成功的那一刻就记下映射，列表里立刻能显示名字。
   assert.equal(remembered.get("zhangsan"), "张三");
-  assert.match(await (await fetch(`${admin.url}/groups`)).text(), /<b>张三<\/b><code class="faint">zhangsan<\/code>/);
+  assert.match(await (await fetch(`${admin.url}/groups/detail?id=group`)).text(), /<b>张三<\/b><code class="faint">zhangsan<\/code>/);
   await post("/groups/users/remove", { groupId: "group", agentId: "default", userId: "zhangsan" });
   assert.deepEqual(config.groups.group?.agents.default?.allowUsers, ["owner"]);
   const ownerRemoval = await post("/groups/users/remove", { groupId: "group", agentId: "default", userId: "owner" });
@@ -166,9 +220,9 @@ test("localhost admin manages agents, groups, and users with CSRF protection", a
   assert.deepEqual(config.groups.group?.agents.default?.allowUsers, ["owner"]);
 
   const accessOn = await post("/groups/access", { groupId: "group", agentId: "default", allowAll: "on" });
-  assert.match(accessOn.headers.get("location") ?? "", /^\/groups\?ok=.*#group$/);
+  assert.match(accessOn.headers.get("location") ?? "", /^\/groups\/detail\?id=group&ok=/);
   assert.equal(config.groups.group?.agents.default?.allowAll, true);
-  assert.match(await (await fetch(`${admin.url}/groups`)).text(), /全员可用/);
+  assert.match(await (await fetch(`${admin.url}/groups/detail?id=group`)).text(), /全员可用/);
   const accessOff = await post("/groups/access", { groupId: "group", agentId: "default", allowAll: "off" });
   assert.equal(accessOff.status, 303);
   assert.equal(config.groups.group?.agents.default?.allowAll, undefined);
@@ -193,7 +247,7 @@ test("localhost admin manages agents, groups, and users with CSRF protection", a
   // Session 也是按「群 + Agent」的：同群两台机器人不能互相清掉对方的。
   const reset = await post("/groups/session/reset", { groupId: "group", agentId: "default" });
   assert.equal(reset.status, 303);
-  assert.match(reset.headers.get("location") ?? "", /^\/groups\?ok=.*#group$/);
+  assert.match(reset.headers.get("location") ?? "", /^\/groups\/detail\?id=group&ok=/);
   assert.deepEqual(resetCalls, ["group:default"]);
 
   const unbound = await post("/groups/unbind", { groupId: "new-group", agentId: "default" });
@@ -320,12 +374,13 @@ test("group discovery reports failures and explains an empty list instead of cla
   assert.match(groups, /群查询失败/);
   assert.match(groups, /errcode 853006/);
   assert.match(groups, /并不完整/);
-  // 未确认的群仍然可以绑定，但不能声称机器人在群里；确认过的才带标记。
+  // 列表只做导航，绑定控件进入群详情后才出现。
   assert.match(groups, /月相工作室/);
-  // 两个群卡片各一组复选框；确认过的带「机器人已在群」标记。
-  assert.match(groups, /name="agentId" value="alpha"/);
-  assert.match(groups, /value="alpha"[^>]*>[\s\S]{0,80}机器人已在群/);
-  assert.match(groups, /绑定后在群里 @ 一次机器人/);
+  assert.doesNotMatch(groups, /name="agentId" value="alpha"/);
+  const seenDetail = await (await fetch(`${admin.url}/groups/detail?id=seen-group`)).text();
+  assert.match(seenDetail, /name="agentId" value="alpha"/);
+  assert.match(seenDetail, /value="alpha"[^>]*>[\s\S]{0,80}机器人已在群/);
+  assert.match(seenDetail, /绑完即可 @ 使用/);
 
   const empty = await startAdminServer(config, {
     updateConfig: async (change) => { await change(config); },
