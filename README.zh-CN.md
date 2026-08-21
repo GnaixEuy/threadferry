@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="./docs/assets/threadferry-hero.png" alt="ThreadFerry 将本地 AI Agent 连接到企业微信" width="100%">
+  <img src="./docs/assets/threadferry-hero-v2.png" alt="ThreadFerry 将 Codex、Pi、Claude 和 Grok 连接到企业微信" width="100%">
 </p>
 
 <p align="center">
@@ -17,8 +17,9 @@ Workspace、Runtime 和 Session，严格 1:1，互不串用。
 
 ## 安装
 
-需要 macOS 或 Linux、Node.js 22+、企业微信智能机器人，以及 Codex CLI `0.138.0+` 或
-Pi CLI `0.84.2+`。安装器会在需要时补装企业微信官方 `wecom-cli 1.1.0+`。
+需要 macOS 或 Linux、Node.js 22+、企业微信智能机器人，以及以下任一 Runtime：Codex CLI
+`0.138.0+`、Pi CLI `0.84.2+`、Claude Code `2.1.233+` 或 Grok Build `1.0.5+`。
+安装器会在需要时补装企业微信官方 `wecom-cli 1.1.0+`。
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/GnaixEuy/threadferry/main/install.sh | bash
@@ -65,6 +66,16 @@ threadferry agent add --name reviewer --runtime pi --workspace /absolute/path/to
 threadferry agent login reviewer
 ```
 
+原生 Claude Code 和 Grok Build 使用本机已有登录与模型，也可以在管理台选择：
+
+```sh
+claude auth login
+threadferry agent add --name claude-reviewer --runtime claude --workspace /absolute/path/to/project
+
+grok login
+threadferry agent add --name grok-reviewer --runtime grok --workspace /absolute/path/to/project
+```
+
 私聊要管理的机器人，发送以下命令：
 
 | 命令 | 用途 |
@@ -92,7 +103,8 @@ Owner 的 Agent 之间交接任务。每个动作都要通过身份、会话、�
 - 每台机器人只接受自己 Owner 的私聊 Agent 请求。
 - 未配置群、未授权用户和没有 `@机器人` 的消息不会启动 Runtime。
 - Agent 之间不共享凭据、Session、群历史或 Workspace。
-- Codex 禁用网络和文件写入；Pi 只开放经过路径守卫的 `read` 和 `ls`。
+- Codex 禁用网络和文件写入；Pi 只开放经过路径守卫的 `read` 和 `ls`；Claude Code 使用 Safe Mode
+  与只读工具；Grok Build 使用 strict sandbox 与只读工具，并关闭 Web、子 Agent 和 Memory。
 - Runtime 不能提交、推送、部署、删除文件，也不能执行任意企业微信操作。
 - 机器人凭据保存在各 Agent 的官方 `wecom-cli` 加密存储中。ThreadFerry 不会把 Bot Secret
   写入配置、日志、状态、URL 或环境变量。

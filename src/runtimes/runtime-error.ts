@@ -14,6 +14,7 @@ function messageOf(value: unknown): string | undefined {
   const record = value as Record<string, unknown>;
   if (typeof record.message === "string") return record.message;
   if (typeof record.error === "string") return record.error;
+  if (typeof record.result === "string") return record.result;
   if (record.error && typeof record.error === "object") {
     const nested = (record.error as Record<string, unknown>).message;
     if (typeof nested === "string") return nested;
@@ -33,9 +34,10 @@ export function structuredRuntimeError(stdout: string): string | undefined {
       continue;
     }
     if (!event || typeof event !== "object") continue;
-    const type = (event as Record<string, unknown>).type;
-    if (type !== "error" && type !== "turn.failed") continue;
-    const message = messageOf(event) ?? messageOf((event as Record<string, unknown>).item);
+    const record = event as Record<string, unknown>;
+    const type = record.type;
+    if (type !== "error" && type !== "turn.failed" && record.is_error !== true) continue;
+    const message = messageOf(event) ?? messageOf(record.item);
     if (message?.trim()) found = message.trim();
   }
   return found;

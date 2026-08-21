@@ -4,6 +4,32 @@ ThreadFerry 的每个 GitHub Release 都使用这里对应版本的内容，不�
 
 ## Unreleased
 
+## 0.23.0
+
+新增 Claude Code 与 Grok Build 原生 Runtime，在保留每个 Agent 独立 Workspace 和 Session 的同时，
+继续执行 ThreadFerry 的只读与敏感文件保护边界。
+
+### 主要变化
+
+- `runtime` 新增 `claude` 和 `grok`，可从初始化向导、终端参数、本机管理台或 v6 配置选择。
+- Claude Code 使用 Safe Mode、`dontAsk` 和只读工具白名单；Grok Build 使用 strict sandbox、
+  `dontAsk`、只读工具白名单，并关闭 Web、子 Agent、Memory 和自动更新。
+- 两个 Runtime 都支持模型覆盖、持久 Session 和中断信号，机器输出只提取最终回复，不把机器人凭据
+  或企业微信参数传入 Runtime 环境。
+- `threadferry start` 和 `threadferry doctor` 会检查对应 CLI 版本与登录状态，并给出可执行的登录提示。
+- 中英文 README、配置示例和真实验收清单已同步四 Runtime，并换用对应的产品主图。
+
+### 安装与升级
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/GnaixEuy/threadferry/main/install.sh | bash
+```
+
+Claude Runtime 需要 Claude Code `2.1.233+` 并执行 `claude auth login`；Grok Runtime 需要 Grok Build
+`1.0.5+` 并执行 `grok login`。现有 Codex、Pi、配置格式和机器人凭据无需迁移。
+
+[查看 v0.22.0...v0.23.0 的完整变更](https://github.com/GnaixEuy/threadferry/compare/v0.22.0...v0.23.0)
+
 ## 0.22.0
 
 重做本机管理台与项目首页：机器人可以在管理台内完成新增和授权，群聊配置改为清晰的列表与详情页，

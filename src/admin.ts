@@ -8,6 +8,7 @@ import { CLIENT_SCRIPT, STYLESHEET } from "./admin-assets.js";
 import { addAgent, resolveWorkspace } from "./config.js";
 import { resolveDirectoryUser } from "./directory.js";
 import type { StateSnapshot } from "./state.js";
+import { isRuntimeName } from "./types.js";
 import type { DirectoryUser, GroupAccess, GroupBinding, RuntimeName, ThreadFerryConfig } from "./types.js";
 
 export type ConfigUpdater = (change: (latest: ThreadFerryConfig) => void | Promise<void>) => Promise<void>;
@@ -494,7 +495,7 @@ function addAgentDialog(
         <div class="fields">
           <label class="field"><span>机器人名称</span><input name="agentId" value="${html(prefill.name)}" maxlength="128" placeholder="1-128 个字符，支持中文和空格" required autofocus></label>
           <label class="field"><span>Runtime</span><select name="runtime">
-            <option value="codex"${prefill.runtime === "codex" ? " selected" : ""}>Codex</option><option value="pi"${prefill.runtime === "pi" ? " selected" : ""}>Pi</option>
+            <option value="codex"${prefill.runtime === "codex" ? " selected" : ""}>Codex</option><option value="pi"${prefill.runtime === "pi" ? " selected" : ""}>Pi</option><option value="claude"${prefill.runtime === "claude" ? " selected" : ""}>Claude Code</option><option value="grok"${prefill.runtime === "grok" ? " selected" : ""}>Grok Build</option>
           </select></label>
           <div class="field">
             <label for="add-agent-workspace">Workspace</label>
@@ -567,9 +568,10 @@ async function agentsPage(config: ThreadFerryConfig, dependencies: AdminDependen
     }
   }
   const total = Object.keys(config.agents).length;
+  const requestedRuntime = url.searchParams.get("runtime")?.trim() ?? "";
   const prefill = {
     name: url.searchParams.get("name")?.trim() ?? "",
-    runtime: url.searchParams.get("runtime")?.trim() === "pi" ? "pi" : "codex",
+    runtime: isRuntimeName(requestedRuntime) ? requestedRuntime : "codex",
     model: url.searchParams.get("model")?.trim() ?? "",
     workspace: url.searchParams.get("workspace")?.trim() ?? "",
     configDir: url.searchParams.get("configDir")?.trim() ?? "",
@@ -811,7 +813,7 @@ export async function startAdminServer(
         })}`;
         const agentId = required(input, "agentId");
         const runtime = required(input, "runtime") as RuntimeName;
-        if (runtime !== "codex" && runtime !== "pi") throw new Error("runtime 仅支持 codex 或 pi");
+        if (!isRuntimeName(runtime)) throw new Error("runtime 仅支持 codex、pi、claude 或 grok");
         const workspace = await resolveWorkspace(required(input, "workspace"));
         const model = input.get("model")?.trim() || undefined;
         const configDir = input.get("configDir")?.trim() || undefined;

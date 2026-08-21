@@ -27,7 +27,9 @@ import {
 import { fetchWecomHistory } from "./history/wecom-cli.js";
 import { describeIdentity, fetchWecomIdentity } from "./identity.js";
 import { runCommand } from "./process.js";
+import { runClaude } from "./runtimes/claude.js";
 import { runCodex } from "./runtimes/codex.js";
+import { runGrok } from "./runtimes/grok.js";
 import { runPi } from "./runtimes/pi.js";
 import { acquireHostLock, defaultStatePath, newErrorId, sessionScope, ThreadFerryState } from "./state.js";
 import {
@@ -42,19 +44,20 @@ import {
   waitForPair,
   type SetupPlan,
 } from "./setup-wizard.js";
-import type { AgentView, CommandRunner, GroupMessage, IncomingMention, RuntimeName, ThreadFerryConfig } from "./types.js";
+import { isRuntimeName, RUNTIME_NAMES } from "./types.js";
+import type { AgentView, CommandRunner, GroupMessage, IncomingMention, RuntimeName, RuntimeRequest, RuntimeResult, ThreadFerryConfig } from "./types.js";
 import { findUpdate, installUpdate } from "./update.js";
 import { runWorkflowTick } from "./workflow.js";
 
-const VERSION = "0.22.0";
+const VERSION = "0.23.0";
 const UPDATE_INTERVAL_MS = 6 * 60 * 60 * 1_000;
 const WORKFLOW_INTERVAL_MS = 30_000;
 const USAGE = `ThreadFerry ${VERSION}
 
 Usage:
   threadferry onboard [--config <path>] [--timeout <seconds>]
-  threadferry setup [--workspace <absolute-path>] [--agent <name>] [--runtime codex|pi] [--model <id>] [--config <path>] [--timeout <seconds>]
-  threadferry agent add --name <name> --runtime codex|pi --workspace <absolute-path> [--model <id>] [--config <path>]
+  threadferry setup [--workspace <absolute-path>] [--agent <name>] [--runtime codex|pi|claude|grok] [--model <id>] [--config <path>] [--timeout <seconds>]
+  threadferry agent add --name <name> --runtime codex|pi|claude|grok --workspace <absolute-path> [--model <id>] [--config <path>]
   threadferry agent list [--config <path>]
   threadferry agent login <name> [--config <path>]
   threadferry doctor [--config <path>]
@@ -159,9 +162,18 @@ function wecomRunner(configDir: string): CommandRunner {
 }
 
 function runtimeName(input: string | undefined): RuntimeName {
-  if (input === undefined || input === "codex") return "codex";
-  if (input === "pi") return "pi";
-  throw new Error("--runtime 仅支持 codex 或 pi");
+  if (input === undefined) return "codex";
+  if (isRuntimeName(input)) return input;
+  throw new Error(`--runtime 仅支持 ${RUNTIME_NAMES.join("、")}`);
+}
+
+function runAgentRuntime(request: RuntimeRequest): Promise<RuntimeResult> {
+  switch (request.runtime) {
+    case "codex": return runCodex(request);
+    case "pi": return runPi(request);
+    case "claude": return runClaude(request);
+    case "grok": return runGrok(request);
+  }
 }
 
 function adminPort(input: string | undefined): number {
@@ -253,6 +265,34 @@ async function preflightDependencies(runtimes: Set<RuntimeName>): Promise<void> 
       throw new Error("找不到 Pi CLI 0.84.2+；请安装 @earendil-works/pi-coding-agent 并完成模型授权");
     }
     if (!atLeast(version, [0, 84, 2])) throw new Error("ThreadFerry 要求 pi 0.84.2+");
+  }
+  if (runtimes.has("claude")) {
+    let version: string;
+    try {
+      version = (await runCommand("claude", ["--version"], { timeoutMs: 10_000 })).stdout;
+    } catch {
+      throw new Error("找不到 Claude Code 2.1.233+；请安装并运行 claude auth login");
+    }
+    if (!atLeast(version, [2, 1, 233])) throw new Error("ThreadFerry 要求 Claude Code 2.1.233+");
+    try {
+      await runCommand("claude", ["auth", "status"], { timeoutMs: 10_000 });
+    } catch {
+      throw new Error("Claude Code 尚未登录；请先运行 claude auth login");
+    }
+  }
+  if (runtimes.has("grok")) {
+    let version: string;
+    try {
+      version = (await runCommand("grok", ["--version"], { timeoutMs: 10_000 })).stdout;
+    } catch {
+      throw new Error("找不到 Grok Build 1.0.5+；请安装并运行 grok login");
+    }
+    if (!atLeast(version, [1, 0, 5])) throw new Error("ThreadFerry 要求 Grok Build 1.0.5+");
+    try {
+      await runCommand("grok", ["models"], { timeoutMs: 30_000 });
+    } catch {
+      throw new Error("Grok Build 尚未登录；请先运行 grok login");
+    }
   }
 }
 
@@ -440,7 +480,7 @@ async function onboard(configOption?: string, timeoutMs?: number): Promise<void>
       return answer || fallback;
     };
     const pickRuntimeWorkspaceModel = async (agentId: string) => {
-      const runtime = runtimeName((await ask("Runtime (codex/pi)", existing?.agents[agentId]?.runtime ?? "codex")).toLowerCase());
+      const runtime = runtimeName((await ask("Runtime (codex/pi/claude/grok)", existing?.agents[agentId]?.runtime ?? "codex")).toLowerCase());
       const workspace = await resolveWorkspace(await ask("Workspace 绝对路径", existing?.agents[agentId]?.workspace ?? process.cwd()));
       const model = await askModel(existing?.agents[agentId]?.model);
       return { runtime, workspace, ...(model ? { model } : {}) } as Omit<SetupPlan, "reused">;
@@ -674,6 +714,36 @@ async function doctor(configPath?: string): Promise<boolean> {
       checks.push({ ok: false, message: "找不到 Pi CLI；请安装 @earendil-works/pi-coding-agent 并完成模型授权" });
     }
   }
+  if (configuredRuntimes.has("claude")) {
+    try {
+      const { stdout } = await runCommand("claude", ["--version"], { timeoutMs: 10_000 });
+      const supported = atLeast(stdout, [2, 1, 233]);
+      checks.push({ ok: supported, message: supported ? stdout.trim() : `${stdout.trim()}；ThreadFerry 要求 Claude Code 2.1.233+` });
+      try {
+        await runCommand("claude", ["auth", "status"], { timeoutMs: 10_000 });
+        checks.push({ ok: true, message: "Claude Code 登录有效（详情未显示）" });
+      } catch {
+        checks.push({ ok: false, message: "Claude Code 尚未登录；请先运行 claude auth login" });
+      }
+    } catch {
+      checks.push({ ok: false, message: "找不到 Claude Code；请安装并执行 claude auth login" });
+    }
+  }
+  if (configuredRuntimes.has("grok")) {
+    try {
+      const { stdout } = await runCommand("grok", ["--version"], { timeoutMs: 10_000 });
+      const supported = atLeast(stdout, [1, 0, 5]);
+      checks.push({ ok: supported, message: supported ? stdout.trim() : `${stdout.trim()}；ThreadFerry 要求 Grok Build 1.0.5+` });
+      try {
+        await runCommand("grok", ["models"], { timeoutMs: 30_000 });
+        checks.push({ ok: true, message: "Grok Build 登录有效（详情未显示）" });
+      } catch {
+        checks.push({ ok: false, message: "Grok Build 尚未登录；请先运行 grok login" });
+      }
+    } catch {
+      checks.push({ ok: false, message: "找不到 Grok Build；请安装并执行 grok login" });
+    }
+  }
 
   for (const check of checks) console.log(`${check.ok ? "[ok]" : "[error]"} ${check.message}`);
   return checks.every((check) => check.ok);
@@ -897,7 +967,7 @@ async function start(
       await confirmOwnerIdentity(config, agentId, updateConfig);
       const app = createApp(view, {
       history: (groupId, options) => fetchWecomHistory(groupId, options, runner),
-      runtime: (request) => request.runtime === "codex" ? runCodex(request) : runPi(request),
+      runtime: runAgentRuntime,
       // 写回只动「这个 host 的 Agent」那一份：同群的另一台机器人有它自己的名单和开关。
       updateAllowUsers: (groupId, users) => updateConfig((latest) => {
         const access = latest.groups[groupId]?.agents[agentId];

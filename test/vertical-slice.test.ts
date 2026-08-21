@@ -8,7 +8,9 @@ import { listWecomGroups, runWecomAction, searchWecomUsers, sendWecomReply, stan
 import { addAgent, agentView, loadConfig, onboardingDefaults, pairConfig, refreshAgentView, resolveWorkspace, saveConfig, setupConfig } from "../src/config.js";
 import { fetchWecomHistory } from "../src/history/wecom-cli.js";
 import { CommandExecutionError, runCommand } from "../src/process.js";
+import { runClaude } from "../src/runtimes/claude.js";
 import { runCodex } from "../src/runtimes/codex.js";
+import { runGrok } from "../src/runtimes/grok.js";
 import { allowedReadPath } from "../src/runtimes/pi-readonly-extension.js";
 import { runPi } from "../src/runtimes/pi.js";
 import { ThreadFerryState } from "../src/state.js";
@@ -1036,6 +1038,14 @@ test("the v6 disk format round-trips agents, their groups and credential overrid
     "      g2:",
     "        allow_users: [woOWNER]",
     "        allow_all: true",
+    "  claude-reviewer:",
+    "    runtime: claude",
+    `    workspace: ${JSON.stringify(workspace)}`,
+    "    owner_user: woOWNER",
+    "  grok-reviewer:",
+    "    runtime: grok",
+    `    workspace: ${JSON.stringify(workspace)}`,
+    "    owner_user: woOWNER",
     "",
   ].join("\n"));
 
@@ -1058,6 +1068,8 @@ test("the v6 disk format round-trips agents, their groups and credential overrid
   assert.deepEqual(Object.keys(fromV6.groups.g2!.agents), ["reviewer"]);
   assert.equal(fromV6.groups.g2?.agents.reviewer?.allowAll, true);
   assert.equal(fromV6.agents.reviewer?.model, "provider/model");
+  assert.equal(fromV6.agents["claude-reviewer"]?.runtime, "claude");
+  assert.equal(fromV6.agents["grok-reviewer"]?.runtime, "grok");
 
   // config_dir 往返保留。
   fromV6.agents.reviewer!.configDir = join(workspace, "creds");
@@ -1455,6 +1467,56 @@ test("Pi uses only guarded read tools and parses its machine-readable result", a
     assert.ok(received?.args.includes(flag));
   }
   assert.equal(received?.args[received.args.indexOf("--model") + 1], "provider/model");
+});
+
+test("Claude Code runs headlessly with only read tools and resumes its session", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "threadferry-claude-test-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const workspace = await realpath(root);
+  let received: { command: string; args: string[]; cwd?: string; input?: string; secret?: string } | undefined;
+  const runner: CommandRunner = async (command, args, options) => {
+    received = { command, args, cwd: options?.cwd, input: options?.input, secret: options?.env?.THREADFERRY_WECOM_BOT_SECRET };
+    return { stdout: JSON.stringify({ type: "result", subtype: "success", result: "Claude 只读分析", session_id: "claude-session" }), stderr: "" };
+  };
+  const result = await runClaude({ workspace, prompt: "分析", model: "sonnet", sessionId: "claude-session" }, runner);
+  assert.deepEqual(result, { text: "Claude 只读分析", sessionId: "claude-session" });
+  assert.equal(received?.command, "claude");
+  assert.equal(received?.cwd, workspace);
+  assert.equal(received?.input, "分析");
+  assert.equal(received?.secret, undefined);
+  for (const flag of ["--safe-mode", "--permission-mode", "--allowedTools", "--disallowedTools", "--resume"]) {
+    assert.ok(received?.args.includes(flag));
+  }
+  assert.equal(received?.args[received.args.indexOf("--model") + 1], "sonnet");
+
+  const loggedOut: CommandRunner = async () => {
+    throw new CommandExecutionError("claude", 1, JSON.stringify({ type: "result", is_error: true, result: "Not logged in" }), "");
+  };
+  await assert.rejects(runClaude({ workspace, prompt: "分析" }, loggedOut), /Claude：Not logged in/);
+});
+
+test("Grok Build runs in the strict read-only sandbox and creates a resumable session", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "threadferry-grok-test-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const workspace = await realpath(root);
+  let received: { command: string; args: string[]; cwd?: string; input?: string; secret?: string } | undefined;
+  const runner: CommandRunner = async (command, args, options) => {
+    received = { command, args, cwd: options?.cwd, input: options?.input, secret: options?.env?.THREADFERRY_WECOM_BOT_SECRET };
+    const sessionId = args[args.indexOf("--session-id") + 1];
+    return { stdout: JSON.stringify({ text: "Grok 只读分析", sessionId, stopReason: "end_turn" }), stderr: "" };
+  };
+  const result = await runGrok({ workspace, prompt: "分析", model: "grok-4.6" }, runner);
+  assert.equal(result.text, "Grok 只读分析");
+  assert.match(result.sessionId ?? "", /^[0-9a-f-]{36}$/);
+  assert.equal(received?.command, "grok");
+  assert.equal(received?.cwd, workspace);
+  assert.equal(received?.input, "分析");
+  assert.equal(received?.secret, undefined);
+  assert.equal(received?.args[received.args.indexOf("--sandbox") + 1], "strict");
+  assert.equal(received?.args[received.args.indexOf("--permission-mode") + 1], "dontAsk");
+  assert.equal(received?.args[received.args.indexOf("--tools") + 1], "Read,Grep");
+  assert.ok(received?.args.includes("--disable-web-search"));
+  assert.equal(received?.args[received.args.indexOf("--model") + 1], "grok-4.6");
 });
 
 test("Pi read guard rejects workspace escapes, symlinks, and sensitive files", async (t) => {

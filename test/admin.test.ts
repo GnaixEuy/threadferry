@@ -77,6 +77,8 @@ test("localhost admin manages agents, groups, and users with CSRF protection", a
   assert.match(agentsPage, /机器人管理/);
   assert.match(agentsPage, /default/);
   assert.match(agentsPage, /AI Coding/);
+  assert.match(agentsPage, /Claude Code/);
+  assert.match(agentsPage, /Grok Build/);
   // 添加表单只在对话框里，页面上只留一个按钮；默认关着。
   assert.match(agentsPage, /data-dialog="add-agent"/);
   assert.match(agentsPage, /<dialog id="add-agent" class="modal"/);

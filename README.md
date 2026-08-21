@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="./docs/assets/threadferry-hero.png" alt="ThreadFerry connects local AI agents to WeCom" width="100%">
+  <img src="./docs/assets/threadferry-hero-v2.png" alt="ThreadFerry connects Codex, Pi, Claude, and Grok to WeCom" width="100%">
 </p>
 
 <p align="center">
@@ -17,8 +17,9 @@ credentials, groups, workspace, runtime, and sessions — strictly 1:1 and isola
 
 ## Install
 
-Requirements: macOS or Linux, Node.js 22+, a WeCom AI bot, and either Codex CLI `0.138.0+` or
-Pi CLI `0.84.2+`. The installer adds the official `wecom-cli 1.1.0+` when needed.
+Requirements: macOS or Linux, Node.js 22+, a WeCom AI bot, and one runtime: Codex CLI `0.138.0+`,
+Pi CLI `0.84.2+`, Claude Code `2.1.233+`, or Grok Build `1.0.5+`. The installer adds the official
+`wecom-cli 1.1.0+` when needed.
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/GnaixEuy/threadferry/main/install.sh | bash
@@ -66,6 +67,16 @@ threadferry agent add --name reviewer --runtime pi --workspace /absolute/path/to
 threadferry agent login reviewer
 ```
 
+Native Claude Code and Grok Build runtimes reuse the local CLI login and model selection:
+
+```sh
+claude auth login
+threadferry agent add --name claude-reviewer --runtime claude --workspace /absolute/path/to/project
+
+grok login
+threadferry agent add --name grok-reviewer --runtime grok --workspace /absolute/path/to/project
+```
+
 Send management commands in a direct chat with the bot they should affect:
 
 | Command | Purpose |
@@ -95,7 +106,9 @@ require a fresh confirmation code.
 - Direct-agent requests are accepted only from that bot's Owner.
 - Unconfigured groups, unauthorized users, and messages without `@Bot` do not start a runtime.
 - Agents never share credentials, sessions, group history, or workspace access.
-- Codex runs without network or file writes; Pi exposes only path-guarded `read` and `ls`.
+- Codex runs without network or file writes; Pi exposes only path-guarded `read` and `ls`; Claude Code
+  uses Safe Mode and read-only tools; Grok Build uses a strict sandbox and read-only tools with web,
+  subagents, and memory disabled.
 - Runtimes cannot commit, push, deploy, delete files, or invoke arbitrary enterprise actions.
 - Bot credentials stay in each agent's official `wecom-cli` encrypted store. ThreadFerry does not
   persist Bot Secrets in configuration, logs, state, URLs, or environment variables.

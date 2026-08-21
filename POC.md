@@ -55,7 +55,8 @@ Every missing item is reported with a next action. The command must fail until r
 
 1. Install official `wecom-cli 1.1.0+` and run `wecom-cli auth init` for the target enterprise.
 2. Verify `wecom-cli identity whoami --json '{}'` succeeds.
-3. Run `codex login`, then verify `codex --version` is at least `0.138.0`.
+3. 登录所选 Runtime，并确认最低版本：Codex `0.138.0+`、Pi `0.84.2+`、Claude Code `2.1.233+`
+   或 Grok Build `1.0.5+`。
 4. Create an Enterprise WeCom intelligent robot. Group membership is optional until group acceptance begins.
 5. Run `threadferry onboard`. ThreadFerry must NOT prompt for a Bot ID or Bot Secret at any point: authorization goes through `wecom-cli auth init` inside the agent's own credential directory.
 6. Complete the Agent and Workspace prompts, privately send the printed one-time pairing command to the robot, then approve the callback userid in the local terminal. Pairing must not call the directory API.
@@ -66,21 +67,21 @@ Every missing item is reported with a next action. The command must fail until r
 11. Verify the stream first shows the processing acknowledgement and then the final result.
 12. Send two mentions quickly in the same group and verify the second is queued and Runtime executions do not overlap.
 13. Restart ThreadFerry, repeat a handled callback msgid in a controlled test, and verify it is not executed again.
-14. Send a second new mention and verify `threadferry status` reports one persisted Codex Session.
-15. Verify an unconfigured group, a non-allowlisted user, and a message without a robot mention do not start Codex.
-16. Send a new group message while Codex is analyzing and verify ThreadFerry asks for a new mention instead of returning the stale result.
-17. While Codex is analyzing, terminate the ThreadFerry process abnormally, restart it, and verify the terminal logs `正在恢复 1 个上次中断的任务` and the result is actively sent to the original group.
+14. Send a second new mention and verify `threadferry status` reports one persisted Session for the selected Runtime.
+15. Verify an unconfigured group, a non-allowlisted user, and a message without a robot mention do not start the selected Runtime.
+16. Send a new group message while the selected Runtime is analyzing and verify ThreadFerry asks for a new mention instead of returning the stale result.
+17. While the selected Runtime is analyzing, terminate the ThreadFerry process abnormally, restart it, and verify the terminal logs `正在恢复 1 个上次中断的任务` and the result is actively sent to the original group.
 18. Simulate a reply interruption, restart ThreadFerry, and verify it logs `已补发 1 条上次未投递的回复`; `threadferry status` must then show `outbox=0`.
 19. Start a second `threadferry start` process and verify it is rejected with `ThreadFerry 已在运行` without creating another WebSocket consumer.
-20. Send another ordinary message in the same second while Codex runs and verify the completed analysis is marked stale.
-21. Stop ThreadFerry with `Ctrl+C` during Codex execution and verify the child process is cancelled and the task reaches a terminal failure state.
+20. Send another ordinary message in the same second while the selected Runtime runs and verify the completed analysis is marked stale.
+21. Stop ThreadFerry with `Ctrl+C` during Runtime execution and verify the child process is cancelled and the task reaches a terminal failure state.
 22. Have the robot creator privately message the bot with `threadferry groups`; verify configured groups are marked with their Agent and unconfigured ones with `[未配置 Agent]`. Verify `threadferry help` no longer mentions a `use` command or an agent argument for `bind`.
 23. Have the Owner privately send `threadferry add <群名> <姓名>` and verify ThreadFerry resolves the member through `contact users search`, persists the real userid, and grants access without restarting.
 24. Search a duplicated name and verify ThreadFerry does not change the allowlist; it must return candidate departments and `id:<userid>` values for explicit selection.
 25. Have the Owner privately send `threadferry invite <群名>`, then have an unauthorized member privately send `threadferry join <邀请码>` (or send it with `@机器人` in that group); verify access works immediately without restarting ThreadFerry.
 26. Have a non-Owner privately send `threadferry groups`, `threadferry users`, `threadferry invite`, `threadferry add`, and `threadferry remove`; verify none reveals or changes the allowlist.
 27. Send an Owner management command in a group and verify ThreadFerry asks the Owner to use private chat without changing the allowlist.
-28. Have the Owner privately remove the newly authorized member by name and verify its next analysis request returns `unauthorized_user` without starting Codex.
+28. Have the Owner privately remove the newly authorized member by name and verify its next analysis request returns `unauthorized_user` without starting the selected Runtime.
 29. Add a second Pi Agent with `threadferry agent add`, run `threadferry agent login <name>` for it against a SECOND WeCom robot, and verify `threadferry agent list` shows both robots as authorized with different Bot IDs.
 30. Restart `threadferry start` and verify it opens one connection per agent, printing each agent's robot identity, authorized user, and configured Owner. Verify an agent without credentials is reported and skipped rather than silently ignored, and that `--agents <name>` starts only the named agent.
 31. Add the second robot to a different internal group, bind it from that robot's private chat, and verify a mention there runs in the SECOND agent's Workspace with only `read` and `ls`. Verify each agent resumes only its own Session.
@@ -88,9 +89,11 @@ Every missing item is reported with a next action. The command must fail until r
 33. Open `http://127.0.0.1:17638`; verify each Agent card shows its robot authorization state and its own Owner, that binding an unbound group only offers agents whose robot is in that group, and that add/remove of an authorized user updates `~/.threadferry/threadferry.yaml` and affects the next group mention without restarting.
 34. Verify the management server is bound only to `127.0.0.1`, rejects a POST without its CSRF token, and does not expose bot credentials or environment variables.
 35. Verify `~/.threadferry/threadferry.yaml` contains no Bot Secret, and that no `THREADFERRY_WECOM_BOT_*` environment variable is set by ThreadFerry.
+36. 分别用 `runtime: claude` 和 `runtime: grok` 完成一次真实私聊分析，重启后追问并确认恢复的是各自 Session。
+37. 在测试 Workspace 放置 `.env` 和写入诱导指令，确认 Claude/Grok 均不能读取敏感文件、写文件、执行命令、访问 Web 或 MCP。
 
 V0.1 的真实 WebSocket 接收、群历史拉取、Codex 执行和原群回复已在目标企业手工打通。V0.2～V0.9
-新增的队列、Session 续接、崩溃恢复、创建者私聊管理、Pi Runtime、本机管理台、安装向导和项目
+新增的队列、Session 续接、崩溃恢复、创建者私聊管理、Pi/Claude/Grok Runtime、本机管理台、安装向导和项目
 重命名仍需按以上步骤完成真实验收，不能用 Mock 结果代替。
 
 **多机器人（第 29-33 项）尚未真机验收**：需要第二个企业微信机器人。逻辑与隔离已有自动化测试

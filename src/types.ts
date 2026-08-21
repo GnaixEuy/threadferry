@@ -42,7 +42,12 @@ export interface DirectoryUser {
   matchedKeywords?: string[];
 }
 
-export type RuntimeName = "codex" | "pi";
+export const RUNTIME_NAMES = ["codex", "pi", "claude", "grok"] as const;
+export type RuntimeName = typeof RUNTIME_NAMES[number];
+
+export function isRuntimeName(value: string): value is RuntimeName {
+  return RUNTIME_NAMES.includes(value as RuntimeName);
+}
 
 export interface AgentConfig {
   workspace: string;

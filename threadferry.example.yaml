@@ -12,6 +12,8 @@ version: 6
 # 加密保存在 ~/.threadferry/wecom/<Agent名>/，本文件绝不存 Bot Secret。
 agents:
   default:
+    # 可选：codex、pi、claude、grok
+    # Claude 与 Grok 复用本机 CLI 的登录和模型配置。
     runtime: "codex"
     workspace: "/absolute/path/to/project"
     # 该 Agent 机器人下 Owner 的回调 userid。换企业后同一个人的 userid 会变，所以按 Agent 存。

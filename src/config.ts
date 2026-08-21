@@ -3,10 +3,11 @@ import { chmod, lstat, mkdir, readFile, realpath, rename, rm, stat, writeFile } 
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { parse, stringify } from "yaml";
 import { validateAgentId } from "./bots.js";
+import { RUNTIME_NAMES } from "./types.js";
 import type { AgentConfig, AgentDefinition, AgentView, GroupBinding, GroupConfig, RuntimeName, ThreadFerryConfig } from "./types.js";
 
 const USER_ID = /^[A-Za-z0-9_@.-]{1,512}$/;
-const RUNTIMES = new Set<RuntimeName>(["codex", "pi"]);
+const RUNTIMES = new Set<RuntimeName>(RUNTIME_NAMES);
 
 function object(value: unknown, name: string): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
@@ -37,7 +38,7 @@ export async function resolveWorkspace(input: string): Promise<string> {
 function validateAgent(agentId: string, agent: AgentDefinition): void {
   // agentId 同时是机器人凭据目录名（见 src/bots.ts），因此必须目录安全（允许中文，挡路径穿越）。
   validateAgentId(agentId);
-  if (!RUNTIMES.has(agent.runtime)) throw new Error(`Agent ${agentId} 的 runtime 仅支持 codex 或 pi`);
+  if (!RUNTIMES.has(agent.runtime)) throw new Error(`Agent ${agentId} 的 runtime 仅支持 ${RUNTIME_NAMES.join("、")}`);
   if (agent.model !== undefined && (!agent.model.trim() || agent.model.length > 256 || /[\r\n]/.test(agent.model))) {
     throw new Error(`Agent ${agentId} 的 model 无效`);
   }
