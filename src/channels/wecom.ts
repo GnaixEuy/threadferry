@@ -10,7 +10,7 @@ import {
   saveAttachmentResource,
 } from "../attachments.js";
 import { CommandExecutionError, runCommand } from "../process.js";
-import type { AttachmentResource, AttachmentSource, AttachmentType, CommandRunner, DirectoryUser, IncomingMention, IncomingWecomEvent, QuoteMetadata, Reply } from "../types.js";
+import type { AttachmentResource, AttachmentSource, AttachmentType, CommandRunner, DirectoryUser, IncomingDirectMessage, IncomingMention, IncomingWecomEvent, QuoteMetadata, Reply } from "../types.js";
 
 function quoteMetadata(quote: QuoteContent | undefined): QuoteMetadata | undefined {
   if (!quote) return undefined;
@@ -64,6 +64,11 @@ function messageText(body: BaseMessage): string {
   if (body.msgtype === "file") return "[用户发送了一个文件]";
   if (body.msgtype === "video") return "[用户发送了一段视频]";
   return "";
+}
+
+function carriesAttachment(body: BaseMessage): boolean {
+  return body.msgtype === "image" || body.msgtype === "file" || body.msgtype === "video"
+    || (body.msgtype === "mixed" && (body.mixed?.msg_item ?? []).some((item: { msgtype?: string }) => item.msgtype === "image"));
 }
 
 export async function standardizeMessage(frame: WsFrame<BaseMessage>, download: AttachmentDownloader): Promise<IncomingWecomEvent | undefined> {
@@ -154,6 +159,101 @@ export function standardizeAuthChange(frame: WsFrame<unknown>): IncomingWecomEve
   };
 }
 
+// ponytail: 750 ms quiet window identifies one WeCom send burst; use a platform correlation id if the SDK exposes one later.
+const DIRECT_MESSAGE_BUNDLE_MS = 750;
+const RESOURCE_FAILURE_REPLY = "ThreadFerry 已收到消息，但资源下载、解密或分析失败。请在运行 ThreadFerry 的机器上执行 `threadferry doctor` 检查依赖和授权。";
+
+type BufferedWecomMessage = {
+  key?: string;
+  hasAttachment: boolean;
+  event: Promise<IncomingWecomEvent | undefined>;
+  reply: Reply;
+};
+
+function mergeDirectEvents(events: IncomingWecomEvent[]): IncomingWecomEvent {
+  if (!events.every((event) => event.chatType === "single")) throw new Error("只能合并同一私聊的消息");
+  const messages = events.map((event) => event.message as IncomingDirectMessage);
+  const last = messages.at(-1)!;
+  if (!messages.every((message) => message.senderId === last.senderId)) throw new Error("不能合并不同用户的消息");
+  const resources = messages.flatMap((message) => message.resources ?? []);
+  if (resources.length > MAX_ATTACHMENT_COUNT
+    || resources.reduce((total, resource) => total + resource.size, 0) > MAX_ATTACHMENT_TOTAL_BYTES) {
+    throw new Error("企业微信附件超过单轮安全上限");
+  }
+  const message: IncomingDirectMessage = {
+    ...last,
+    text: messages.map(({ text }) => text).filter(Boolean).join("\n"),
+    attachments: messages.flatMap((item) => item.attachments ?? []),
+    resources,
+  };
+  if (!message.attachments?.length) delete message.attachments;
+  if (!message.resources?.length) delete message.resources;
+  return { chatType: "single", message };
+}
+
+export function createWecomMessageDispatcher(
+  handle: (event: IncomingWecomEvent, reply: Reply) => Promise<void>,
+  bundleMs = DIRECT_MESSAGE_BUNDLE_MS,
+): (message: BufferedWecomMessage) => Promise<void> {
+  const pending = new Map<string, {
+    messages: BufferedWecomMessage[];
+    waiters: Array<() => void>;
+    timer: ReturnType<typeof setTimeout>;
+  }>();
+
+  async function fail(reply: Reply): Promise<void> {
+    await reply(RESOURCE_FAILURE_REPLY).catch(() => undefined);
+  }
+
+  async function deliver(messages: BufferedWecomMessage[]): Promise<void> {
+    const settled = await Promise.allSettled(messages.map(({ event }) => event));
+    const events = settled.flatMap((result) => result.status === "fulfilled" && result.value ? [result.value] : []);
+    if (messages.length > 1 && messages.some(({ hasAttachment }) => hasAttachment)) {
+      try {
+        const rejected = settled.find((result) => result.status === "rejected");
+        if (rejected) throw rejected.reason;
+        if (events.length) await handle(mergeDirectEvents(events), messages.at(-1)!.reply);
+      } catch {
+        await fail(messages.at(-1)!.reply);
+      } finally {
+        await cleanupAttachmentResources(events.flatMap((event) => event.message.resources ?? []));
+      }
+      return;
+    }
+    for (const [index, result] of settled.entries()) {
+      const message = messages[index]!;
+      if (result.status === "rejected") {
+        await fail(message.reply);
+        continue;
+      }
+      if (!result.value) continue;
+      try {
+        await handle(result.value, message.reply);
+      } catch {
+        await fail(message.reply);
+      } finally {
+        await cleanupAttachmentResources(result.value.message.resources ?? []);
+      }
+    }
+  }
+
+  return (message) => {
+    if (!message.key) return deliver([message]);
+    const key = message.key;
+    return new Promise<void>((resolve) => {
+      const current = pending.get(key);
+      if (current) clearTimeout(current.timer);
+      const messages = [...(current?.messages ?? []), message];
+      const waiters = [...(current?.waiters ?? []), resolve];
+      const timer = setTimeout(() => {
+        pending.delete(key);
+        void deliver(messages).finally(() => waiters.forEach((waiter) => waiter()));
+      }, bundleMs);
+      pending.set(key, { messages, waiters, timer });
+    });
+  };
+}
+
 /** 一条「加密 userid → 姓名」的映射。通讯录不支持按 userid 反查，只能从别处顺手收集。 */
 export interface WecomPerson {
   id: string;
@@ -176,8 +276,10 @@ const GROUP_WINDOW_MS = 7 * 24 * 60 * 60 * 1000 - 60_000;
 const MAX_GROUP_PAGES = 10;
 const MAX_ACTION_FILE_BYTES = 1024 * 1024;
 const FILE_OUTPUT_ACTIONS = new Set([
+  "disk.files.download",
   "doc.contents.get",
   "mail.get",
+  "media.download",
   "sheet.ranges.get",
   "smartpage.pages.get",
   "meeting.original.get",
@@ -376,18 +478,29 @@ export async function pushWecomMessage(client: WSClient, chatId: string, content
   await client.sendMessage(chatId, { msgtype: "markdown", markdown: { content } });
 }
 
-/**
- * 执行一个白名单动作（见 src/actions.ts）。命令参数由 ThreadFerry 组装并逐项校验过，
- * Runtime 的沙箱不参与——它只负责提议，执行始终在这里，用该 Agent 自己的凭据。
- */
+/** 执行 Broker 已校验的命令；不经过 shell，并始终使用所属 Agent 的独立 runner。 */
 export async function runWecomAction(
   command: string[],
   runner: CommandRunner = runCommand,
   write = true,
 ): Promise<Record<string, unknown>> {
+  const inspection = ["--doc", "--help", "--schema"].includes(command.at(-1) ?? "")
+    && command.length >= 2
+    && command.slice(0, -1).every((part) => /^[a-z][a-z0-9-]*$/.test(part));
+  if (inspection) {
+    const { stdout } = await runner("wecom-cli", command, { timeoutMs: 30_000 });
+    return { documentation: stdout };
+  }
   const jsonIndex = command.indexOf("--json");
   if (command.length === 0 || command.some((part) => typeof part !== "string")
-    || jsonIndex < 0 || command.includes("--dry-run")) {
+    || jsonIndex !== command.length - 2 || command.includes("--dry-run")
+    || command.slice(0, jsonIndex).some((part) => !/^[a-z][a-z0-9-]*$/.test(part))) {
+    throw new Error("动作命令无效");
+  }
+  try {
+    const request = JSON.parse(command.at(-1)!);
+    if (!request || typeof request !== "object" || Array.isArray(request)) throw new Error();
+  } catch {
     throw new Error("动作命令无效");
   }
   if (write) {
@@ -403,7 +516,7 @@ export async function runWecomAction(
     const actual = [...command];
     if (outputDirectory) actual.splice(jsonIndex, 0, "--output-dir", outputDirectory);
     const { stdout } = await runner("wecom-cli", actual, { timeoutMs: 30_000 });
-    const data = envelopeData(stdout, command.slice(0, 3).join("."));
+    const data = envelopeData(stdout, command.slice(0, jsonIndex).join("."));
     return outputDirectory ? await hydrateActionFiles(data, outputDirectory) as Record<string, unknown> : data;
   } finally {
     if (outputDirectory) await rm(outputDirectory, { recursive: true, force: true });
@@ -467,24 +580,17 @@ export function startWecomChannel(
     secret: credentials.secret,
     logger: { debug() {}, info() {}, warn() {}, error() {} },
   });
+  const dispatch = createWecomMessageDispatcher(handle);
   client.on("message", (frame) => {
     const streamId = generateReqId("threadferry");
     const reply: Reply = (content, finish = true) => client.replyStream(frame, streamId, content, finish).then(() => undefined);
-    void (async () => {
-      let event: IncomingWecomEvent | undefined;
-      try {
-        event = await standardizeMessage(frame, (url, aesKey) => client.downloadFile(url, aesKey));
-        if (event) await handle(event, reply);
-      } catch {
-        try {
-          await reply("ThreadFerry 已收到消息，但资源下载、解密或分析失败。请在运行 ThreadFerry 的机器上执行 `threadferry doctor` 检查依赖和授权。");
-        } catch {
-          // SDK 会负责连接错误与重连；不把凭据、资源 URL、密钥或原始帧写入日志。
-        }
-      } finally {
-        if (event) await cleanupAttachmentResources(event.message.resources ?? []);
-      }
-    })();
+    const body = frame.body;
+    void dispatch({
+      key: body?.chattype === "single" ? body.from.userid : undefined,
+      hasAttachment: Boolean(body && carriesAttachment(body)),
+      event: standardizeMessage(frame, (url, aesKey) => client.downloadFile(url, aesKey)),
+      reply,
+    });
   });
   client.on("event", (frame) => {
     const event = standardizeAuthChange(frame);

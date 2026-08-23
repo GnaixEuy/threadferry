@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import { prepareRuntimeResources } from "../attachments.js";
 import { resolveWorkspace } from "../config.js";
 import { runCommand } from "../process.js";
+import { officialWecomSkillPaths } from "../wecom-skills.js";
 import { runtimeFailure, structuredRuntimeError } from "./runtime-error.js";
 import type { CommandRunner, RuntimeRequest, RuntimeResult } from "../types.js";
 
@@ -48,7 +49,8 @@ export async function runPi(
     "--mode", "json", "--print",
     "--tools", "read,ls",
     "--no-extensions", "--extension", extension,
-    "--no-skills", "--no-prompt-templates", "--no-themes", "--no-context-files", "--no-approve",
+    "--no-skills", ...officialWecomSkillPaths().flatMap((path) => ["--skill", path]),
+    "--no-prompt-templates", "--no-themes", "--no-context-files", "--no-approve",
     "--session-dir", sessionDir,
     ...(request.model ? ["--model", request.model] : []),
     ...(request.sessionId ? ["--session-id", request.sessionId] : []),

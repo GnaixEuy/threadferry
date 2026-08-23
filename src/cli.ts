@@ -47,9 +47,10 @@ import {
 import { isRuntimeName, RUNTIME_NAMES } from "./types.js";
 import type { AgentView, CommandRunner, GroupMessage, IncomingMention, RuntimeName, RuntimeRequest, RuntimeResult, ThreadFerryConfig } from "./types.js";
 import { findUpdate, installUpdate } from "./update.js";
+import { installOfficialWecomSkills, officialWecomSkillsInstalled } from "./wecom-skills.js";
 import { runWorkflowTick } from "./workflow.js";
 
-const VERSION = "0.25.1";
+const VERSION = "0.25.2";
 const UPDATE_INTERVAL_MS = 6 * 60 * 60 * 1_000;
 const WORKFLOW_INTERVAL_MS = 30_000;
 const USAGE = `ThreadFerry ${VERSION}
@@ -61,6 +62,7 @@ Usage:
   threadferry agent list [--config <path>]
   threadferry agent login <name> [--config <path>]
   threadferry doctor [--config <path>]
+  threadferry skills install
   threadferry status [--config <path>]
   threadferry update
   threadferry session reset --group <group-id> [--config <path>]
@@ -538,7 +540,7 @@ async function onboard(configOption?: string, timeoutMs?: number): Promise<void>
         const picked = (await askLine(`选择要重新配对的 Agent ${names.join(" / ")} [${names[0]}]: `)).trim();
         const agentId = picked || names[0]!;
         if (!existing.agents[agentId]) throw new Error(`Agent ${agentId} 未配置`);
-        console.log("\n[2/5] 授权企业微信机器人（已有凭据则跳过）");
+        console.log("\n[2/6] 授权企业微信机器人（已有凭据则跳过）");
         const credentials = await authorizeBot(agentId, existing.agents[agentId].configDir);
         const plan = resolveSetupPlan(existing, agentId);
         await claimOwner(configPath, agentId, credentials, plan, existing, timeoutMs);
@@ -547,7 +549,7 @@ async function onboard(configOption?: string, timeoutMs?: number): Promise<void>
         return;
       } else {
         // 新增 Agent：先授权机器人，再用机器人名作 Agent 名（自动，无需输入）。
-        console.log("\n[2/5] 授权企业微信机器人（扫码）");
+        console.log("\n[2/6] 授权企业微信机器人（扫码）");
         const { tempDir, botName } = await authorizeTemp();
         const agentId = await nameFromBot(botName, "新 Agent");
         validateAgentId(agentId);
@@ -559,7 +561,7 @@ async function onboard(configOption?: string, timeoutMs?: number): Promise<void>
       }
     } else {
       // 首次配置：先授权机器人，再用机器人名作 Agent 名（自动，无需输入）。
-      console.log("\n[2/5] 授权企业微信机器人（扫码）");
+      console.log("\n[2/6] 授权企业微信机器人（扫码）");
       const { tempDir, botName } = await authorizeTemp();
       const agentId = await nameFromBot(botName, "Agent");
       validateAgentId(agentId);
@@ -574,7 +576,11 @@ async function onboard(configOption?: string, timeoutMs?: number): Promise<void>
     temporaryDirs.clear();
   }
 
-  console.log("\n[4/5] 运行环境诊断");
+  console.log("\n[4/6] 安装企业微信官方 Skills");
+  await installOfficialWecomSkills();
+  console.log("官方企业微信 Skills 已安装或更新到 ~/.agents/skills。");
+
+  console.log("\n[5/6] 运行环境诊断");
   if (!(await doctor(configPath))) {
     console.error(
       "\n[error] 环境诊断未通过。请根据上面的 [error] 条目修复问题。\n" +
@@ -583,7 +589,7 @@ async function onboard(configOption?: string, timeoutMs?: number): Promise<void>
     throw new Error(`环境诊断未通过；修复后运行 threadferry doctor --config ${configPath} 复查。`);
   }
 
-  console.log("\n[5/5] 启动 ThreadFerry");
+  console.log("\n[6/6] 启动 ThreadFerry");
   const startAnswer = (await askLine("现在启动并保持当前终端运行？[Y/n]: ")).trim().toLowerCase();
   const shouldStart = startAnswer === "" || startAnswer === "y" || startAnswer === "yes";
   if (shouldStart) {
@@ -595,7 +601,7 @@ async function onboard(configOption?: string, timeoutMs?: number): Promise<void>
 
 // 认领 Owner：默认直接采用授权用户（终端确认），拒绝时回退到手机配对。
 async function claimOwner(configPath: string, agentId: string, credentials: BotCredentials, plan: SetupPlan, existing: ThreadFerryConfig | undefined, timeoutMs?: number): Promise<void> {
-  console.log("\n[3/5] 认领 Owner（默认使用授权用户，也可手机配对指定）");
+  console.log("\n[3/6] 认领 Owner（默认使用授权用户，也可手机配对指定）");
   const adopted = await adoptAuthorizedOwner(configPath, agentId, credentials, plan, existing);
   if (!adopted) {
     await pairOwner(configPath, { agentId, workspace: plan.workspace, runtime: plan.runtime, ...(plan.model ? { model: plan.model } : {}), timeoutMs });
@@ -618,6 +624,11 @@ async function doctor(configPath?: string): Promise<boolean> {
   let configuredRuntimes = new Set<RuntimeName>(["codex"]);
   const major = Number(process.versions.node.split(".")[0]);
   checks.push({ ok: major >= 22, message: major >= 22 ? `Node ${process.version}` : `Node ${process.version}；请安装 Node.js 22+ LTS` });
+  const skillsInstalled = await officialWecomSkillsInstalled();
+  checks.push({
+    ok: skillsInstalled,
+    message: skillsInstalled ? "企业微信官方 Skills 已安装且来源已验证" : "企业微信官方 Skills 未完整安装或来源无法验证；请执行 threadferry skills install",
+  });
 
   const chosenConfig = resolve(configPath ?? defaultConfigPath());
   if (!existsSync(chosenConfig)) {
@@ -1046,7 +1057,11 @@ async function start(
           throw new Error(/授权|auth/i.test(reason) ? `${reason}（在终端执行 threadferry agent login ${agentId}）` : reason);
         }
       },
-      searchUsers: (keywords) => searchWecomUsers(keywords, hosts[0]!.runner),
+      searchUsers: async (agentId, keywords) => {
+        const runner = runnerFor(agentId);
+        if (!runner) throw new Error(`Agent ${agentId} 未启动`);
+        return searchWecomUsers(keywords, runner);
+      },
       userName: (userId) => names.name(userId),
       rememberUser: (userId, name) => names.remember(userId, name),
       botStatus: async (agentId) => {
@@ -1259,6 +1274,12 @@ async function main(): Promise<void> {
   }
   if (command === "doctor") {
     if (!(await doctor(option(args, "--config")))) process.exitCode = 1;
+    return;
+  }
+  if (command === "skills") {
+    if (args[0] !== "install") throw new Error("threadferry skills 仅支持 install");
+    await installOfficialWecomSkills();
+    console.log("企业微信官方 Skills 已安装或更新到 ~/.agents/skills。");
     return;
   }
   if (command === "status") {

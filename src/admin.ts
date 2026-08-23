@@ -36,7 +36,8 @@ export interface AdminDependencies {
    * 为假只代表未确认（群里还没人 @ 过机器人），不代表机器人不在。
    */
   listGroups: (agentId: string) => Promise<Array<{ id: string; name?: string; hasBotSession?: boolean }>>;
-  searchUsers: (keywords: string[]) => Promise<DirectoryUser[]>;
+  /** 通讯录可见范围跟机器人身份绑定，必须使用目标 Agent 自己的凭据查询。 */
+  searchUsers: (agentId: string, keywords: string[]) => Promise<DirectoryUser[]>;
   /**
    * 查加密 userid 对应的姓名。**同步、只读缓存**：企业微信不支持按 userid 反查通讯录，
    * 名字是从别处顺手收集的（见 src/directory-names.ts），拿不到就显示 id。
@@ -251,12 +252,13 @@ async function listDirectories(requested: string | undefined, partial: boolean):
 
 async function searchDirectoryUsers(
   dependencies: AdminDependencies,
+  agentId: string,
   query: string,
 ): Promise<{ users: DirectoryUser[]; note?: string }> {
   if (!query) return { users: [] };
   let users: DirectoryUser[];
   try {
-    users = await dependencies.searchUsers([query]);
+    users = await dependencies.searchUsers(agentId, [query]);
   } catch {
     return { users: [], note: "通讯录查询失败；可以直接填 id:<userid>。" };
   }
@@ -545,7 +547,7 @@ function addUserDialog(
           <div class="field">
             <label for="${html(dialogId)}-user">用户</label>
             <div class="picker" data-picker-root>
-              <input id="${html(dialogId)}-user" name="user" data-picker="users" placeholder="点这里搜索姓名或别名" maxlength="512" required autofocus>
+              <input id="${html(dialogId)}-user" name="user" data-picker="users" data-agent-id="${html(agentId)}" placeholder="点这里搜索姓名或别名" maxlength="512" required autofocus>
             </div>
             <p class="hint">点输入框搜通讯录，也可以直接填 <code>id:userid</code>。 <span class="picked" data-picker-note="user"></span></p>
           </div>
@@ -775,7 +777,11 @@ export async function startAdminServer(
         if (url.pathname === "/admin.css") return sendAsset(response, "text/css; charset=utf-8", STYLESHEET);
         if (url.pathname === "/admin.js") return sendAsset(response, "text/javascript; charset=utf-8", CLIENT_SCRIPT);
         if (url.pathname === "/api/dirs") return sendJson(response, 200, await listDirectories(url.searchParams.get("path") ?? undefined, true));
-        if (url.pathname === "/api/users") return sendJson(response, 200, await searchDirectoryUsers(dependencies, url.searchParams.get("q")?.trim() ?? ""));
+        if (url.pathname === "/api/users") {
+          const agentId = url.searchParams.get("agent")?.trim() ?? "";
+          if (!config.agents[agentId]) return sendJson(response, 400, { users: [], note: "Agent 无效。" });
+          return sendJson(response, 200, await searchDirectoryUsers(dependencies, agentId, url.searchParams.get("q")?.trim() ?? ""));
+        }
         if (url.pathname === "/") return send(response, 200, await overviewPage(config, dependencies, token, url));
         if (url.pathname === "/agents") return send(response, 200, await agentsPage(config, dependencies, token, url));
         if (url.pathname === "/agents/browse") return send(response, 200, await browsePage(config, url));
@@ -923,7 +929,7 @@ export async function startAdminServer(
         const agentId = required(input, "agentId");
         target = groupAnchor(groupId);
         errorTarget = groupUserAnchor(groupId, agentId);
-        const user = await resolveDirectoryUser(required(input, "user"), dependencies.searchUsers);
+        const user = await resolveDirectoryUser(required(input, "user"), (keywords) => dependencies.searchUsers(agentId, keywords));
         if (!USER_ID.test(user.id)) throw new Error("通讯录返回的 userid 无效");
         await dependencies.updateConfig((latest) => {
           const access = latest.groups[groupId]?.agents[agentId];

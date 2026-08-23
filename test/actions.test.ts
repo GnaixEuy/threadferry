@@ -1,318 +1,140 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { actionCatalog, extractAction, isKnownAction, prepareAction } from "../src/actions.js";
-import { DirectoryUserNotFoundError } from "../src/directory.js";
+import { actionCatalog, extractAction, isKnownAction, prepareAction, type ProposedAction } from "../src/actions.js";
 
 const fence = (body: string) => "```threadferry-action\n" + body + "\n```";
 
-test("an action proposal is lifted out of the reply so the group never sees raw JSON", () => {
-  const reply = `好的，我建议这样安排。\n\n${fence('{"action":"schedule.create","subject":"回归测试","begin_time":"2026-08-21 10:00:00","end_time":"2026-08-21 10:30:00"}')}`;
-  const result = extractAction(reply);
-  assert.equal(result.reply, "好的，我建议这样安排。");
-  assert.deepEqual(result.action, {
-    name: "schedule.create",
-    arguments: {
-      subject: "回归测试",
-      begin_time: "2026-08-21 10:00:00",
-      end_time: "2026-08-21 10:30:00",
-    },
-  });
+function wecom(command: string[], skill: string, summary = "执行测试操作"): ProposedAction {
+  return { name: "wecom-cli", skill, userIntent: "explicit", arguments: { command, summary } };
+}
+
+test("a generic CLI proposal is removed from the visible reply and preserved verbatim", () => {
+  const command = ["meeting", "create", "--json", JSON.stringify({ subject: "回归测试", begin_time: "2026-08-21 10:00:00", end_time: "2026-08-21 10:30:00" })];
+  const result = extractAction(`好的，我来处理。\n\n${fence(JSON.stringify({
+    action: "wecom-cli", skill: "wecomcli-meeting", user_intent: "explicit", command, summary: "创建回归测试会议",
+  }))}`);
+  assert.equal(result.reply, "好的，我来处理。");
+  assert.deepEqual(result.action, wecom(command, "wecomcli-meeting", "创建回归测试会议"));
 });
 
-test("anything that is not a known action is ignored, and the block still never reaches the group", () => {
-  // 白名单之外的动作名一律不认——提示词注入最多让它提议，提议不了就什么都不会发生。
-  const unknown = extractAction(`看看这个\n${fence('{"action":"shell.exec","command":"rm -rf /"}')}`);
-  assert.equal(unknown.action, undefined);
-  assert.equal(unknown.reply, "看看这个");
-  assert.ok(!unknown.reply.includes("rm -rf"));
-
-  // 半截 JSON 同样按「没有提议」处理，绝不猜。
-  const broken = extractAction(`结论如下\n${fence('{"action":"schedule.create"')}`);
-  assert.equal(broken.action, undefined);
-  assert.equal(broken.reply, "结论如下");
-
-  // 没有围栏就原样返回。
-  assert.deepEqual(extractAction("就是一句普通回复"), { reply: "就是一句普通回复" });
-  assert.ok(!isKnownAction("shell.exec"));
-  assert.ok(isKnownAction("schedule.create"));
-  assert.ok(isKnownAction("meeting.create"));
-  assert.ok(isKnownAction("mail.search"));
-  assert.ok(isKnownAction("doc.create"));
-  assert.ok(isKnownAction("disk.search"));
-  assert.match(actionCatalog(), /schedule\.create/);
-  assert.match(actionCatalog(), /meeting\.create[\s\S]*attendees/);
+test("unknown, legacy, and malformed actions never reach the user or executor", () => {
+  for (const body of [
+    '{"action":"shell.exec","command":"rm -rf /"}',
+    '{"action":"meeting.create","subject":"旧协议"}',
+    '{"action":"wecom-cli"',
+  ]) {
+    const result = extractAction(`结论如下\n${fence(body)}`);
+    assert.equal(result.action, undefined);
+    assert.equal(result.reply, "结论如下");
+  }
+  assert.deepEqual(extractAction("普通回复"), { reply: "普通回复" });
+  assert.equal(isKnownAction("wecom-cli"), true);
+  assert.equal(isKnownAction("meeting.create"), false);
+  assert.equal(isKnownAction("reminder.create"), true);
+  assert.match(actionCatalog(), /wecom-cli[\s\S]*command[\s\S]*reminder\.create/);
 });
 
-test("preparing a schedule validates every field and renders a summary for the owner", async () => {
-  const prepared = await prepareAction({
-    name: "schedule.create",
-    arguments: {
-      subject: "回归测试复盘",
-      begin_time: "2026-08-21 10:00:00",
-      end_time: "2026-08-21 11:00:00",
-      location: "线上",
-      description: "关于刚才的测试",
-    },
+test("only the first proposal is considered and every internal fence is hidden", () => {
+  const first = JSON.stringify({
+    action: "wecom-cli", skill: "wecomcli-meeting", user_intent: "explicit",
+    command: ["meeting", "create", "--json", "{}"], summary: "创建会议",
   });
-  assert.match(prepared.summary, /创建日程/);
-  assert.match(prepared.summary, /回归测试复盘/);
-  assert.match(prepared.summary, /2026-08-21 10:00:00 → 2026-08-21 11:00:00/);
-  assert.deepEqual(prepared.command.slice(0, 4), ["calendar", "schedules", "create", "--json"]);
-  assert.deepEqual(JSON.parse(prepared.command[4]!), {
-    subject: "回归测试复盘",
-    begin_time: "2026-08-21 10:00:00",
-    end_time: "2026-08-21 11:00:00",
-    location: "线上",
-    description: "关于刚才的测试",
+  const second = JSON.stringify({
+    action: "wecom-cli", skill: "wecomcli-meeting", user_intent: "explicit",
+    command: ["meeting", "cancel", "--json", "{}"], summary: "取消会议",
   });
+  const result = extractAction(`给用户的回复\n${fence(first)}\n${fence(second)}`);
+  assert.equal(result.reply, "给用户的回复");
+  assert.deepEqual(result.action?.arguments.command, ["meeting", "create", "--json", "{}"]);
+
+  const invalidFirst = extractAction(`给用户的回复\n${fence("not-json")}\n${fence(second)}`);
+  assert.equal(invalidFirst.reply, "给用户的回复");
+  assert.equal(invalidFirst.action, undefined);
 });
 
-test("bad arguments are rejected instead of guessed", async () => {
-  const base = { subject: "会", begin_time: "2026-08-21 10:00:00", end_time: "2026-08-21 11:00:00" };
-  await assert.rejects(prepareAction({ name: "schedule.create", arguments: { ...base, subject: "" } }), /标题不能为空/);
-  await assert.rejects(prepareAction({ name: "schedule.create", arguments: { ...base, begin_time: "明天十点" } }), /2026-08-21 10:00:00/);
-  await assert.rejects(prepareAction({ name: "schedule.create", arguments: { ...base, begin_time: "2026-02-30 10:00:00" } }), /不是有效时间/);
-  await assert.rejects(prepareAction({ name: "schedule.create", arguments: { ...base, end_time: "2026-08-21 09:00:00" } }), /结束时间必须晚于开始时间/);
-  await assert.rejects(prepareAction({ name: "schedule.create", arguments: { ...base, subject: "长".repeat(200) } }), /过长/);
-  await assert.rejects(prepareAction({ name: "shell.exec", arguments: {} }), /不支持的动作/);
+test("the broker keeps the Skill command intact and classifies only its safety mode", async () => {
+  const command = ["meeting", "create", "--json", JSON.stringify({
+    subject: "项目复盘", begin_time: "2026-08-21 10:00:00", end_time: "2026-08-21 10:30:00",
+    attendees: [{ userid: "woxxx" }],
+  })];
+  const prepared = await prepareAction(wecom(command, "wecomcli-meeting", "创建项目复盘在线会议"));
+  assert.equal(prepared.name, "meeting.create");
+  assert.equal(prepared.mode, "write");
+  assert.equal(prepared.private, undefined);
+  assert.deepEqual(prepared.command, command);
+  assert.equal(prepared.summary, "创建项目复盘在线会议");
+  assert.match(prepared.resource ?? "", /^meeting\.create:[a-f0-9]{16}$/);
 });
 
-test("attendees are resolved through the directory, never taken as raw ids", async () => {
-  const asked: string[] = [];
-  const prepared = await prepareAction({
-    name: "schedule.create",
-    arguments: {
-      subject: "评审",
-      begin_time: "2026-08-21 10:00:00",
-      end_time: "2026-08-21 11:00:00",
-      attendees: ["张三", "id:lisi", "张三"],
-    },
-  }, async (reference) => {
-    asked.push(reference);
-    return reference === "id:lisi" ? { id: "lisi", name: "李四" } : { id: "zhangsan", name: "张三" };
-  });
-  assert.deepEqual(asked, ["张三", "id:lisi", "张三"]);
-  // 重复的人只留一份。
-  assert.deepEqual(JSON.parse(prepared.command[4]!).attendees, [{ userid: "zhangsan" }, { userid: "lisi" }]);
+test("service routing requires the matching official Skill", async () => {
+  const cases: Array<[string[], string]> = [
+    [["calendar", "schedules", "list", "--json", "{}"], "wecomcli-calendar"],
+    [["contact", "users", "search", "--json", "{}"], "wecomcli-contact"],
+    [["chat", "messages", "list", "--json", "{}"], "wecomcli-message"],
+    [["doc", "contents", "get", "--json", "{}"], "wecomcli-doc"],
+    [["doc", "search", "--json", "{}"], "wecomcli-doc-manage"],
+    [["smartsheet", "records", "list", "--json", "{}"], "wecomcli-smartsheet"],
+  ];
+  for (const [command, skill] of cases) await prepareAction(wecom(command, skill));
+  await assert.rejects(prepareAction(wecom(["meeting", "create", "--json", "{}"], "wecomcli-calendar")), /wecomcli-meeting/);
+  await assert.rejects(prepareAction(wecom(["auth", "show", "--json", "{}"], "wecomcli-shared")), /不允许/);
+});
 
-  // 没有通讯录能力时宁可报错，也不把用户输入当 userid 直接塞进去。
+test("reads, writes, destructive operations, and payload-level deletion are fail-closed", async () => {
+  const cases: Array<[string[], string, "read" | "write" | "destructive"]> = [
+    [["meeting", "search", "--json", "{}"], "wecomcli-meeting", "read"],
+    [["disk", "files", "rename", "--json", "{}"], "wecomcli-disk", "write"],
+    [["meeting", "cancel", "--json", "{}"], "wecomcli-meeting", "destructive"],
+    [["doc", "contents", "overwrite", "--json", "{}"], "wecomcli-doc", "destructive"],
+    [["mail", "send", "--json", "{}"], "wecomcli-email", "destructive"],
+    [["message", "aibot", "send", "--json", "{}"], "wecomcli-message", "destructive"],
+    [["smartsheet", "records", "update", "--json", '{"type":"delete"}'], "wecomcli-smartsheet", "destructive"],
+  ];
+  for (const [command, skill, mode] of cases) assert.equal((await prepareAction(wecom(command, skill))).mode, mode);
+  await assert.rejects(prepareAction(wecom(["meeting", "frobnicate", "--json", "{}"], "wecomcli-meeting")), /未识别/);
+});
+
+test("the broker accepts CLI introspection but rejects arbitrary options, paths, credentials, and invalid JSON", async () => {
+  const inspection = await prepareAction(wecom(["smartsheet", "records", "update", "--schema"], "wecomcli-smartsheet", "读取当前记录更新契约"));
+  assert.equal(inspection.mode, "read");
+  assert.equal(inspection.private, true);
+
+  await assert.rejects(prepareAction(wecom(["meeting", "create", "--dry-run", "--json", "{}"], "wecomcli-meeting")), /命令路径无效|只接受/);
+  await assert.rejects(prepareAction(wecom(["meeting", "create", "--json", "not-json"], "wecomcli-meeting")), /有效 JSON/);
+  await assert.rejects(prepareAction(wecom(["media", "upload", "--json", '{"file_path":"/etc/passwd"}'], "wecomcli-media")), /本地文件路径/);
+  await assert.rejects(prepareAction(wecom(["meeting", "create", "--json", '{"bot_secret":"nope"}'], "wecomcli-meeting")), /凭据字段/);
   await assert.rejects(prepareAction({
-    name: "schedule.create",
-    arguments: { subject: "评审", begin_time: "2026-08-21 10:00:00", end_time: "2026-08-21 11:00:00", attendees: ["张三"] },
-  }), /不支持解析参与人/);
+    name: "wecom-cli", skill: "wecomcli-meeting", userIntent: "explicit", arguments: { command: ["meeting", "create", "--json", "{}"] },
+  }), /动作摘要不能为空/);
 });
 
-test("meeting creation keeps the official local time format and invites resolved directory users", async () => {
-  const prepared = await prepareAction({
-    name: "meeting.create",
-    arguments: {
-      subject: "刚才的测试复盘",
-      begin_time: "2026-08-20 17:00:00",
-      end_time: "2026-08-20 17:30:00",
-      attendees: ["平平无奇小天才"],
-    },
-  }, async (reference) => ({ id: "encrypted-user-id", name: reference }));
-
-  assert.match(prepared.summary, /创建会议/);
-  assert.match(prepared.summary, /参与人：平平无奇小天才/);
-  assert.deepEqual(prepared.command.slice(0, 3), ["meeting", "create", "--json"]);
-  assert.deepEqual(JSON.parse(prepared.command[3]!), {
-    subject: "刚才的测试复盘",
-    begin_time: "2026-08-20 17:00:00",
-    end_time: "2026-08-20 17:30:00",
-    attendees: [{ userid: "encrypted-user-id" }],
-  });
-  assert.match(prepared.formatResult?.({ meeting_id: "meeting-1", meeting_code: "123456789" }) ?? "", /会议 ID：meeting-1[\s\S]*123-456-789/);
-});
-
-test("persistent workflow writes return the resource id needed for follow-up", async () => {
+test("internal reminders and work remain ThreadFerry-owned and validated", async () => {
   const reminder = await prepareAction({
-    name: "reminder.create",
+    name: "reminder.create", skill: "threadferry", userIntent: "explicit",
     arguments: { instruction: "检查待办", run_at: "2026-08-21 09:00:00" },
   });
-  assert.match(reminder.formatResult?.({ reminder: { id: "R-123456789ABC", nextRunAt: "2026-08-21T01:00:00.000Z" } }) ?? "", /提醒 ID：R-123456789ABC[\s\S]*下次运行/);
+  assert.equal(reminder.mode, "write");
+  assert.deepEqual(reminder.command.slice(0, 4), ["internal", "reminder", "create", "--json"]);
 
   const work = await prepareAction({
-    name: "work.create",
+    name: "work.create", skill: "threadferry", userIntent: "explicit",
     arguments: { title: "复盘", description: "整理结论", assignee_agent: "reviewer" },
   });
-  assert.match(work.formatResult?.({ work: { id: "W-123456789ABC", status: "queued" } }) ?? "", /任务 ID：W-123456789ABC[\s\S]*queued/);
-});
-
-test("read actions prepare official meeting, schedule-free and todo commands", async () => {
-  const meeting = await prepareAction({
-    name: "meeting.search",
-    arguments: { keywords: ["测试复盘"], begin_time: "2026-08-20 00:00:00", end_time: "2026-08-21 23:59:59" },
-  });
-  assert.equal(meeting.mode, "read");
-  assert.deepEqual(meeting.command.slice(0, 3), ["meeting", "search", "--json"]);
-  assert.deepEqual(JSON.parse(meeting.command[3]!), {
-    keywords: ["测试复盘"],
-    begin_time: "2026-08-20 00:00:00",
-    end_time: "2026-08-21 23:59:59",
-    limit: 10,
-  });
-
-  const free = await prepareAction({
-    name: "schedule.free",
-    arguments: {
-      attendees: ["张三", "李四"],
-      begin_time: "2026-08-21 09:00:00",
-      end_time: "2026-08-21 18:00:00",
-      min_duration_minutes: 45,
-    },
-  }, async (reference) => ({ id: `${reference}-id`, name: reference }));
-  assert.equal(free.mode, "read");
-  assert.deepEqual(free.command.slice(0, 5), ["calendar", "schedules", "free", "list", "--json"]);
-  assert.deepEqual(JSON.parse(free.command[5]!).userids, [{ userid: "张三-id" }, { userid: "李四-id" }]);
-
-  const todos = await prepareAction({ name: "todo.list", arguments: { keywords: "上线", status: "all" } });
-  assert.equal(todos.mode, "read");
-  assert.deepEqual(JSON.parse(todos.command[3]!), {
-    keywords: ["上线"],
-    status_filter: ["proceed", "finished"],
-    limit: 10,
-  });
-});
-
-test("todo creation and lifecycle actions validate ids, deadlines and people", async () => {
-  const todo = await prepareAction({
-    name: "todo.create",
-    arguments: {
-      title: "完成上线复盘",
-      description: "整理结论",
-      deadline: "2026-08-21 18:00:00",
-      attendees: ["张三"],
-    },
-  }, async (reference) => ({ id: "zhangsan-id", name: reference }));
-  assert.equal(todo.mode, "write");
-  assert.deepEqual(todo.command.slice(0, 3), ["todo", "create", "--json"]);
-  assert.deepEqual(JSON.parse(todo.command[3]!), {
-    items: [{
-      title: "完成上线复盘",
-      description: "整理结论",
-      deadline: { type: "datetime", value: "2026-08-21 18:00:00" },
-      follower_ids: ["zhangsan-id"],
-    }],
-  });
-
-  const cancel = await prepareAction({ name: "meeting.cancel", arguments: { meeting_id: "meeting-id" } });
-  assert.equal(cancel.mode, "destructive");
-  assert.deepEqual(JSON.parse(cancel.command[3]!), { meeting_id: "meeting-id" });
-
-  const finish = await prepareAction({ name: "todo.finish", arguments: { todo_id: "todo-id" } });
-  assert.equal(finish.mode, "destructive");
-  assert.deepEqual(JSON.parse(finish.command[3]!), { items: [{ todo_id: "todo-id", finished_all: true }] });
-
-  const update = await prepareAction({
-    name: "todo.update",
-    arguments: { todo_id: "todo-id", title: "新的标题", description: "", deadline: "2026-08-22" },
-  });
-  assert.equal(update.mode, "write");
-  assert.deepEqual(JSON.parse(update.command[3]!), {
-    items: [{ todo_id: "todo-id", title: "新的标题", description: "", deadline: { type: "date", value: "2026-08-22" } }],
-  });
-});
-
-test("mail, document and disk actions use official commands and keep private data in owner chat", async () => {
-  const resolve = async (reference: string) => ({ id: `${reference}-id`, name: reference });
-  const mailSearch = await prepareAction({
-    name: "mail.search",
-    arguments: { keywords: ["上线"], sender: "张三", only_unread: true },
-  });
-  assert.equal(mailSearch.mode, "read");
-  assert.equal(mailSearch.private, true);
-  assert.deepEqual(mailSearch.command.slice(0, 3), ["mail", "search", "--json"]);
-  assert.deepEqual(JSON.parse(mailSearch.command[3]!), {
-    keywords: ["上线"], sender: "张三", only_unread: true, limit: 10,
-  });
-
-  const mailSend = await prepareAction({
-    name: "mail.send",
-    arguments: {
-      to: ["external@example.com", "李四"],
-      cc: ["王五"],
-      subject: "上线通知",
-      content: "今天完成上线。",
-    },
-  }, resolve);
-  assert.equal(mailSend.mode, "destructive");
-  assert.equal(mailSend.private, true);
-  assert.deepEqual(JSON.parse(mailSend.command[3]!), {
-    to: { emails: ["external@example.com"], userids: ["李四-id"] },
-    cc: { userids: ["王五-id"] },
-    subject: "上线通知",
-    content: "今天完成上线。",
-    content_type: "markdown",
-  });
-  const externalMail = await prepareAction({
-    name: "mail.send",
-    arguments: { to: ["external@example.com"], subject: "通知", content: "正文" },
-  });
-  assert.deepEqual(JSON.parse(externalMail.command[3]!).to, { emails: ["external@example.com"] });
+  assert.equal(work.private, true);
   await assert.rejects(prepareAction({
-    name: "mail.send",
-    arguments: { to: ["收件人"], subject: "通知", content: "正文" },
-  }, async () => { throw new DirectoryUserNotFoundError("通讯录中没有找到收件人"); }), /通讯录中没有找到收件人/);
-
-  const doc = await prepareAction({
-    name: "doc.create",
-    arguments: { doc_name: "上线复盘", content: "# 结论" },
-  });
-  assert.equal(doc.mode, "write");
-  assert.equal(doc.private, true);
-  assert.deepEqual(JSON.parse(doc.command[3]!), {
-    doc_name: "上线复盘", doc_type: "doc", content: "# 结论", content_type: "markdown",
-  });
-
-  const disk = await prepareAction({
-    name: "disk.search",
-    arguments: { keywords: "复盘", file_types: ["doc", "pdf"], space_keywords: ["项目"] },
-  });
-  assert.equal(disk.mode, "read");
-  assert.equal(disk.private, true);
-  assert.deepEqual(disk.command.slice(0, 4), ["disk", "files", "search", "--json"]);
-  assert.deepEqual(JSON.parse(disk.command[4]!), {
-    keywords: ["复盘"], file_types: ["doc", "pdf"], space_keywords: ["项目"], search_type: "all", limit: 10,
-  });
+    name: "work.create", skill: "wecomcli-todo", userIntent: "explicit",
+    arguments: { title: "复盘", description: "整理结论", assignee_agent: "reviewer" },
+  }), /threadferry Skill/);
+  await assert.rejects(prepareAction({
+    name: "reminder.create", skill: "threadferry", userIntent: "explicit",
+    arguments: { instruction: "检查待办", run_at: "明天" },
+  }), /必须形如/);
 });
 
-test("knowledge actions read full enterprise content with the current official command tree", async () => {
-  const cases: Array<{
-    name: string;
-    arguments: Record<string, unknown>;
-    command: string[];
-    request: Record<string, unknown>;
-  }> = [
-    { name: "doc.read", arguments: { docid: "https://doc.weixin.qq.com/doc/example" }, command: ["doc", "contents", "get"], request: { docid: "https://doc.weixin.qq.com/doc/example", content_type: "markdown" } },
-    { name: "mail.read", arguments: { mail_ids: ["mail-1", "mail-2"] }, command: ["mail", "get"], request: { mail_ids: ["mail-1", "mail-2"] } },
-    { name: "sheet.info", arguments: { docid: "sheet-doc" }, command: ["sheet", "get"], request: { docid: "sheet-doc" } },
-    { name: "sheet.read", arguments: { docid: "sheet-doc", sheet_id: "sheet-1", range: "A1:D20" }, command: ["sheet", "ranges", "get"], request: { docid: "sheet-doc", sheet_id: "sheet-1", range: "A1:D20" } },
-    { name: "smartpage.read", arguments: { docid: "smartpage-doc", page_id: "page-1" }, command: ["smartpage", "pages", "get"], request: { docid: "smartpage-doc", page_id: "page-1", content_type: "markdown" } },
-    { name: "smartsheet.info", arguments: { docid: "smart-doc" }, command: ["smartsheet", "sheets", "list"], request: { docid: "smart-doc" } },
-    { name: "smartsheet.fields", arguments: { docid: "smart-doc", sheet_id: "sheet-1" }, command: ["smartsheet", "fields", "list"], request: { docid: "smart-doc", sheet_id: "sheet-1", type: "fields", limit: 150 } },
-    { name: "smartsheet.records", arguments: { docid: "smart-doc", sheet_id: "sheet-1", field_titles: ["负责人", "状态"], limit: 100 }, command: ["smartsheet", "records", "list"], request: { docid: "smart-doc", sheet_id: "sheet-1", field_titles: ["负责人", "状态"], type: "records", key_type: "field_title", limit: 100 } },
-    { name: "schedule.get", arguments: { schedule_ids: ["schedule-1"] }, command: ["calendar", "schedules", "get"], request: { schedule_ids: ["schedule-1"] } },
-    { name: "meeting.get", arguments: { meeting_id: "meeting-1" }, command: ["meeting", "get"], request: { meeting_ids: [{ meeting_id: "meeting-1" }] } },
-    { name: "meeting.transcript", arguments: { meeting_id: "meeting-1", sub_meeting_id: "sub-1" }, command: ["meeting", "original", "get"], request: { meeting_id: "meeting-1", sub_meeting_id: "sub-1", media_index: 0, limit: 500 } },
-    { name: "meeting.rooms", arguments: { begin_time: "2026-08-21 10:00:00", end_time: "2026-08-21 11:00:00", capacity_min: 6 }, command: ["meeting", "rooms", "search"], request: { begin_time: "2026-08-21 10:00:00", end_time: "2026-08-21 11:00:00", capacity_min: 6, limit: 20 } },
-    { name: "todo.get", arguments: { todo_ids: ["todo-1"] }, command: ["todo", "get"], request: { items: [{ todo_id: "todo-1" }] } },
-    { name: "disk.get", arguments: { file_id: "file-1" }, command: ["disk", "files", "get"], request: { file_id: "file-1" } },
-    { name: "disk.list", arguments: {}, command: ["disk", "files", "list"], request: { limit: 20 } },
-  ];
-
-  for (const item of cases) {
-    const prepared = await prepareAction({ name: item.name, arguments: item.arguments });
-    assert.equal(prepared.mode, "read", item.name);
-    assert.equal(prepared.private, true, item.name);
-    assert.deepEqual(prepared.command.slice(0, item.command.length), item.command, item.name);
-    const jsonIndex = prepared.command.indexOf("--json");
-    assert.deepEqual(JSON.parse(prepared.command[jsonIndex + 1]!), item.request, item.name);
-  }
-});
-
-test("activity resource identity never persists an enterprise URL", async () => {
-  const prepared = await prepareAction({ name: "doc.read", arguments: { docid: "https://doc.example/path?token=secret" } });
-  assert.match(prepared.resource ?? "", /^doc:[a-f0-9]{16}$/);
+test("activity identity hashes enterprise URLs instead of persisting them", async () => {
+  const prepared = await prepareAction(wecom([
+    "doc", "contents", "get", "--json", JSON.stringify({ docid: "https://doc.example/path?token=secret" }),
+  ], "wecomcli-doc"));
+  assert.match(prepared.resource ?? "", /^doc\.contents\.get:[a-f0-9]{16}$/);
   assert.doesNotMatch(prepared.resource ?? "", /token|secret|https/);
 });

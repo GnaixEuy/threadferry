@@ -27,7 +27,7 @@ test("context contains recent history as untrusted data and preserves the curren
   ];
 
   const prompt = buildContext(history, current, { lookbackHours: 6, maxMessages: 80 });
-  const firstMessageLocalTime = history[0].time.toTimeString().slice(0, 8);
+  const firstMessageLocalTime = history[0]!.time.toTimeString().slice(0, 8);
   for (const expected of ["张三", firstMessageLocalTime, "这个接口有问题", "李四", "可能是 Redis", "王五", "线上出现三次"]) {
     assert.match(prompt, new RegExp(expected));
   }
@@ -35,9 +35,13 @@ test("context contains recent history as untrusted data and preserves the curren
   assert.match(prompt, /CURRENT_USER_INSTRUCTION/);
   assert.match(prompt, /@ThreadFerry 帮忙分析（原文）/);
   assert.match(prompt, /trace\.log/);
-  assert.match(prompt, /meeting\.create/);
-  assert.match(prompt, /attendees/);
-  assert.match(prompt, /不要包含当前消息里被 @ 的机器人名/);
+  assert.match(prompt, /"action":"wecom-cli"/);
+  assert.match(prompt, /"command":\["meeting","create","--json"/);
+  assert.match(prompt, /官方 wecomcli-\* Skill/);
+  assert.match(prompt, /"skill":"wecomcli-meeting"/);
+  assert.match(prompt, /"user_intent":"explicit"/);
+  assert.match(prompt, /否定、询问、假设、能力咨询、信息不足或含糊表达一律填 confirm/);
+  assert.match(prompt, /不要提议 auth、identity、任意 shell、输出路径、凭据或本地文件路径/);
 });
 
 test("context enforces lookback and total message limit", () => {

@@ -454,7 +454,7 @@ function attachPicker(input) {
   function run() {
     var value = input.value.trim();
     var url = kind === "users"
-      ? "/api/users?q=" + encodeURIComponent(value)
+      ? "/api/users?agent=" + encodeURIComponent(input.getAttribute("data-agent-id") || "") + "&q=" + encodeURIComponent(value)
       : "/api/dirs?path=" + encodeURIComponent(value);
     var ticket = (pending += 1);
     fetch(url, { headers: { accept: "application/json" } }).then(function (response) {
