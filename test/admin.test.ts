@@ -25,6 +25,7 @@ test("localhost admin manages agents, groups, and users with CSRF protection", a
   const now = new Date().toISOString();
   const resetCalls: string[] = [];
   const authCalls: Array<{ agentId: string; mode: string; botId?: string; secret?: string }> = [];
+  const directoryAgents: string[] = [];
   const admin = await startAdminServer(config, {
     updateConfig: async (change) => { await change(config); },
     listGroups: async (agentId) => agentId === "default"
@@ -36,9 +37,12 @@ test("localhost admin manages agents, groups, and users with CSRF protection", a
     authorizeBot: async (agentId, authorization) => {
       authCalls.push({ agentId, ...authorization });
     },
-    searchUsers: async (keywords) => keywords.includes("张三")
-      ? [{ id: "zhangsan", name: "张三", matchedKeywords: ["张三"] }]
-      : [],
+    searchUsers: async (agentId, keywords) => {
+      directoryAgents.push(agentId);
+      return keywords.includes("张三")
+        ? [{ id: "zhangsan", name: "张三", matchedKeywords: ["张三"] }]
+        : [];
+    },
     userName: (userId) => remembered.get(userId),
     rememberUser: (userId, name) => { remembered.set(userId, name); },
     snapshot: async () => ({
@@ -127,6 +131,7 @@ test("localhost admin manages agents, groups, and users with CSRF protection", a
   assert.match(groupDetail, /data-dialog="add-user-0"/);
   assert.match(groupDetail, /<dialog id="add-user-0"/);
   assert.match(groupDetail, /data-picker="users"/);
+  assert.match(groupDetail, /data-agent-id="default"/);
   // 候选是复选框：一个群可以一次勾多台机器人。new-group 还没人 @ 过，不能声称机器人在群里。
   const pendingDetail = await (await fetch(`${admin.url}/groups/detail?id=new-group`)).text();
   assert.match(pendingDetail, /<input type="checkbox" id="bind-0-0" name="agentId" value="default" checked>/);
@@ -136,9 +141,12 @@ test("localhost admin manages agents, groups, and users with CSRF protection", a
   const userKey = encodeURIComponent("default\ngroup");
   assert.match(await (await fetch(`${admin.url}/groups/detail?id=group&user=${userKey}`)).text(), /id="add-user-0"[^>]*open>/);
 
-  const found = await (await fetch(`${admin.url}/api/users?q=${encodeURIComponent("张三")}`)).json();
+  const found = await (await fetch(`${admin.url}/api/users?agent=default&q=${encodeURIComponent("张三")}`)).json();
   assert.deepEqual(found.users.map((user: { id: string }) => user.id), ["zhangsan"]);
-  assert.deepEqual((await (await fetch(`${admin.url}/api/users?q=`)).json()).users, []);
+  assert.deepEqual((await (await fetch(`${admin.url}/api/users?agent=default&q=`)).json()).users, []);
+  assert.equal((await fetch(`${admin.url}/api/users?q=张三`)).status, 400);
+  assert.equal((await fetch(`${admin.url}/api/users?agent=missing&q=张三`)).status, 400);
+  assert.deepEqual(directoryAgents, ["default"]);
   const hostileStatus = await new Promise<number | undefined>((resolve, reject) => {
     const target = new URL(admin.url);
     const request = httpRequest({ hostname: target.hostname, port: target.port, headers: { host: "evil.example" } }, (response) => resolve(response.statusCode));
@@ -211,6 +219,7 @@ test("localhost admin manages agents, groups, and users with CSRF protection", a
 
   // 名单是「群 + Agent」的，所以每个写操作都带 agentId。
   await post("/groups/users/add", { groupId: "group", agentId: "default", user: "张三" });
+  assert.deepEqual(directoryAgents, ["default", "default"]);
   assert.deepEqual(config.groups.group?.agents.default?.allowUsers, ["owner", "zhangsan"]);
   // 按姓名添加成功的那一刻就记下映射，列表里立刻能显示名字。
   assert.equal(remembered.get("zhangsan"), "张三");

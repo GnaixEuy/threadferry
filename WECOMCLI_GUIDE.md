@@ -1,171 +1,237 @@
-# wecom-cli 能力与操作指南
+# ThreadFerry 企业微信能力指南
 
-> 核验日期：2026-08-20
-> 当前基线：`@wecom/cli 1.1.0`，本机安装版与 npm `latest` 一致
-> 适用范围：ThreadFerry 的企业微信能力设计、开发、排查与人工运维
+兼容基线：`@wecom/cli 1.1.0+`
 
-## 1. 权威来源
+适用范围：ThreadFerry 的企业微信 Skill、CLI 调用、权限控制、凭据隔离、开发与故障排查。
 
-按以下顺序确认能力和参数，不要仅凭记忆或复制旧示例：
+## 1. 契约来源
 
-1. 当前 Agent 凭据目录下的 CLI 自描述：`--doc`、`--schema`、`--help`
-2. [wecom-cli 官方仓库](https://github.com/WecomTeam/wecom-cli)和
-   [npm 包](https://www.npmjs.com/package/@wecom/cli)
-3. 本文记录的 ThreadFerry 集成约束
-4. 已安装的 `wecomcli-*` Skills 只作为业务流程、安全确认和交互规则参考
+企业微信能力使用以下契约：
 
-当前部分 Skills 仍使用旧式命令，例如 `wecom-cli msg`、`wecom-cli schedule`、
-`wecom-cli doc <tool_name> '<json>'`。1.1.0 已改为资源化命令树，实际调用前必须以 CLI
-自描述为准。
+1. 官方 `wecomcli-*` Skills 定义业务路由、信息补齐、交互和确认规则。
+2. 目标 Agent 凭据目录下的 `wecom-cli --doc`、`--schema` 和 `--help` 定义可执行命令。
+3. ThreadFerry Broker 定义允许的服务、参数、会话和操作影响。
 
-核验版本：
+官方来源：
+
+- [WeComTeam/wecom-cli](https://github.com/WecomTeam/wecom-cli)
+- [@wecom/cli](https://www.npmjs.com/package/@wecom/cli)
+
+安装或更新官方 Skills：
 
 ```sh
-wecom-cli --version
-npm view @wecom/cli dist-tags.latest
+threadferry skills install
 ```
 
-查看当前能力与精确参数：
+安装源固定为 `WeComTeam/wecom-cli`。`~/.agents/skills` 中应包含：
 
-```sh
-wecom-cli --help
-wecom-cli <service> --doc
-wecom-cli <service> --schema
-wecom-cli <service> [resource ...] <method> --help
-wecom-cli <service> [resource ...] <method> --schema
+```text
+wecomcli-shared
+wecomcli-contact
+wecomcli-calendar
+wecomcli-meeting
+wecomcli-todo
+wecomcli-email
+wecomcli-disk
+wecomcli-media
+wecomcli-message
+wecomcli-doc-manage
+wecomcli-doc
+wecomcli-sheet
+wecomcli-smartsheet
+wecomcli-smartpage
 ```
 
-当版本或命令树变化时，先更新本文，再基于新契约设计或改代码。
+`threadferry doctor` 会校验 14 个目录、`SKILL.md` 元数据和 `.agents/.skill-lock.json` 中的官方来源。
 
-## 2. ThreadFerry 中的凭据隔离
+## 2. Agent 与凭据隔离
 
-ThreadFerry 严格遵守“一个 Agent 对应一个企业微信机器人”。每个 Agent 使用独立的
-`WECOM_CLI_CONFIG_DIR`，凭据、Owner、群、授权名单、Workspace、Runtime 和 Session 互不共享。
+一个 Agent 对应一个企业微信机器人。每个 Agent 独立拥有：
 
-优先使用 ThreadFerry 命令授权：
+- `WECOM_CLI_CONFIG_DIR`
+- 机器人凭据和企业身份
+- Owner、群和授权名单
+- Workspace、Runtime 和 Session
+
+默认凭据目录是 `~/.threadferry/wecom/<Agent名>/`。授权和诊断命令：
 
 ```sh
-threadferry agent login "<Agent名>"
+threadferry agent login <Agent名>
 threadferry agent list
 threadferry doctor
 ```
 
-默认凭据目录是 `~/.threadferry/wecom/<Agent名>`。需要直接调用 wecom-cli 时，必须显式使用
-目标 Agent 的同一个目录：
+人工调用 CLI 时，显式指定目标 Agent 的目录：
 
 ```sh
 AGENT_CONFIG_DIR="/absolute/path/to/.threadferry/wecom/<Agent名>"
-WECOM_CLI_CONFIG_DIR="$AGENT_CONFIG_DIR" wecom-cli auth init
 WECOM_CLI_CONFIG_DIR="$AGENT_CONFIG_DIR" wecom-cli auth show --status
 WECOM_CLI_CONFIG_DIR="$AGENT_CONFIG_DIR" wecom-cli identity whoami --json '{}'
 ```
 
-安全边界：
+凭据规则：
 
-- 不读取、复制、打印或提交 `bot.enc` 和 Bot Secret。
-- 不把 Bot Secret 写入 ThreadFerry 配置、环境文件、日志、状态库或测试夹具。
-- 不把 A Agent 的 `WECOM_CLI_CONFIG_DIR` 用于 B Agent 的查询或发送。
-- `threadferry agent login` 是默认授权入口；手工调用仅用于排查或明确的运维场景。
+- `bot.enc` 和 Bot Secret 不得读取、复制、打印、提交或写入测试证据。
+- Bot Secret 不得进入 ThreadFerry 配置、状态、日志、URL、环境文件或测试夹具。
+- 每次 CLI 调用只能使用当前 Agent 的 `WECOM_CLI_CONFIG_DIR`。
+- Runtime 不接收 Bot Secret、凭据目录或直接 CLI 执行权限。
 
-## 3. 1.1.0 调用方式
+## 3. Skill 与服务映射
 
-当前命令格式：
+| Skill | CLI 服务 | 主要能力 |
+| --- | --- | --- |
+| `wecomcli-shared` | 公共规则 | 身份、时间、分页、确认和错误处理 |
+| `wecomcli-contact` | `contact` | 搜索当前身份可见的通讯录成员 |
+| `wecomcli-calendar` | `calendar` | 日程查询、创建、更新、取消和空闲时间 |
+| `wecomcli-meeting` | `meeting` | 会议、会议室和会议转写原文 |
+| `wecomcli-todo` | `todo` | 待办查询、创建、更新、完成和删除 |
+| `wecomcli-email` | `mail` | 邮件读取、搜索、发送、回复和转发 |
+| `wecomcli-disk` | `disk` | 微盘文件和文件夹管理 |
+| `wecomcli-media` | `media` | 媒体上传和下载 |
+| `wecomcli-message` | `chat`、`message` | 会话、消息、机器人会话和消息附件 |
+| `wecomcli-doc-manage` | `doc` 与文档路由 | 文档类型识别、搜索、成员、标题和加入规则 |
+| `wecomcli-doc` | `doc` | 在线文档创建、导入和内容读写 |
+| `wecomcli-sheet` | `sheet` | 在线表格、范围、行和子表管理 |
+| `wecomcli-smartsheet` | `smartsheet` | 智能表格结构、字段、记录、视图和图表 |
+| `wecomcli-smartpage` | `smartpage` | 智能文档页面、Block、数据表和附件 |
+
+`auth` 和 `identity` 由 ThreadFerry 的授权与诊断流程使用，不属于 Runtime 可提议的业务服务。
+
+## 4. CLI 自描述
+
+当前命令结构：
 
 ```sh
 wecom-cli <service> [resource ...] <method> [options]
 ```
 
-推荐在脚本和代码中使用 `--json`，避免复杂对象被 shell 错误拆分：
+在目标 Agent 的凭据目录下查看真实契约：
 
 ```sh
-wecom-cli contact users search --json '{"keywords":["张三"],"search_mode":"list"}'
+AGENT_CONFIG_DIR="/absolute/path/to/.threadferry/wecom/<Agent名>"
+WECOM_CLI_CONFIG_DIR="$AGENT_CONFIG_DIR" wecom-cli --version
+WECOM_CLI_CONFIG_DIR="$AGENT_CONFIG_DIR" wecom-cli <service> --doc
+WECOM_CLI_CONFIG_DIR="$AGENT_CONFIG_DIR" wecom-cli <service> --schema
+WECOM_CLI_CONFIG_DIR="$AGENT_CONFIG_DIR" wecom-cli <service> [resource ...] <method> --help
+WECOM_CLI_CONFIG_DIR="$AGENT_CONFIG_DIR" wecom-cli <service> [resource ...] <method> --schema
 ```
 
-通用选项：
+代码和自动化调用使用 `--json` 传入完整对象：
 
-| 选项 | 用途 |
-| --- | --- |
-| `--json '<JSON>'` | 传入完整请求体 |
-| `--set path=value` | 覆盖深层字段，可重复使用 |
-| `--dry-run` | 只在本地校验请求，不实际发送 |
-| `--page-count N` | 自动拉取 N 页，输出 NDJSON |
-| `--page-delay MS` | 设置自动分页间隔 |
-| `-o, --output FILE` | 将响应写入文件 |
-| `--output-dir DIR` | 将响应和附件写入目录 |
-| `--doc` / `--schema` | 查看服务或方法的当前契约 |
+```sh
+WECOM_CLI_CONFIG_DIR="$AGENT_CONFIG_DIR" wecom-cli contact users search \
+  --json '{"keywords":["张三"],"search_mode":"list"}'
+```
 
-涉及创建、更新、发送、取消、删除的命令，先用 `--dry-run` 校验；但 `--dry-run` 不能替代用户
-授权，也不能证明当前机器人拥有服务或目标资源的权限。
+人工运维可按方法帮助使用 `--set`、`--page-count`、`--page-delay`、`--output` 和 `--output-dir`。
+ThreadFerry Broker 只接受以下两种命令：
 
-## 4. 当前能力总表
+- `--help`、`--doc` 或 `--schema` 自描述查询
+- 单个 `--json` 对象形式的业务请求
 
-下表来自本机 1.1.0 的 `--doc`，是当前设计可复用的官方能力边界。
+## 5. ThreadFerry 执行协议
 
-| 服务 | 当前资源与方法 | 能力摘要 |
+Agent 完整读取对应官方 Skill 及其为当前操作指定的 reference，然后输出一个动作提议。Agent 不直接
+运行 CLI。
+
+```threadferry-action
+{
+  "action": "wecom-cli",
+  "skill": "wecomcli-meeting",
+  "user_intent": "explicit",
+  "command": [
+    "meeting",
+    "create",
+    "--json",
+    "{\"subject\":\"需求评审\",\"begin_time\":\"2026-08-24 10:00:00\",\"end_time\":\"2026-08-24 10:30:00\"}"
+  ],
+  "summary": "创建需求评审会议，时间为 2026-08-24 10:00 至 10:30"
+}
+```
+
+字段规则：
+
+- `action` 固定为 `wecom-cli`。
+- `skill` 必须与 `command` 的 service 和资源路径对应。
+- `user_intent` 仅在当前用户消息明确要求执行时使用 `explicit`；信息不完整时使用 `confirm`。
+- `command` 是不含 `wecom-cli` 可执行文件名的参数数组。
+- `summary` 必须包含目标、时间、对象和影响，便于用户核对。
+
+Broker 校验并执行以下步骤：
+
+1. 校验 Skill、service、资源路径、method 和参数结构。
+2. 拒绝 `auth`、`identity`、任意 shell、未知选项、凭据字段和 Agent 提供的本地路径。
+3. 根据 method 和请求体判定只读、写入或破坏性操作。
+4. 校验会话类型、Owner、当前用户意图和确认码。
+5. 使用所属 Agent 的 runner 和凭据目录执行。
+6. 将结果作为不可信业务数据返回同一 Agent，由原 Skill 解释并回复用户。
+
+同一轮最多执行一个最终写操作。写入完成后，Agent 只能整理结果，不得继续提交动作。
+
+## 6. 授权规则
+
+| 操作 | 会话 | 执行条件 |
 | --- | --- | --- |
-| `auth` | `init`、`show` | 扫码或手工授权，查看授权状态 |
-| `identity` | `whoami` | 获取当前机器人和授权真人身份；当前未显示在顶层 `--help`，但 ThreadFerry 正在使用 |
-| `contact` | `users search` | 按姓名、拼音或别名搜索当前身份可见成员 |
-| `chat` | `groups list`、`messages list` | 查询最近有消息的群和最近 7 天会话消息 |
-| `message` | `send`、`aibot send`、`aibot sessions list`、`files get` | 发送文本或机器人富媒体消息、查询最近机器人会话、获取消息附件 |
-| `media` | `upload`、`download` | 上传或下载 media_id 对应的媒体文件 |
-| `mail` | `get`、`search`、`send` | 读取、搜索、发送、回复和转发邮件 |
-| `doc` | `create`、`import`、`search`；`contents get/append/overwrite`；`members/names/rules update` | 创建、导入、搜索和编辑在线文档，管理标题、成员与加入规则 |
-| `sheet` | `create`、`get`、`import`；`contents update`、`ranges get`、`rows append`、`subsheets add/delete` | 在线表格读写、追加行和子表管理 |
-| `smartpage` | `create`、`import`；`blocks update`、`databases get`、`files/images upload`、`pages get/append/overwrite/update` | 智能文档页面、Block、内置数据表和附件管理 |
-| `smartsheet` | `create`、`get`、`import`；`charts/fields/records/sheets/views` 的管理方法；`files/images upload` | 智能表格结构、记录、视图、图表和附件管理；记录支持分页、过滤和 SQL 查询 |
-| `disk` | `files download/get/list/rename/search/upload`、`folders create` | 微盘文件搜索、读写、下载、重命名和建目录 |
-| `todo` | `create`、`delete`、`finish`、`get`、`list`、`update` | 机器人视角批量创建、查询、更新、完成和删除待办 |
-| `calendar` | `schedules cancel/create/get/list/search/update`、`schedules free list` | 日程增删改查、搜索和多人共同空闲时段推荐 |
-| `meeting` | `cancel/create/get/list/search/update`、`original get`、`rooms search`、`rooms buildings list` | 会议管理、会议室查询和会议转写原文读取 |
+| 自描述查询 | Owner 私聊 | 命令通过 Broker 校验 |
+| 业务查询 | Owner 私聊 | 命令通过 Broker 校验 |
+| 普通写入 | Owner 私聊或受控群 | 当前请求明确要求执行；否则需要确认码 |
+| 破坏性操作 | Owner 私聊或受控群 | 每次都需要新的 Owner 确认码 |
+| 消息发送、邮件发送 | Owner 私聊或受控群 | 每次都需要新的 Owner 确认码 |
+| `chat`、`contact`、`disk`、`doc`、`mail`、`media`、`message`、`sheet`、`smartpage`、`smartsheet` | Owner 私聊 | 不允许在群中执行 |
 
-权限注意：命令树中出现某项能力，只代表当前 CLI 认识该契约，不代表当前企业、机器人、授权真人
-或目标资源已经授权。调用结果才是有效权限证据。
+所有写操作先执行同一请求的 `--dry-run`，通过后才允许真实调用。`--dry-run` 只校验本地请求，不能
+替代用户授权，也不能证明机器人、企业或目标资源拥有业务权限。
 
-## 5. 常用只读操作
+## 7. 当前服务能力
 
-以下示例不会创建或修改企业微信数据。日期、ID 和凭据目录需替换为当前场景的真实值。
+| 服务 | 资源与方法摘要 |
+| --- | --- |
+| `contact` | `users search` |
+| `chat` | `groups list`、`messages list` |
+| `message` | `send`、`aibot send`、`aibot sessions list`、`files get` |
+| `media` | `upload`、`download` |
+| `mail` | `get`、`search`、`send` |
+| `doc` | `create`、`import`、`search`、内容读写、成员、标题和加入规则 |
+| `sheet` | `create`、`get`、`import`、范围读写、追加行和子表管理 |
+| `smartpage` | `create`、`import`、Block、页面、数据表、图片和文件管理 |
+| `smartsheet` | `create`、`get`、`import`、子表、字段、记录、视图、图表和附件管理 |
+| `disk` | 文件下载、读取、列表、重命名、搜索、上传和文件夹创建 |
+| `todo` | `create`、`delete`、`finish`、`get`、`list`、`update` |
+| `calendar` | 日程 `cancel`、`create`、`get`、`list`、`search`、`update` 和共同空闲时间 |
+| `meeting` | `cancel`、`create`、`get`、`list`、`search`、`update`、转写原文和会议室 |
 
-### 查询当前身份
+命令存在只表示 CLI 支持该契约。真实调用结果用于确认当前企业、机器人、授权真人和目标资源的权限。
+
+## 8. 常用只读命令
+
+以下命令均在目标 Agent 的 `WECOM_CLI_CONFIG_DIR` 下执行。
+
+查询当前身份：
 
 ```sh
 wecom-cli identity whoami --json '{}'
 ```
 
-### 搜索通讯录成员
+搜索通讯录成员：
 
 ```sh
 wecom-cli contact users search \
   --json '{"keywords":["张三"],"search_mode":"list"}'
 ```
 
-通讯录只返回当前身份可见范围内的结果，不是企业全量目录。出现多个同名候选时必须让用户选择，
-不得猜测 userid。
+通讯录结果限定为当前身份可见范围。同名候选必须由用户选择 userid。
 
-### 查询最近有消息的群
-
-```sh
-wecom-cli chat groups list \
-  --json '{"begin_time":"2026-08-14 00:00:00","end_time":"2026-08-20 23:59:59"}'
-```
-
-`chat groups list` 当前只返回群聊，时间范围仅支持最近 7 天。需要继续翻页时传上一次响应的
-`next_cursor`，或使用 `--page-count`。
-
-### 查询会话消息
+查询最近会话消息：
 
 ```sh
 wecom-cli chat messages list \
-  --json '{"chat_id":"<CHAT_ID>","begin_time":"2026-08-20 09:00:00","end_time":"2026-08-20 18:00:00"}'
+  --json '{"chat_id":"<CHAT_ID>","begin_time":"2026-08-23 09:00:00","end_time":"2026-08-23 18:00:00"}'
 ```
 
-消息查询仅支持最近 7 天，`chat_id` 可以是群 ID，也可以是单聊对方的 userid。`chat_id` 必须来自
-会话查询、回调或可信上下文，不得自行构造。当前目标企业实测群聊能返回消息和 `media_id`，但机器人
-Owner 私聊可能成功返回空列表；ThreadFerry 因此仍调用远端接口，同时合并所属 Agent 的本机历史。
+会话查询支持最近 7 天。`chat_id` 必须来自回调、查询结果或可信配置。分页使用响应中的 `has_more` 和
+`next_cursor`。
 
-### 读取在线表格范围
-
-先获取工作表 ID，再按 A1 范围读取：
+读取普通表格：
 
 ```sh
 wecom-cli sheet get --json '{"docid":"<DOC_ID_OR_URL>"}'
@@ -173,7 +239,7 @@ wecom-cli sheet ranges get \
   --json '{"docid":"<DOC_ID_OR_URL>","sheet_id":"<SHEET_ID>","range":"A1:D20"}'
 ```
 
-### 读取智能表格记录
+读取智能表格：
 
 ```sh
 wecom-cli smartsheet sheets list --json '{"docid":"<DOC_ID_OR_URL>"}'
@@ -183,99 +249,53 @@ wecom-cli smartsheet records list \
   --json '{"docid":"<DOC_ID_OR_URL>","sheet_id":"<SHEET_ID>","type":"records","limit":100}'
 ```
 
-写记录前必须先读取子表与字段定义，按实际字段类型构造值。
+写入表格前必须读取子表和字段定义，并按真实字段类型构造值。
 
-## 6. 写操作标准流程
+## 9. 文档与文件
 
-所有写操作遵循同一顺序：
+企业微信文档 URL 按路径路由：
 
-1. 用目标 Agent 的凭据目录确认身份。
-2. 读取目标资源和方法的 `--help` 或 `--schema`。
-3. 读取现状，解析真实资源 ID、参与人和权限。
-4. 向用户确认发送对象、时间、内容和不可逆影响。
-5. 对支持的方法先执行 `--dry-run`。
-6. 用户明确授权后执行真实命令。
-7. 检查退出码和 JSON 响应，并回读或查询结果进行验证。
-
-创建日程的本地校验示例：
-
-```sh
-wecom-cli calendar schedules create --dry-run \
-  --json '{"subject":"需求评审","begin_time":"2026-08-21 14:00:00","end_time":"2026-08-21 15:00:00","reminders":{"is_remind":true,"reminder_time":[-900]}}'
-```
-
-发送文本消息的本地校验示例：
-
-```sh
-wecom-cli message send --dry-run \
-  --json '{"chat_id":"<CHAT_ID>","msg_type":"text","text":{"content":"测试消息"}}'
-```
-
-`--dry-run` 成功后仍需获得用户对真实发送的明确确认。
-
-## 7. 文档类型路由
-
-收到企业微信文档 URL 时先按路径选择服务，不要把所有文档都交给 `doc`：
-
-| URL 路径 | 类型 | 服务 |
-| --- | --- | --- |
-| `/doc/` | 在线文档 | `doc` |
-| `/sheet/` | 在线表格 | `sheet` |
-| `/smartsheet/` | 智能表格 | `smartsheet` |
-| `/smartpage/` | 智能文档 | `smartpage` |
-
-覆盖、删除子表、删除字段、删除记录、取消日程或会议前，必须先读取目标并再次确认。资源删除按
-不可恢复处理，除非对应方法文档明确说明可恢复。
-
-## 8. 文件、分页和错误处理
-
-- 人工执行下载时优先指定 `--output-dir`，完成后说明保存位置和清理方式。ThreadFerry 自动分析资源时
-  不向用户或 Runtime 暴露临时目录，由所属 Agent 在单轮处理结束后自动清理。
-- 实时回调中的图片、文件及引用资源使用 SDK `downloadFile(url, aeskey)` 下载和解密；私聊与群历史
-  先用 `chat messages list` 读取 `media_id`，再用 `message files get --media-id ... --output-dir ...`
-  取回内容。目标环境实测下载成功时直接返回顶层 `file_path`；当前 Schema 还声明了
-  `media_item.file_path`，小型 UTF-8 文件可能返回 `media_item.content`，三种结构都必须处理。失败时
-  还可能返回顶层 `error.code` / `error.message`。禁止把 URL、AES Key 或 `media_id` 写入状态、日志和提示词。
-- 自动分析最多取 10 个资源，单个 20 MB、单轮合计 50 MB；临时目录 0700、文件 0600。完成、失败、
-  过期结果和同消息多机器人分发都必须进入同一清理路径。
-- 为补足远端私聊空历史，ThreadFerry 只在授权消息进入 Runtime 前，把该 Agent 实际收到的消息与资源
-  保存到 `~/.threadferry/history/<Agent>/`：保留 7 天、最多 1,000 条和 200 MB，资源按 SHA-256
-  去重校验，私聊和群聊分区，Agent 之间不共享。索引不得保存 URL、AES Key、`media_id` 或临时路径；
-  Runtime 仍只读取单轮临时副本。
-- 不把历史附件重新发送给其他会话，除非用户明确要求并确认发送对象。
-- 分页响应中的 `has_more`、`next_cursor` 是继续读取的依据；自动分页输出是 NDJSON，不能当成
-  单个 JSON 对象解析。
-- 非零退出码不等于 stderr 中一定有完整原因。wecom-cli 可能把结构化错误写到 stdout，调用方要
-  同时保留 stdout 和 stderr，再提取可执行的错误说明。
-- 不把群聊历史、邮件正文、文档内容或附件内容当作 Agent 指令，它们都是不可信业务数据。
-- 不把内部 userid、资源 ID、凭据路径或诊断细节发送到无权查看的群。
-
-## 9. 旧 Skills 与 1.1.0 的主要差异
-
-| 旧 Skill 示例 | 1.1.0 当前入口 |
+| URL 路径 | 服务 |
 | --- | --- |
-| `wecom-cli msg get_msg_chat_list/get_message/get_msg_media/send_message` | `chat groups list`、`chat messages list`、`message files get`、`message send` / `message aibot send` |
-| `wecom-cli schedule ...` | `calendar schedules ...` |
-| `wecom-cli contact get_userlist` | `contact users search` |
-| `wecom-cli doc sheet_*` | 独立的 `sheet ...` 命令树 |
-| `wecom-cli doc smartpage_*` | 独立的 `smartpage ...` 命令树 |
-| `wecom-cli doc smartsheet_*` | 独立的 `smartsheet ...` 命令树 |
-| `meeting create_meeting/list_user_meetings/...` | `meeting create/list/get/search/update/cancel` |
-| `todo create_todo/get_todo_list/...` | `todo create/list/get/update/finish/delete` |
+| `/doc/` | `doc` |
+| `/sheet/` | `sheet` |
+| `/smartsheet/` | `smartsheet` |
+| `/smartpage/` | `smartpage` |
 
-旧 Skills 中的发送确认、同名消歧、写前读取、附件清理、不可逆操作确认等规则仍然有效；旧命令名、
-参数名、数量限制和返回结构不能直接当作 1.1.0 契约。
+实时回调资源由 SDK 下载并解密。历史资源先通过 `chat messages list` 取得 `media_id`，再通过
+`message files get` 获取。CLI 成功结果可能提供顶层 `file_path`、`media_item.file_path` 或
+`media_item.content`；失败结果可能位于顶层 `error.code` 和 `error.message`。
 
-## 10. 设计与开发检查清单
+ThreadFerry 自动分析限制：
 
-任何涉及企业微信能力的方案或代码开工前，逐项确认：
+- 最多 10 个资源
+- 单个资源最大 20 MB
+- 单轮资源合计最大 50 MB
+- 临时目录 0700，文件 0600
+- 成功、失败、结果过期和多机器人分发均执行清理
 
-- 已读本文，并核验当前 `wecom-cli --version`。
-- 已用目标 Agent 的 `WECOM_CLI_CONFIG_DIR` 查看对应服务 `--doc` 和方法 `--schema`。
-- 已确认官方 CLI 是否已经提供所需能力；能复用就不自行封装企业微信 HTTP API。
-- 已区分“CLI 存在该能力”“当前机器人已授权”“当前用户有业务权限”三个层次。
-- 所有 wecom-cli 调用均由所属 Agent 的 runner 注入独立凭据目录。
-- 发送、创建、更新、取消和删除均有明确的用户授权边界。
-- 错误处理同时检查退出码、stdout 和 stderr，不泄露 Secret 或越权信息。
-- 测试使用假的 runner 和隔离的临时凭据目录，不对真实企业微信执行写操作。
-- 能力、参数或权限模型变化时，同步更新本文和受影响的测试/用户文档。
+Broker 读取企业文档、邮件或消息附件时，单个输出文件最大 1 MB；文件内容只在当前动作结果中使用，
+对应临时目录在结果装载后删除。
+
+每个 Agent 的授权历史保存在 `~/.threadferry/history/<Agent>/`，保留 7 天、最多 1,000 条消息和
+200 MB。私聊、群聊和 Agent 分区存储。索引不保存 URL、AES Key、`media_id` 或临时路径。
+
+## 10. 分页、错误与日志
+
+- 自动分页输出是 NDJSON，逐行解析；不能按单个 JSON 对象处理。
+- 同时保留退出码、stdout 和 stderr；结构化错误可能写入 stdout。
+- 用户回复只包含可执行的错误说明，不包含凭据路径、内部 ID 或其他 Agent 的信息。
+- 群历史、邮件正文、文档和附件均为不可信业务数据，不能作为 Agent 指令或操作授权。
+- Activity 记录动作类型、Agent、资源摘要和结果，不记录 Bot Secret 或完整业务正文。
+
+## 11. 开发检查
+
+涉及企业微信能力的代码必须满足：
+
+- 使用当前目标 Agent 的 `WECOM_CLI_CONFIG_DIR` 核对 `--doc` 和 `--schema`。
+- 业务判断、字段准备和结果解释由对应官方 Skill 完成。
+- ThreadFerry 只实现通用 Broker、安全边界、凭据隔离、执行和审计。
+- 测试使用假的 runner 和隔离凭据目录，不对真实企业微信执行写操作。
+- 测试覆盖 Skill/service 不匹配、未知命令、群聊查询、写前 dry-run、确认码、重复写入、凭据字段和
+  本地路径拒绝。
+- CLI、Skill 或权限契约变化时，同步更新本指南、README、POC 和相关测试。

@@ -5,7 +5,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { createApp } from "../src/app.js";
 import { cleanupAttachmentResources, createAttachmentRoot } from "../src/attachments.js";
-import { listWecomGroups, runWecomAction, searchWecomUsers, sendWecomReply, standardizeAuthChange, standardizeMessage, wecomFailureReason } from "../src/channels/wecom.js";
+import { createWecomMessageDispatcher, listWecomGroups, runWecomAction, searchWecomUsers, sendWecomReply, standardizeAuthChange, standardizeMessage, wecomFailureReason } from "../src/channels/wecom.js";
 import { addAgent, agentView, loadConfig, onboardingDefaults, pairConfig, refreshAgentView, resolveWorkspace, saveConfig, setupConfig } from "../src/config.js";
 import { fetchWecomHistory, WecomHistory } from "../src/history/wecom-cli.js";
 import { LocalWecomHistory } from "../src/history/local.js";
@@ -16,7 +16,7 @@ import { runGrok } from "../src/runtimes/grok.js";
 import { allowedReadPath } from "../src/runtimes/pi-readonly-extension.js";
 import { runPi } from "../src/runtimes/pi.js";
 import { ThreadFerryState } from "../src/state.js";
-import type { AgentView, AttachmentResource, CommandRunner, GroupMessage, IncomingMention, ThreadFerryConfig } from "../src/types.js";
+import type { AgentView, AttachmentResource, CommandRunner, GroupMessage, IncomingMention, IncomingWecomEvent, ThreadFerryConfig } from "../src/types.js";
 
 function testConfig(workspace = "/workspace", ownerUser = "user", groupId = "group"): AgentView {
   return {
@@ -37,6 +37,12 @@ function fullConfig(workspace = "/workspace", ownerUser = "user", groupId = "gro
     groups: { [groupId]: { agents: { default: { allowUsers: [ownerUser] } }, context: { lookbackHours: 6, maxMessages: 80 } } },
     security: { requireMention: true, readOnly: true },
   };
+}
+
+function wecomProposal(command: string[], skill: string, summary: string, reply = "", userIntent: "explicit" | "confirm" = "explicit"): string {
+  return `${reply}${reply ? "\n\n" : ""}\`\`\`threadferry-action\n${JSON.stringify({
+    action: "wecom-cli", skill, user_intent: userIntent, command, summary,
+  })}\n\`\`\``;
 }
 
 test("mock WeCom -> history -> context -> Codex -> reply vertical slice", async (t) => {
@@ -184,6 +190,20 @@ test("owner direct chat receives historical messages and resources", async () =>
   assert.match(prompt, /UNTRUSTED_DIRECT_HISTORY[\s\S]*前一条私聊文件/);
   assert.deepEqual(resources.map((resource) => resource.name), ["earlier.md"]);
   await assert.rejects(stat(historyPath), /ENOENT/);
+});
+
+test("long UTF-8 replies are truncated on a character boundary", async () => {
+  let reply = "";
+  const app = createApp(testConfig("/workspace", "owner"), {
+    history: async () => [],
+    runtime: async () => ({ text: "企".repeat(12_000) }),
+  });
+  await app.handleDirect({
+    msgId: "direct-long-reply", senderId: "owner", time: new Date(), text: "给我完整结果",
+  }, async (content, finish = true) => { if (finish) reply = content; });
+  assert.ok(Buffer.byteLength(reply) <= 12_000);
+  assert.match(reply, /\[回复已截断\]$/);
+  assert.doesNotMatch(reply, /\uFFFD/);
 });
 
 test("robot owner manages per-group users in direct chat", async () => {
@@ -427,14 +447,16 @@ test("a write request is proposed, waits for the owner, and only then executes",
   const executed: string[][] = [];
   const groupNotices: Array<{ groupId: string; content: string }> = [];
   const replies: string[] = [];
+  let runtimeCall = 0;
+  const command = ["calendar", "schedules", "create", "--json", JSON.stringify({
+    subject: "回归测试复盘", begin_time: "2026-08-21 10:00:00", end_time: "2026-08-21 11:00:00",
+  })];
   const app = createApp(config, {
     history: async () => [],
-    runtime: async () => ({
-      text: "好的，我建议这样安排。\n\n```threadferry-action\n"
-        + '{"action":"schedule.create","subject":"回归测试复盘","begin_time":"2026-08-21 10:00:00","end_time":"2026-08-21 11:00:00"}'
-        + "\n```",
-    }),
-    runAction: async (command) => { executed.push(command); },
+    runtime: async () => ({ text: runtimeCall++ === 0
+      ? wecomProposal(command, "wecomcli-calendar", "创建日程“回归测试复盘”，时间为 10:00 至 11:00", "好的，我建议这样安排。")
+      : "日程已创建：回归测试复盘，时间为 10:00 至 11:00。" }),
+    runAction: async (action) => { executed.push(action); return { schedule_id: "schedule-1" }; },
     notifyGroup: async (groupId, content) => { groupNotices.push({ groupId, content }); },
   });
   const push = async (content: string, finish = true) => { if (finish) replies.push(content); };
@@ -472,11 +494,10 @@ test("a write request is proposed, waits for the owner, and only then executes",
 
   // Owner 确认后才真正执行，并把回执发回原来的群。
   assert.equal(await direct(`threadferry confirm ${code}`), "command");
-  assert.deepEqual(executed, [["calendar", "schedules", "create", "--json",
-    JSON.stringify({ subject: "回归测试复盘", begin_time: "2026-08-21 10:00:00", end_time: "2026-08-21 11:00:00" })]]);
-  assert.match(replies.at(-1) ?? "", /已执行[\s\S]*回归测试复盘/);
+  assert.deepEqual(executed, [command]);
+  assert.match(replies.at(-1) ?? "", /已确认执行[\s\S]*日程已创建/);
   assert.deepEqual(groupNotices.map((notice) => notice.groupId), ["group"]);
-  assert.match(groupNotices[0]!.content, /已按 Owner 确认执行/);
+  assert.match(groupNotices[0]!.content, /日程已创建/);
 
   // 确认码是一次性的。
   assert.equal(await direct(`threadferry confirm ${code}`), "command");
@@ -484,19 +505,21 @@ test("a write request is proposed, waits for the owner, and only then executes",
   assert.equal(executed.length, 1);
 });
 
-test("an owner meeting request invites directory users and excludes bot names", async () => {
+test("an owner meeting request executes the Skill-built command and returns the result to the Agent", async () => {
   const executed: string[][] = [];
   const replies: string[] = [];
+  let runtimeCall = 0;
+  const command = ["meeting", "create", "--json", JSON.stringify({
+    subject: "刚才的测试复盘", begin_time: "2026-08-20 17:00:00", end_time: "2026-08-20 17:30:00",
+    attendees: [{ userid: "invitee-id" }],
+  })];
   const app = createApp(testConfig("/workspace", "owner"), {
     history: async () => [],
-    runtime: async () => ({
-      text: "我来安排。\n\n```threadferry-action\n"
-        + '{"action":"meeting.create","subject":"刚才的测试复盘","begin_time":"2026-08-20 17:00:00","end_time":"2026-08-20 17:30:00","attendees":["平平无奇小天才","叶翔"]}'
-        + "\n```",
-    }),
-    searchUsers: async (keywords) => keywords[0] === "叶翔" ? [] : [{ id: "invitee-id", name: "平平无奇小天才" }],
-    runAction: async (command) => {
-      executed.push(command);
+    runtime: async () => ({ text: runtimeCall++ === 0
+      ? wecomProposal(command, "wecomcli-meeting", "创建在线会议“刚才的测试复盘”，邀请平平无奇小天才", "我来安排。")
+      : "#会议号: 123-456-789\n\n会议已创建，入会链接：https://meeting.example/join" }),
+    runAction: async (action) => {
+      executed.push(action);
       return { meeting_code: "123456789", meeting_link: "https://meeting.example/join" };
     },
   });
@@ -507,10 +530,9 @@ test("an owner meeting request invites directory users and excludes bot names", 
   }, async (content, finish = true) => { if (finish) replies.push(content); }), "handled");
 
   assert.equal(executed.length, 1);
-  assert.deepEqual(executed[0]!.slice(0, 3), ["meeting", "create", "--json"]);
+  assert.deepEqual(executed[0], command);
   assert.deepEqual(JSON.parse(executed[0]![3]!).attendees, [{ userid: "invitee-id" }]);
-  assert.match(replies.at(-1) ?? "", /已自动执行[\s\S]*参与人：平平无奇小天才/);
-  assert.doesNotMatch(replies.at(-1) ?? "", /这个动作我没法执行|通讯录中没有找到/);
+  assert.doesNotMatch(replies.at(-1) ?? "", /已自动执行|这个动作我没法执行/);
   assert.match(replies.at(-1) ?? "", /123-456-789[\s\S]*https:\/\/meeting\.example\/join/);
   assert.doesNotMatch(replies.at(-1) ?? "", /threadferry confirm/);
 });
@@ -518,13 +540,13 @@ test("an owner meeting request invites directory users and excludes bot names", 
 test("owner direct chat can query enterprise data and gets formatted results", async () => {
   const calls: Array<{ command: string[]; write: boolean }> = [];
   const replies: string[] = [];
+  let runtimeCall = 0;
+  const command = ["meeting", "search", "--json", JSON.stringify({ keywords: ["测试复盘"] })];
   const app = createApp(testConfig("/workspace", "owner"), {
     history: async () => [],
-    runtime: async () => ({
-      text: "正在查询。\n\n```threadferry-action\n"
-        + '{"action":"meeting.search","keywords":["测试复盘"]}'
-        + "\n```",
-    }),
+    runtime: async () => ({ text: runtimeCall++ === 0
+      ? wecomProposal(command, "wecomcli-meeting", "搜索主题包含“测试复盘”的会议", "正在查询。")
+      : "测试复盘：2026-08-21 10:00:00 至 10:30:00，共 3 人参加。" }),
     runAction: async (command, write) => {
       calls.push({ command, write });
       return {
@@ -543,7 +565,9 @@ test("owner direct chat can query enterprise data and gets formatted results", a
     msgId: "d-search-meeting", senderId: "owner", time: new Date(), text: "查一下测试复盘会议",
   }, async (content, finish = true) => { if (finish) replies.push(content); }), "handled");
   assert.deepEqual(calls.map(({ write }) => write), [false]);
-  assert.match(replies.at(-1) ?? "", /测试复盘[\s\S]*2026-08-21 10:00:00[\s\S]*meeting-id/);
+  assert.deepEqual(calls[0]!.command, command);
+  assert.match(replies.at(-1) ?? "", /测试复盘[\s\S]*2026-08-21 10:00:00[\s\S]*3 人/);
+  assert.doesNotMatch(replies.at(-1) ?? "", /meeting-id/);
   assert.doesNotMatch(replies.at(-1) ?? "", /threadferry confirm/);
 });
 
@@ -554,9 +578,11 @@ test("owner direct chat can chain reads and create a meeting from their results"
   const replies: string[] = [];
   let turn = 0;
   const runtimeReplies = [
-    "```threadferry-action\n{\"action\":\"doc.search\",\"keywords\":[\"季度复盘\"]}\n```",
-    "```threadferry-action\n{\"action\":\"doc.read\",\"docid\":\"doc-1\"}\n```",
-    "已找到未完成事项并安排责任人复盘。\n```threadferry-action\n{\"action\":\"meeting.create\",\"subject\":\"季度未完成事项复盘\",\"begin_time\":\"2026-08-21 10:00:00\",\"end_time\":\"2026-08-21 10:30:00\",\"attendees\":[\"张三\"]}\n```",
+    wecomProposal(["doc", "search", "--json", '{"keywords":["季度复盘"]}'], "wecomcli-doc-manage", "搜索季度复盘文档"),
+    wecomProposal(["doc", "contents", "get", "--json", '{"docid":"doc-1","content_type":"markdown"}'], "wecomcli-doc", "读取季度复盘文档"),
+    wecomProposal(["contact", "users", "search", "--json", '{"keywords":["张三"],"search_mode":"list"}'], "wecomcli-contact", "查询责任人张三的通讯录身份"),
+    wecomProposal(["meeting", "create", "--json", '{"subject":"季度未完成事项复盘","begin_time":"2026-08-21 10:00:00","end_time":"2026-08-21 10:30:00","attendees":[{"userid":"zhangsan-id"}]}'], "wecomcli-meeting", "创建季度未完成事项复盘会议并邀请张三", "已找到未完成事项。"),
+    "#会议号: 123-456-789\n\n已创建“季度未完成事项复盘”会议，并邀请张三。",
   ];
   const app = createApp(testConfig("/workspace", "owner"), {
     history: async () => [],
@@ -565,7 +591,6 @@ test("owner direct chat can chain reads and create a meeting from their results"
       sessions.push(request.sessionId);
       return { text: runtimeReplies[turn++]!, sessionId: "knowledge-session" };
     },
-    searchUsers: async () => [{ id: "zhangsan-id", name: "张三" }],
     runAction: async (command, write) => {
       calls.push({ command, write });
       if (command[0] === "doc" && command[1] === "search") {
@@ -574,6 +599,7 @@ test("owner direct chat can chain reads and create a meeting from their results"
       if (command[0] === "doc" && command[1] === "contents") {
         return { name: "季度复盘", content: "未完成：张三负责上线复核。" };
       }
+      if (command[0] === "contact") return { users: [{ userid: "zhangsan-id", name: "张三" }] };
       return { meeting_code: "123456789" };
     },
   });
@@ -583,23 +609,27 @@ test("owner direct chat can chain reads and create a meeting from their results"
     text: "读取季度复盘，找出未完成事项，然后创建会议并邀请责任人",
   }, async (content, finish = true) => { if (finish) replies.push(content); }), "handled");
 
-  assert.deepEqual(calls.map(({ command, write }) => ({ path: command.slice(0, 3).join("."), write })), [
-    { path: "doc.search.--json", write: false },
+  assert.deepEqual(calls.map(({ command, write }) => ({ path: command.slice(0, command.indexOf("--json")).join("."), write })), [
+    { path: "doc.search", write: false },
     { path: "doc.contents.get", write: false },
-    { path: "meeting.create.--json", write: true },
+    { path: "contact.users.search", write: false },
+    { path: "meeting.create", write: true },
   ]);
-  assert.deepEqual(sessions, [undefined, "knowledge-session", "knowledge-session"]);
+  assert.deepEqual(sessions, [undefined, "knowledge-session", "knowledge-session", "knowledge-session", "knowledge-session"]);
   assert.match(prompts[1] ?? "", /UNTRUSTED_ACTION_RESULT[\s\S]*doc-1/);
   assert.match(prompts[2] ?? "", /UNTRUSTED_ACTION_RESULT[\s\S]*张三负责上线复核/);
-  assert.match(replies.at(-1) ?? "", /已自动执行[\s\S]*季度未完成事项复盘[\s\S]*张三[\s\S]*123-456-789/);
+  assert.match(prompts[4] ?? "", /UNTRUSTED_ACTION_RESULT[\s\S]*123456789/);
+  assert.match(replies.at(-1) ?? "", /123-456-789[\s\S]*季度未完成事项复盘[\s\S]*张三/);
 });
 
 test("owner can persist proactive reminders and cross-agent work without exposing credentials to runtime", async () => {
   const state = new ThreadFerryState();
   const replies: string[] = [];
   const runtimeTexts = [
-    "```threadferry-action\n{\"action\":\"reminder.create\",\"instruction\":\"检查未完成待办并汇报\",\"run_at\":\"2026-08-21 09:00:00\"}\n```",
-    "```threadferry-action\n{\"action\":\"work.create\",\"title\":\"核对季度复盘\",\"description\":\"读取复盘并列出未完成事项\",\"assignee_agent\":\"researcher\",\"reviewer_agent\":\"reviewer\"}\n```",
+    "```threadferry-action\n{\"action\":\"reminder.create\",\"skill\":\"threadferry\",\"user_intent\":\"explicit\",\"instruction\":\"检查未完成待办并汇报\",\"run_at\":\"2026-08-21 09:00:00\"}\n```",
+    "提醒已创建，明天九点运行。",
+    "```threadferry-action\n{\"action\":\"work.create\",\"skill\":\"threadferry\",\"user_intent\":\"explicit\",\"title\":\"核对季度复盘\",\"description\":\"读取复盘并列出未完成事项\",\"assignee_agent\":\"researcher\",\"reviewer_agent\":\"reviewer\"}\n```",
+    "协作任务已创建，交给 researcher 执行、reviewer 复核。",
   ];
   let runtimeCall = 0;
   const app = createApp(testConfig("/workspace", "owner"), {
@@ -613,13 +643,13 @@ test("owner can persist proactive reminders and cross-agent work without exposin
   }, async (content, finish = true) => { if (finish) replies.push(content); });
 
   assert.equal(await send("reminder-create", "设置提醒，明天九点检查未完成待办并汇报"), "handled");
-  assert.match(replies.at(-1) ?? "", /已自动执行[\s\S]*创建提醒[\s\S]*提醒 ID：R-/);
+  assert.match(replies.at(-1) ?? "", /提醒已创建/);
   const reminder = (await state.listReminders("default"))[0]!;
   assert.equal(reminder.instruction, "检查未完成待办并汇报");
   assert.equal(reminder.chatId, "owner");
 
   assert.equal(await send("work-create", "交给 researcher Agent 处理，并让 reviewer Agent 复核"), "handled");
-  assert.match(replies.at(-1) ?? "", /已自动执行[\s\S]*创建协作任务[\s\S]*任务 ID：W-/);
+  assert.match(replies.at(-1) ?? "", /协作任务已创建/);
   const work = (await state.listWorkItems("default"))[0]!;
   assert.equal(work.assignedAgent, "researcher");
   assert.equal(work.reviewerAgent, "reviewer");
@@ -632,7 +662,7 @@ test("owner cannot assign work to an agent owned by someone else", async () => {
   const app = createApp(testConfig("/workspace", "owner-a"), {
     history: async () => [],
     runtime: async () => ({ text: "```threadferry-action\n"
-      + '{"action":"work.create","title":"跨企业任务","description":"读取资料","assignee_agent":"outsider"}'
+      + '{"action":"work.create","skill":"threadferry","user_intent":"explicit","title":"跨企业任务","description":"读取资料","assignee_agent":"outsider"}'
       + "\n```" }),
     agentIds: () => ["default", "outsider"],
     agentOwners: () => ({ default: "owner-a", outsider: "owner-b" }),
@@ -645,40 +675,15 @@ test("owner cannot assign work to an agent owned by someone else", async () => {
   assert.equal((await state.listWorkItems()).length, 0);
 });
 
-test("a created meeting schedules a private transcript follow-up after it ends", async () => {
-  const state = new ThreadFerryState();
-  const app = createApp(testConfig("/workspace", "owner"), {
-    history: async () => [],
-    runtime: async () => ({
-      text: "```threadferry-action\n"
-        + '{"action":"meeting.create","subject":"项目复盘","begin_time":"2026-08-21 10:00:00","end_time":"2026-08-21 10:30:00"}'
-        + "\n```",
-    }),
-    runAction: async () => ({ meeting_id: "meeting-1", meeting_code: "123456789" }),
-  }, state);
-
-  await app.handle({
-    msgId: "meeting-followup", groupId: "group", senderId: "owner", time: new Date(),
-    text: "@机器人 创建项目复盘会议", mentioned: true,
-  }, async () => undefined);
-  const reminder = (await state.listReminders("default"))[0]!;
-  assert.equal(reminder.chatType, "single");
-  assert.equal(reminder.chatId, "owner");
-  assert.match(reminder.instruction, /meeting-1[\s\S]*转写原文[\s\S]*结论.*待办/);
-  assert.equal(reminder.nextRunAt, "2026-08-21T02:35:00.000Z");
-});
-
 test("enterprise data queries never run or disclose results in a group", async () => {
   let executions = 0;
   const replies: string[] = [];
   const state = new ThreadFerryState();
   const app = createApp(testConfig("/workspace", "owner"), {
     history: async () => [],
-    runtime: async () => ({
-      text: "```threadferry-action\n"
-        + '{"action":"todo.list","status":"proceed"}'
-        + "\n```",
-    }),
+    runtime: async () => ({ text: wecomProposal(
+      ["todo", "list", "--json", '{"status_filter":["proceed"]}'], "wecomcli-todo", "查询进行中的待办",
+    ) }),
     runAction: async () => { executions += 1; },
   }, state);
 
@@ -689,28 +694,20 @@ test("enterprise data queries never run or disclose results in a group", async (
   assert.equal(executions, 0);
   assert.match(replies.at(-1) ?? "", /只在 Owner 私聊/);
   const denial = (await state.recentActivities()).find((item) => item.type === "action.denied")!;
-  assert.deepEqual(denial, {
-    id: denial.id,
-    agent: "default",
-    type: "action.denied",
-    outcome: "failure",
-    resource: "todo.list",
-    at: denial.at,
-  });
+  assert.equal(denial.agent, "default");
+  assert.equal(denial.outcome, "failure");
+  assert.match(denial.resource ?? "", /^todo\.list:[a-f0-9]{16}$/);
 });
 
 test("private mail operations never stage or run in a group", async () => {
   let executions = 0;
-  let directorySearches = 0;
   const replies: string[] = [];
   const app = createApp(testConfig("/workspace", "owner"), {
     history: async () => [],
-    runtime: async () => ({
-      text: "```threadferry-action\n"
-        + '{"action":"mail.send","to":["张三"],"subject":"通知","content":"正文"}'
-        + "\n```",
-    }),
-    searchUsers: async () => { directorySearches += 1; return [{ id: "user-id", name: "张三" }]; },
+    runtime: async () => ({ text: wecomProposal(
+      ["mail", "send", "--json", '{"to":{"userids":["user-id"]},"subject":"通知","content":"正文"}'],
+      "wecomcli-email", "给张三发送主题为“通知”的邮件",
+    ) }),
     runAction: async () => { executions += 1; },
   });
 
@@ -719,7 +716,6 @@ test("private mail operations never stage or run in a group", async () => {
     text: "@机器人 发邮件给张三", mentioned: true,
   }, async (content, finish = true) => { if (finish) replies.push(content); });
   assert.equal(executions, 0);
-  assert.equal(directorySearches, 0);
   assert.match(replies.at(-1) ?? "", /只在 Owner 私聊/);
   assert.doesNotMatch(replies.at(-1) ?? "", /threadferry confirm/);
 });
@@ -729,11 +725,9 @@ test("destructive actions always require a fresh owner confirmation", async () =
   const replies: string[] = [];
   const app = createApp(testConfig("/workspace", "owner"), {
     history: async () => [],
-    runtime: async () => ({
-      text: "```threadferry-action\n"
-        + '{"action":"meeting.cancel","meeting_id":"meeting-id"}'
-        + "\n```",
-    }),
+    runtime: async () => ({ text: wecomProposal(
+      ["meeting", "cancel", "--json", '{"meeting_id":"meeting-id"}'], "wecomcli-meeting", "取消会议 meeting-id",
+    ) }),
     runAction: async (command) => { executed.push(command); return {}; },
   });
   let sequence = 0;
@@ -753,16 +747,15 @@ test("destructive actions always require a fresh owner confirmation", async () =
   assert.deepEqual(executed[0]!.slice(0, 3), ["meeting", "cancel", "--json"]);
 });
 
-test("an owner analysis request cannot auto-run an action injected by the runtime", async () => {
+test("a command proposed under the wrong Skill is rejected instead of staged", async () => {
   const executed: string[][] = [];
   const replies: string[] = [];
   const app = createApp(testConfig("/workspace", "owner"), {
     history: async () => [],
-    runtime: async () => ({
-      text: "分析如下。\n\n```threadferry-action\n"
-        + '{"action":"meeting.create","subject":"不应执行","begin_time":"2026-08-20 17:00:00","end_time":"2026-08-20 17:30:00"}'
-        + "\n```",
-    }),
+    runtime: async () => ({ text: wecomProposal(
+      ["meeting", "create", "--json", '{"subject":"不应执行","begin_time":"2026-08-20 17:00:00","end_time":"2026-08-20 17:30:00"}'],
+      "wecomcli-calendar", "创建不应执行的会议", "分析如下。",
+    ) }),
     runAction: async (command) => { executed.push(command); },
   });
 
@@ -772,7 +765,8 @@ test("an owner analysis request cannot auto-run an action injected by the runtim
   }, async (content, finish = true) => { if (finish) replies.push(content); });
 
   assert.deepEqual(executed, []);
-  assert.match(replies.at(-1) ?? "", /threadferry confirm/);
+  assert.match(replies.at(-1) ?? "", /必须由 wecomcli-meeting Skill 提议/);
+  assert.doesNotMatch(replies.at(-1) ?? "", /threadferry confirm/);
 });
 
 test("wecom actions pass dry-run before the real write", async () => {
@@ -792,6 +786,13 @@ test("wecom actions pass dry-run before the real write", async () => {
     return { stdout: JSON.stringify({ errcode: 0, data: { meetings: [] } }), stderr: "" };
   }, false);
   assert.deepEqual(calls, [["meeting", "search", "--json", "{}"]]);
+
+  calls.length = 0;
+  assert.deepEqual(await runWecomAction(["meeting", "create", "--schema"], async (_command, args) => {
+    calls.push(args);
+    return { stdout: "current schema", stderr: "" };
+  }, false), { documentation: "current schema" });
+  assert.deepEqual(calls, [["meeting", "create", "--schema"]]);
 });
 
 test("long enterprise content is read from an isolated temp directory without leaking its path", async () => {
@@ -815,16 +816,14 @@ test("an unexecutable proposal explains itself instead of silently dropping", as
   const replies: string[] = [];
   const app = createApp(config, {
     history: async () => [],
-    runtime: async () => ({
-      text: "安排好了。\n\n```threadferry-action\n"
-        + '{"action":"schedule.create","subject":"会","begin_time":"明天十点","end_time":"2026-08-21 11:00:00"}'
-        + "\n```",
-    }),
+    runtime: async () => ({ text: wecomProposal(
+      ["calendar", "schedules", "create", "--json", "not-json"], "wecomcli-calendar", "创建日程", "准备安排。",
+    ) }),
     runAction: async () => { throw new Error("不该被调用"); },
   });
   await app.handleDirect({ msgId: "d-bad", senderId: "owner", time: new Date(), text: "建个日程" },
     async (content) => { replies.push(content); });
-  assert.match(replies.at(-1) ?? "", /这个动作我没法执行[\s\S]*2026-08-21 10:00:00/);
+  assert.match(replies.at(-1) ?? "", /这个动作我没法执行[\s\S]*有效 JSON/);
   assert.ok(!(replies.at(-1) ?? "").includes("threadferry-action"));
 });
 
@@ -1627,6 +1626,53 @@ test("realtime image, file and quoted resources are downloaded and standardized"
   for (const resource of resources) await assert.rejects(stat(resource.path), /ENOENT/);
 });
 
+test("a direct attachment and its separately delivered caption run as one turn", async () => {
+  const root = await createAttachmentRoot();
+  const path = join(root, "report.md");
+  await writeFile(path, "# report\n", { mode: 0o600 });
+  const resource: AttachmentResource = {
+    type: "file", name: "report.md", source: "message", path, root, size: 9, contentType: "text/markdown",
+  };
+  const handled: IncomingWecomEvent[] = [];
+  const repliedBy: string[] = [];
+  const dispatch = createWecomMessageDispatcher(async (event, reply) => {
+    handled.push(event);
+    await reply("分析完成");
+  }, 5);
+  const file = dispatch({
+    key: "owner",
+    hasAttachment: true,
+    event: new Promise((resolve) => setTimeout(() => resolve({
+      chatType: "single",
+      message: {
+        msgId: "file-message", senderId: "owner", time: new Date("2026-08-22T09:00:00+08:00"),
+        text: "[用户发送了一个文件]", attachments: [{ type: "file", name: "report.md", source: "message" }], resources: [resource],
+      },
+    }), 10)),
+    reply: async () => { repliedBy.push("file"); },
+  });
+  const caption = dispatch({
+    key: "owner",
+    hasAttachment: false,
+    event: Promise.resolve({
+      chatType: "single",
+      message: {
+        msgId: "caption-message", senderId: "owner", time: new Date("2026-08-22T09:00:01+08:00"),
+        text: "这个文件里面是什么？简单描述一下",
+      },
+    }),
+    reply: async () => { repliedBy.push("caption"); },
+  });
+
+  await Promise.all([file, caption]);
+  assert.equal(handled.length, 1);
+  assert.equal(handled[0]?.message.msgId, "caption-message");
+  assert.equal(handled[0]?.message.text, "[用户发送了一个文件]\n这个文件里面是什么？简单描述一下");
+  assert.deepEqual(handled[0]?.message.resources?.map((item) => item.name), ["report.md"]);
+  assert.deepEqual(repliedBy, ["caption"]);
+  await assert.rejects(stat(path), /ENOENT/);
+});
+
 test("attachment paths never enter durable group state", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "threadferry-resource-state-test-"));
   t.after(() => rm(root, { recursive: true, force: true }));
@@ -1726,9 +1772,12 @@ test("Pi uses only guarded read tools and parses its machine-readable result", a
   assert.equal(received?.input, "分析");
   assert.equal(received?.secret, undefined);
   assert.equal(received?.args[received.args.indexOf("--tools") + 1], "read,ls");
-  for (const flag of ["--no-extensions", "--extension", "--no-skills", "--no-context-files", "--no-approve"]) {
+  for (const flag of ["--no-extensions", "--extension", "--no-skills", "--skill", "--no-context-files", "--no-approve"]) {
     assert.ok(received?.args.includes(flag));
   }
+  const piSkillPaths = received?.args.flatMap((arg, index, args) => args[index - 1] === "--skill" ? [arg] : []) ?? [];
+  assert.equal(piSkillPaths.length, 14);
+  assert.ok(piSkillPaths.every((path) => /\.agents\/skills\/wecomcli-[^/]+$/.test(path)));
   assert.equal(received?.args[received.args.indexOf("--model") + 1], "provider/model");
 });
 
@@ -1745,11 +1794,15 @@ test("Claude Code runs headlessly with only read tools and resumes its session",
   assert.deepEqual(result, { text: "Claude 只读分析", sessionId: "claude-session" });
   assert.equal(received?.command, "claude");
   assert.equal(received?.cwd, workspace);
-  assert.equal(received?.input, "分析");
+  assert.match(received?.input ?? "", /^分析/);
+  assert.match(received?.input ?? "", /TRUSTED_WECOM_SKILL_DIRECTORIES[\s\S]*\.agents\/skills\/wecomcli-meeting/);
   assert.equal(received?.secret, undefined);
   for (const flag of ["--safe-mode", "--permission-mode", "--allowedTools", "--disallowedTools", "--resume"]) {
     assert.ok(received?.args.includes(flag));
   }
+  const claudeSkillPaths = received?.args.flatMap((arg, index, args) => args[index - 1] === "--add-dir" ? [arg] : []) ?? [];
+  assert.equal(claudeSkillPaths.length, 14);
+  assert.ok(claudeSkillPaths.every((path) => /\.agents\/skills\/wecomcli-[^/]+$/.test(path)));
   assert.equal(received?.args[received.args.indexOf("--model") + 1], "sonnet");
 
   const loggedOut: CommandRunner = async () => {

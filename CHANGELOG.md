@@ -4,6 +4,52 @@ ThreadFerry 的每个 GitHub Release 都使用这里对应版本的内容，不�
 
 ## Unreleased
 
+## 0.25.2
+
+修复企业微信动作意图由宿主关键词正则猜测、多机器人管理端通讯录固定使用首个机器人，以及一次
+“附件 + 说明文字”被拆成多条私聊回调后重复启动 Runtime 的问题。
+
+### 主要变化
+
+- 同一用户短时间连续发送的私聊消息中只要包含附件，就在企业微信入口合并为一个分析轮；纯文本消息
+  仍逐条处理，不改变原有对话语义。
+- 聚合发生在附件下载完成前，避免文字回调先到、附件下载较慢时再次拆成两轮；合并后继续执行单轮
+  附件数量、总量限制及临时文件清理。
+- 删除 ThreadFerry 内 42 个会议、日程、待办、邮件、文档、微盘和表格业务动作规格及结果格式化器；
+  Agent 现在按官方 Skill 直接生成资源化 `wecom-cli` 命令，通用 Broker 只校验 Skill、命令形状、
+  读写影响、身份和确认策略，不再与官方 CLI 维护两套业务契约。
+- 企业微信动作不再用宿主自然语言正则猜意图。缺少明确意图的写入会安全降级为 Owner 确认，Skill
+  与 service 不匹配会拒绝；删除、取消、覆盖、完成、发消息和发邮件始终确认。查询与写入结果都会
+  返回同一 Agent 按原 Skill 整理，写入完成后禁止同轮执行第二个动作。
+- Broker 允许 Agent 只读查询当前 CLI 的 `--help` / `--doc` / `--schema`，并拒绝 `auth`、`identity`、
+  任意 shell/选项、凭据字段和 Agent 提供的本地文件路径；实际 CLI 仍使用所属 Agent 的隔离凭据，
+  写入先执行 `--dry-run`。
+- `threadferry onboard` 每次从 WeComTeam/wecom-cli 安装或更新 14 个官方 Skills，新增
+  `threadferry skills install` 补装命令；`doctor` 同时核验目录完整性和安装锁中的官方来源。Codex/Grok
+  使用标准目录，Pi 逐项加载 14 个官方目录，Claude 在 Safe Mode 下仅按可信只读路径开放这 14 项，
+  不把其他全局 Skills 暴露给两个 Runtime。
+- 管理台搜索和添加授权用户时显式携带 Agent，通讯录查询使用该 Agent 自己的机器人凭据，不再固定
+  取启动列表中的第一台机器人。
+- 删除宿主在创建会议后自动植入转写提醒的业务特例；需要会后跟进时，由 Agent 按 Skill 和用户意图
+  显式创建 ThreadFerry 提醒，不再由会议命令触发隐藏副作用。
+- 所有 `threadferry-action` 围栏都会在回复前移除，存在多个提议时只处理第一项，避免内部 JSON 外露或
+  一轮触发多项动作；长 UTF-8 回复改用 Node.js 标准解码器在线性时间内安全截断。
+- TypeScript 构建新增未使用代码、遗漏返回、switch 贯穿和未检查索引门禁，防止无效代码与边界错误
+  再次进入主链路。
+- 中英文 README 统一提供当前产品、安装、对话、官方 Skill 企业能力、安全和运维说明；`POC.md`
+  提供可执行验收清单，`WECOMCLI_GUIDE.md` 固化当前 Skill、CLI、Broker 与凭据边界；发布包包含
+  README 引用的 `CONTRIBUTING.md`。
+
+### 安装与升级
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/GnaixEuy/threadferry/main/install.sh | bash
+```
+
+配置、机器人凭据、Runtime Session 和本机历史均无需迁移。
+
+[查看 v0.25.1...v0.25.2 的完整变更](https://github.com/GnaixEuy/threadferry/compare/v0.25.1...v0.25.2)
+
 ## 0.25.1
 
 修复 Windows 用户在 PowerShell 中执行 Unix 安装命令时被转交给 WSL、并因缺少 `/bin/bash` 而

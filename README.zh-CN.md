@@ -7,23 +7,38 @@
 </p>
 
 <p align="center">
-  <a href="#安装">安装</a> · <a href="#使用">使用</a> ·
-  <a href="#安全">安全</a> · <a href="#开发">开发</a> ·
-  <a href="./CHANGELOG.md">更新日志</a>
+  <a href="#安装">安装</a> · <a href="#首次运行">首次运行</a> ·
+  <a href="#对话使用">对话使用</a> · <a href="#安全边界">安全边界</a> ·
+  <a href="#运维">运维</a> · <a href="./CHANGELOG.md">更新日志</a>
 </p>
 
-ThreadFerry 把企业微信连接到本地只读 AI Agent。每个 Agent 独立拥有机器人、Owner、凭据、群、
-Workspace、Runtime 和 Session，严格 1:1，互不串用。
+ThreadFerry 把企业微信连接到相互隔离的本地 AI Agent。一个 Agent 对应一个企业微信智能机器人，
+独立拥有 Owner、凭据、群、Workspace、Runtime 和 Session。Owner 可以直接私聊；授权成员可以在
+已配置群中 `@机器人` 发起任务。
 
 <p align="center">
   <img src="./docs/assets/threadferry-poster.png" alt="ThreadFerry 支持企业微信群聊、私聊以及 Codex、Pi、Claude、Grok" width="560">
 </p>
 
+## 主要能力
+
+- 在固定本地 Workspace 中运行 Codex、Pi、Claude Code 或 Grok Build。
+- 分析私聊和受控群聊上下文，不向 Runtime 开放文件写入或任意 shell。
+- 读取图片、UTF-8 文本附件、引用资源和近期会话资源。
+- 由企业微信官方 `wecomcli-*` Skill 驱动日程、会议、待办、邮件、文档、微盘、表格和智能表格，
+  通过受控 `wecom-cli` Broker 执行。
+- 创建提醒，并在同一 Owner 的 Agent 之间交接工作。
+- 重启后恢复 Session、排队任务和未投递回复。
+
 ## 安装
 
-需要 macOS、Linux 或 Windows、Node.js 22+、企业微信智能机器人，以及以下任一 Runtime：
-Codex CLI `0.138.0+`、Pi CLI `0.84.2+`、Claude Code `2.1.233+` 或 Grok Build `1.0.5+`。
-安装器会在需要时补装企业微信官方 `wecom-cli 1.1.0+`。
+运行要求：
+
+- macOS、Linux 或 Windows
+- Node.js 22+
+- 一个企业微信智能机器人
+- 任一 Runtime：Codex CLI `0.138.0+`、Pi CLI `0.84.2+`、Claude Code `2.1.233+` 或 Grok Build `1.0.5+`
+- 企业微信官方 `wecom-cli 1.1.0+`（安装器会在需要时补装）
 
 macOS 或 Linux：
 
@@ -31,29 +46,33 @@ macOS 或 Linux：
 curl -fsSL https://raw.githubusercontent.com/GnaixEuy/threadferry/main/install.sh | bash
 ```
 
-Windows PowerShell（不需要 WSL）：
+Windows PowerShell：
 
 ```powershell
 irm https://raw.githubusercontent.com/GnaixEuy/threadferry/main/install.ps1 | iex
 ```
 
-初始化向导会授权机器人、确认 Owner、选择 Runtime 和 Workspace、完成诊断并启动 ThreadFerry。
-需要再次运行时：
+## 首次运行
+
+在交互式终端运行初始化向导：
 
 ```sh
 threadferry onboard
 ```
 
-## 使用
+向导会安装企业微信官方 Skills、授权机器人、确认 Owner、选择 Runtime 和 Workspace、执行诊断并启动
+ThreadFerry。
 
-启动所有已授权 Agent：
+以后可直接启动已配置 Agent：
 
 ```sh
 threadferry start
 ```
 
-本机管理台地址是 [http://127.0.0.1:17638](http://127.0.0.1:17638)，用于管理机器人、Workspace、
-群、用户、Session、提醒、协作任务和 Activity。
+本机管理台地址是 [http://127.0.0.1:17638](http://127.0.0.1:17638)，用于管理 Agent、机器人授权、
+Workspace、群、用户、Session、提醒、协作任务和近期 Activity。
+
+## 对话使用
 
 Owner 可以直接私聊机器人：
 
@@ -61,39 +80,55 @@ Owner 可以直接私聊机器人：
 帮我排查登录请求为什么开始超时。
 ```
 
-在已配置群中 `@机器人`：
+授权成员可以在已配置群中 `@机器人`：
 
 ```text
 @机器人 总结刚才的讨论，并检查相关代码。
 ```
 
-群聊会补充最近 6 小时、最多 80 条消息作为不可信背景；私聊会补充最近 7 天、最多 80 条消息。
-普通群消息不会启动 Runtime。
+群任务会补充最近 6 小时、最多 80 条消息作为不可信上下文；私聊任务会补充最近 7 天、最多 80 条
+消息。普通群消息不会启动 Runtime。
+
+### 企业数据与操作
+
+直接用自然语言描述任务，例如：
+
+```text
+查看我今天下午的会议。
+创建明天上午 10 点、时长 30 分钟的评审会议。
+把这些数据追加到项目智能表格。
+```
+
+Agent 按对应的企业微信官方 Skill 选择能力、补齐必要信息、生成当前 CLI 命令并解释结果。
+ThreadFerry 校验 Skill 与命令路径的对应关系、命令结构、身份、会话边界、操作影响和确认规则，再使用该
+Agent 自己的 `wecom-cli` 凭据执行，并把结果交还同一 Agent。
+
+查询只允许在 Owner 私聊中执行。每次写操作都会先进行本地 `--dry-run` 校验。删除、取消、覆盖、
+完成待办、发送消息和发送邮件需要 Owner 输入新的确认码。
 
 ### 图片和文件
 
-可以在 Owner 私聊中直接发送图片或文件，也可以在已配置群中附带资源或引用资源并 `@机器人`。
-ThreadFerry 会下载并解密当前消息和引用消息中的资源，也能补取私聊或群上下文最近 10 个媒体文件。
-UTF-8 文本文件会交给所有 Runtime，图片走各 Runtime 的原生视觉输入；遇到 Runtime 不支持的
-二进制格式会明确说明“已收到但无法解析”，不会再误报“没有收到”。
+可以在 Owner 私聊中发送图片或文件，也可以在已配置群中附带或引用资源并 `@机器人`。UTF-8 文本可供
+所有 Runtime 读取；图片使用各 Runtime 的原生视觉输入。不支持的二进制格式会明确说明已收到但无法解析。
 
-单个资源最大 20 MB，单轮合计最大 50 MB。为支持重启后的追问，并在企业微信私聊历史暂时返回空时
-继续工作，每个 Agent 会在 `~/.threadferry/history/<Agent>/` 保留自己实际收到的授权消息和资源，
-最多 7 天、1,000 条消息和 200 MB；私聊、群聊和 Agent 之间互不共享。历史目录、索引和内容文件
-分别使用 0700/0600，交给 Runtime 的临时副本会在分析和多机器人分发结束后删除；资源 URL、AES Key、
-`media_id` 和临时路径不会持久化。Grok Build 的 JSON 图片传输受命令行参数长度限制，编码后最大
-700 KB；更大的图片请使用 Codex、Pi 或 Claude。
+单个资源最大 20 MB，单轮合计最大 50 MB。每个 Agent 在
+`~/.threadferry/history/<Agent>/` 保留最多 7 天、1,000 条消息和 200 MB 的授权会话历史，Agent 与
+会话之间保持分区。交给 Runtime 的副本会在单轮结束后删除；持久化历史不保存资源 URL、AES Key、
+`media_id` 或临时路径。
 
-### 机器人和群
+Grok Build 的编码后图片请求上限为 700 KB；更大的图片请使用 Codex、Pi 或 Claude。
 
-一台机器人对应一个 Agent 和一个 Workspace。可从管理台新增，也可以使用终端：
+### Agent 与群
+
+可从管理台或终端新增并授权 Agent：
 
 ```sh
 threadferry agent add --name reviewer --runtime pi --workspace /absolute/path/to/project
 threadferry agent login reviewer
+threadferry agent list
 ```
 
-原生 Claude Code 和 Grok Build 使用本机已有登录与模型，也可以在管理台选择：
+Claude Code 和 Grok Build 使用本机 CLI 的登录与模型配置：
 
 ```sh
 claude auth login
@@ -103,44 +138,39 @@ grok login
 threadferry agent add --name grok-reviewer --runtime grok --workspace /absolute/path/to/project
 ```
 
-私聊要管理的机器人，发送以下命令：
+Owner 通过私聊目标机器人管理它自己的群：
 
 | 命令 | 用途 |
 | --- | --- |
 | `threadferry groups` | 查看可见群和配置状态 |
 | `threadferry bind <群>` | 把群绑定到当前机器人 |
 | `threadferry users <群>` | 查看授权用户 |
+| `threadferry invite <群>` | 生成一次性邀请码 |
 | `threadferry add <群> <姓名>` | 授权用户 |
 | `threadferry remove <群> <姓名>` | 移除用户 |
 | `threadferry open <群>` | 允许群内所有成员使用 |
-| `threadferry close <群>` | 恢复仅授权名单可用 |
+| `threadferry close <群>` | 恢复授权名单 |
+| `threadferry whoami` | 查看当前用户的 ThreadFerry userid |
 
-待绑定列表只能发现最近 7 天有消息的群。把机器人拉进新群后，先发一条消息，再刷新并绑定。
+群列表可发现最近 7 天有消息的群。机器人进入新群后，先在群中发送一条消息，再刷新列表并绑定。
 
-### 企业数据与代办
-
-Agent 可以查询白名单内的日程、会议、待办、邮件、文档、微盘和表格，也能创建受控提醒，或在同一
-Owner 的 Agent 之间交接任务。每个动作都要通过身份、会话、资源、当前意图和确认规则，才能交给
-`wecom-cli` 执行。
-
-个人企业数据只允许在 Owner 私聊中使用。删除、取消、完成整个待办和发送邮件始终需要新的确认码。
-
-## 安全
+## 安全边界
 
 - 每台机器人只接受自己 Owner 的私聊 Agent 请求。
 - 未配置群、未授权用户和没有 `@机器人` 的消息不会启动 Runtime。
-- Agent 之间不共享凭据、Session、群历史或 Workspace。
+- Agent 之间不共享凭据、Owner、Session、会话历史或 Workspace。
 - Codex 禁用网络和文件写入；Pi 只开放经过路径守卫的 `read` 和 `ls`；Claude Code 使用 Safe Mode
-  与只读工具；Grok Build 使用 strict sandbox 与只读工具，并关闭 Web、子 Agent 和 Memory。
-- Runtime 不能提交、推送、部署、删除文件，也不能执行任意企业微信操作。
-- 机器人凭据保存在各 Agent 的官方 `wecom-cli` 加密存储中。ThreadFerry 不会把 Bot Secret
-  写入配置、日志、状态、URL 或环境变量。
-- 群历史、引用、附件和企业内容始终按不可信输入处理。
+  和只读工具；Grok Build 使用 strict sandbox，并关闭 Web、子 Agent 和 Memory。
+- Runtime 不能提交、推送、部署、删除文件、执行任意 shell，也不能直接调用 `wecom-cli`。
+- 机器人凭据保存在各 Agent 的 `wecom-cli` 加密存储中。ThreadFerry 不会把 Bot Secret 写入配置、
+  状态、日志、URL、测试夹具或环境变量。
+- 群历史、引用消息、附件和企业内容始终按不可信输入处理。
 
 ## 运维
 
 ```sh
 threadferry doctor
+threadferry skills install
 threadferry status
 threadferry agent list
 threadferry update
@@ -153,7 +183,8 @@ threadferry update
 
 - 配置：`~/.threadferry/threadferry.yaml`
 - 状态：`~/.threadferry/state-v3.json`
-- 示例：[threadferry.example.yaml](./threadferry.example.yaml)
+- Agent 凭据：`~/.threadferry/wecom/<Agent>/`
+- 配置示例：[threadferry.example.yaml](./threadferry.example.yaml)
 
 ## 开发
 
@@ -163,5 +194,5 @@ npm run typecheck
 npm test
 ```
 
-真实企业微信验收见 [POC.md](./POC.md)，Gitmoji 提交规范见 [CONTRIBUTING.md](./CONTRIBUTING.md)。
-项目使用 [MIT License](./LICENSE)。
+验收步骤见 [POC.md](./POC.md)，Gitmoji 提交规范见 [CONTRIBUTING.md](./CONTRIBUTING.md)。项目使用
+[MIT License](./LICENSE)。

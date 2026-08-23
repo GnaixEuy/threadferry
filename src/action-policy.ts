@@ -8,10 +8,10 @@ export function decideAction(input: {
   private: boolean;
   channel: "group" | "direct";
   owner: boolean;
-  explicit: boolean;
+  agentExplicit: boolean;
 }): ActionDecision {
   if (input.channel === "group" && (input.mode === "read" || input.private)) return "deny_private";
   if (input.mode === "read") return "execute";
   if (input.mode === "destructive") return "confirm";
-  return input.owner && input.explicit ? "execute" : "confirm";
+  return input.owner && input.agentExplicit ? "execute" : "confirm";
 }

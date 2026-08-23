@@ -1,6 +1,6 @@
 {
   "name": "threadferry",
-  "version": "0.25.1",
+  "version": "0.25.2",
   "description": "Safely ferry enterprise chat context to read-only local AI agents.",
   "type": "module",
   "bin": {
@@ -10,6 +10,7 @@
     "dist/src",
     "README.md",
     "README.zh-CN.md",
+    "CONTRIBUTING.md",
     "CHANGELOG.md",
     "docs/assets/threadferry-hero-v2.png",
     "docs/assets/threadferry-poster.png",

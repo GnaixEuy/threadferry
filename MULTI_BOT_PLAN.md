@@ -19,10 +19,10 @@
 | P0 | 连续查询企业数据，再完成最终写入 | ✅ 完成 |
 | P1 | 持久提醒、主动唤醒与 Agent Inbox | ✅ 完成 |
 | P2 | 跨 Agent 任务交接、执行与复核 | ✅ 完成 |
-| P3 | 会后自动读取转写并汇报、文档评论触发 | ⛔ 会后链路完成；文档评论事件受平台阻塞 |
+| P3 | 会后跟进与文档评论触发 | ⛔ 会后改为显式提醒；文档评论事件受平台阻塞 |
 | P4 | 统一动作策略、资源审计与 Activity 可观测性 | ✅ 完成 |
 
-状态图例：⬜ 未开始 / 🟡 进行中 / ✅ 完成 / ⛔ 阻塞　　当前测试：**148/148 通过**
+状态图例：⬜ 未开始 / 🟡 进行中 / ✅ 完成 / ⛔ 阻塞　　当前测试：**158/158 通过，另 1 项 Windows 专用测试跳过**
 
 ---
 
@@ -57,6 +57,23 @@ agent 之间完全独立。多条连接并发跑在一个 ThreadFerry 进程里�
 
 ## 设计修正记录
 
+**2026-08-23：企业微信业务能力归还官方 Skill，ThreadFerry 收敛为通用 Broker。**
+
+- [x] 删除宿主内 42 个会议、日程、待办、邮件、文档、微盘和表格 `ActionSpec`，以及参与人转换、
+  参数拼装和结果格式化；官方 Skill 负责业务路由、澄清、前置查询、精确命令与最终表达。
+- [x] 统一为一个 `wecom-cli` 提议：Agent 输出 `skill`、`user_intent`、完整 `command` 和 `summary`；
+  Broker 只做 service/Skill 匹配、命令形状、读写/破坏性分类、Owner/会话确认、dry-run 和审计。
+- [x] Broker 支持通过 `--help` / `--doc` / `--schema` 把当前 CLI 契约回传 Agent，拒绝 `auth`、
+  `identity`、任意 shell/选项、凭据字段和 Agent 提供的本地路径；所有调用继续使用所属 Agent 的
+  `WECOM_CLI_CONFIG_DIR`。
+- [x] 查询与写入结果都回到同一 Agent；写入完成后禁止同轮第二次动作。需 Owner 确认的动作在确认后
+  恢复原 Session 整理结果，并把群请求的回执发回原群。
+- [x] `onboard` 安装官方 14 个 Skills，`threadferry skills install` 可补齐/更新，`doctor` 检查完整性；
+  安装锁还会核验来源必须为 WeComTeam/wecom-cli。Codex/Grok 使用标准 Skills 目录；Pi 逐项加载 14 个
+  官方目录，Claude 在 Safe Mode 下通过可信只读路径仅开放同一组目录。
+- [x] 删除“创建会议后宿主自动创建转写提醒”的隐藏业务副作用；会后跟进改由 Agent 按 Skill 与用户
+  意图显式创建 ThreadFerry reminder。
+
 **2026-08-21：补齐图片与文件资源链。**
 
 - [x] WebSocket 从只监听 `message.text` 改为统一消息入口，接收文本、图片、图文、语音、文件、视频，
@@ -67,7 +84,7 @@ agent 之间完全独立。多条连接并发跑在一个 ThreadFerry 进程里�
   UTF-8 文本内容按不可信数据注入，不支持的二进制格式明确降级。
 - [x] 资源路径与目录不写状态和上下文；下载、分析、失败及多机器人 fan-out 共享清理生命周期，
   并执行数量、单文件、总量、目录权限、文件权限和 realpath 边界。
-- [ ] 按 `POC.md` 第 38-43 项完成真实企业微信图片、文件、引用、历史补取、重启回读和清理验收。
+- [ ] 按 `POC.md`“图片、文件与历史”章节完成真实企业微信图片、文件、引用、历史补取、重启回读和清理验收。
 
 **2026-08-21：统一私聊与群聊历史链。**
 
@@ -79,23 +96,24 @@ agent 之间完全独立。多条连接并发跑在一个 ThreadFerry 进程里�
   200 MB；Runtime 单轮仍限制 10 个、50 MB，并只读取用后清理的临时副本。
 - [x] 历史资源目录和索引执行权限、哈希、配额、过期与孤立文件清理，不持久化 URL、AES Key、
   `media_id` 或临时路径。
-- [ ] 按 `POC.md` 第 38-43 项完成真实企业微信私聊、群聊、重启回读和清理验收。
+- [ ] 按 `POC.md`“图片、文件与历史”章节完成真实企业微信私聊、群聊、重启回读和清理验收。
 
 **2026-08-20：补齐企业工作助理 P0–P4。**
 
-- [x] Runtime 可在同一隔离 Session 内逐步提议最多 8 次只读动作；ThreadFerry 执行后把结果作为
-  `UNTRUSTED_ACTION_RESULT` 回传，资料齐全后再回答或执行最终白名单写动作。
-- [x] 在线文档、表格、智能文档、智能表格、邮件、微盘、日程、待办、会议与会议转写补齐详情读取。
-  CLI 生成的内容文件只在隔离临时目录读取，限制 1 MB，注入后立即删除，不向 Runtime 暴露路径。
+- [x] Runtime 可在同一隔离 Session 内逐步提议最多 8 次通用 Broker 动作；ThreadFerry 把结果作为
+  `UNTRUSTED_ACTION_RESULT` 回传，资料齐全后再回答或执行最终写动作。
+- [x] 在线文档、表格、智能文档、智能表格、邮件、微盘、日程、待办、会议与会议转写由官方 Skill
+  编排；CLI 生成的内容文件只在隔离临时目录读取，限制 1 MB，注入后立即删除，不向 Runtime 暴露路径。
 - [x] 接收官方 `auth_change_event`；Owner 完成文档授权后自动回到原私聊 Session 继续未完成读取，
   不需要复制原请求，也不能借授权回调扩大操作范围。
 - [x] 状态文件增加持久提醒、Agent Inbox、协作任务和 Activity；30 秒调度一次，提醒失败自动退避，
   协作任务支持执行 Agent 与复核 Agent，崩溃后按一小时租约恢复。主动回执先写 outbox，发送失败只
   重试通知，不会重新执行提醒或任务。
 - [x] 跨 Agent 创建、转交和调度都要求同一 Owner；旧状态里的跨 Owner 任务在启动 Runtime 前拒绝。
-- [x] 创建会议、提醒和协作任务后直接返回资源 ID，后续查询、修改和交接不需要猜测标识。
-- [x] 会议创建成功后，自动在结束 5 分钟后唤醒原 Agent，读取转写并向 Owner 汇报结论和待办。
-- [x] 所有动作走统一策略；群内个人数据读取直接拒绝，高风险动作始终二次确认，资源 URL 哈希后审计。
+- [x] 查询和写入结果统一回传原 Agent；由对应 Skill 只展示用户需要的信息，后续查询、修改和交接使用
+  真实返回标识，不允许猜测。
+- [x] 会后跟进不再由会议创建命令隐式触发；需要时显式创建 reminder，避免宿主隐藏副作用。
+- [x] 所有动作走统一策略；群内个人数据读取直接拒绝，高风险动作始终二次确认，命令摘要哈希后审计。
   管理台与 `threadferry status` 展示提醒、协作任务和 Activity。
 - [ ] 文档评论触发：当前 `@wecom/aibot-node-sdk 1.0.7` 只暴露进入会话、模板卡片和反馈事件，
   `wecom-cli 1.1.0` 也没有文档评论查询/事件命令。没有可验证的事件源前不做伪轮询。
@@ -552,7 +570,7 @@ default	codex	default	/Users/gnaixeuy/Desktop/ThreadFerry	aibS5gFrdrjbT-Fluj16Lw
 
 **验证**：这是安全边界，测试必须覆盖跨 agent 越权被拒。
 
-### Phase 6 — 管理台、文档、发版（⬜）
+### Phase 6 — 管理台、文档、发版（✅ 完成）
 
 - [x] **管理台 `listGroups` 改为按 Agent 查询**。原先聚合所有机器人可见的群，会允许把群绑给
       一台不在该群的机器人——结果是静默失效。现在绑定下拉只列出机器人确实在该群的 Agent，
@@ -564,11 +582,10 @@ default	codex	default	/Users/gnaixeuy/Desktop/ThreadFerry	aibS5gFrdrjbT-Fluj16Lw
 - [x] `state.clearSession(groupId, scope?)` 支持按 Agent 作用域（D6 剩余项）；
       `sessionScope()` 抽成共享函数，`app.ts` 与重置路径共用一处构造避免漂移
 - [x] 顶层 `config.ownerUser` 已从 `admin.ts` 完全清除（仅 `config.ts` 内部保留为派生字段）
-- [x] 两份 README 正文按 1:1 重写（模型描述、快速开始、管理命令、管理 Agent、常用命令、
-      安全边界、排查问题）；横幅改为「已完成但待双机器人实测」
+- [x] 两份 README 按当前 1:1 架构提供安装、使用、企业能力、安全边界和运维说明，不展示内部阶段状态
 - [x] `threadferry.example.yaml` 重写为 v6，并实测可被 `loadConfig` 加载
-- [x] `POC.md` 第 3 节按多机器人重写：第 29-33 项覆盖双机器人授权、N 连接启动、
-      跨 Agent 隔离、管理台按 Agent；第 35 项验证配置与环境变量里都没有 Bot Secret
+- [x] `POC.md` 提供工程门禁、真实企业微信、官方 Skill、多 Agent、资源、恢复和安全验收清单
+- [x] `WECOMCLI_GUIDE.md` 记录官方 Skill、当前 CLI、通用 Broker 和 per-Agent 凭据边界
 - [x] 版本升到 **0.16.0**，`CHANGELOG.md` 整理出发布章节（破坏性变更置顶），
       `release-notes.mjs 0.16.0` 抽取正常
 - [x] 管理台两个添加流程重做（0.17.0）：添加 Agent / 添加可使用用户都改成按钮 + 对话框；
@@ -604,14 +621,13 @@ default	codex	default	/Users/gnaixeuy/Desktop/ThreadFerry	aibS5gFrdrjbT-Fluj16Lw
       手工 Secret 仅经 localhost + CSRF 保护的 POST 临时转交给 wecom-cli，不进入配置、日志、状态或 URL
 - [x] 提交并发版：0.16.0 已发布；0.17.0 经 PR #11 合入 main，Build 通过后打 `v0.17.0`，
       Release 工作流产出 `threadferry.tgz` + `SHA256SUMS`，校验和与包内版本已核验
-- [ ] Phase 1c 已主动放弃，见上方说明
-- [ ] 概览页按 agent 分组
-- [ ] `README.md` / `README.zh-CN.md`：**删掉顶部横幅**，正文按 1:1 重写
-      （快速开始、管理群和用户、管理 Agent、常用命令都要改）
-- [ ] `threadferry.example.yaml` 改成 v6 示例；`CHANGELOG.md` 撰写发布章节
-- [ ] `POC.md`：按 1:1 重写验收清单，去掉状态横幅
-- [ ] 版本 → 0.16.0（v5 自动升级，但 agent 名约束收紧，CHANGELOG 要显著说明）
-- [ ] 发版按 `AGENTS.md`：新 `codex/` 分支 → PR → 合 main → Build → tag → Release 核验
+- [x] Phase 1c 已主动放弃，见上方说明
+- [x] 概览页按 Agent 展示机器人、Owner、Workspace、群和授权状态
+- [x] `README.md` / `README.zh-CN.md` 按当前 1:1 架构重写
+- [x] `threadferry.example.yaml` 使用 v6；`CHANGELOG.md` 包含对应发布记录
+- [x] `POC.md` 使用当前验收清单
+- [x] 0.16.0 已完成版本升级与兼容说明
+- [x] 0.16.0 已完成分支、Build、Tag、Release 和资产核验
 
 ---
 
