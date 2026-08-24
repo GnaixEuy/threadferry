@@ -1,6 +1,6 @@
 {
   "name": "threadferry",
-  "version": "0.26.7",
+  "version": "0.26.8",
   "description": "Safely ferry enterprise chat context to read-only local AI agents.",
   "author": "GnaixEuy",
   "homepage": "https://github.com/GnaixEuy/threadferry",
@@ -31,7 +31,7 @@
     "build": "node --eval \"require('node:fs').rmSync('dist', { recursive: true, force: true })\" && tsc && node --eval \"require('node:fs').chmodSync('dist/src/cli.js', 0o755)\"",
     "desktop": "npm run build && electron .",
     "desktop:pack": "npm run build && electron-builder --dir",
-    "desktop:dist": "npm run build && electron-builder",
+    "desktop:dist": "npm run build && electron-builder --publish never",
     "typecheck": "tsc --noEmit",
     "test": "npm run build && node --test dist/test/*.test.js"
   },

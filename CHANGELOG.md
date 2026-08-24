@@ -4,6 +4,27 @@ ThreadFerry 的每个 GitHub Release 都使用这里对应版本的内容，不�
 
 ## Unreleased
 
+## 0.26.8
+
+修复 Tag 构建时桌面打包器越过统一发布作业自行上传，正式产出可直接安装的跨平台桌面资产。
+
+### 主要变化
+
+- 桌面构建显式使用 `--publish never`，macOS、Windows 和 Linux 作业只负责生成并上传 workflow artifact；
+  最后的 Release 作业继续统一创建 GitHub Release、上传全部资产并生成 `SHA256SUMS`。
+- Release 提供 macOS Universal DMG/ZIP、Windows NSIS EXE、Linux AppImage/DEB 和 CLI
+  `threadferry.tgz`。桌面包已包含 ThreadFerry 与 Electron 运行环境，不需要从源码构建。
+- 包含 `0.26.7` 的桌面托盘、偏好与日志追踪、群首次 `@` 自动启用和管理台响应优化。桌面资产未做商业
+  证书签名，系统可能显示来源确认。
+
+### 安装与升级
+
+新用户先运行安装脚本和 `threadferry onboard` 完成官方 `wecom-cli`、Runtime、机器人与 Workspace
+设置，再从 GitHub Release 下载当前系统的桌面安装包。已有用户可以直接安装 `0.26.8`；现有配置、
+机器人凭据、Runtime Session 和本机历史不受影响。
+
+[查看 v0.26.7...v0.26.8 的完整变更](https://github.com/GnaixEuy/threadferry/compare/v0.26.7...v0.26.8)
+
 ## 0.26.7
 
 首次提供可直接安装的跨平台桌面应用，并把群接入、管理台和桌面启动体验整理为一条完整链路。

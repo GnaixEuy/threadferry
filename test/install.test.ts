@@ -165,6 +165,7 @@ test("release workflow publishes curated changelog notes", () => {
 test("release workflow publishes directly installable desktop packages", () => {
   const workflow = readFileSync(join(project, ".github", "workflows", "release.yml"), "utf8");
 
+  assert.match(packageMetadata.scripts?.["desktop:dist"] ?? "", /electron-builder --publish never$/);
   for (const runner of ["macos-latest", "windows-latest", "ubuntu-latest"]) assert.match(workflow, new RegExp(`os: ${runner}`));
   for (const extension of ["dmg", "zip", "exe", "AppImage", "deb"]) assert.match(workflow, new RegExp(`release/desktop/\\*\\.${extension}`));
   assert.match(workflow, /needs: \[cli, desktop\]/);
