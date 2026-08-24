@@ -4,22 +4,24 @@ ThreadFerry 的每个 GitHub Release 都使用这里对应版本的内容，不�
 
 ## Unreleased
 
-## 0.26.12
+## 0.26.13
 
-管理台偏好设置增加手动检查更新入口，不必再打开终端确认是否有新版本。
+管理台增加手动检查更新，并修复 Pi 偶发连接失败时的恢复与错误提示。
 
 ### 主要变化
 
 - 偏好设置页增加“检查更新”按钮，使用现有 GitHub Latest Release 检查链路判断是否有新版本。
 - 点击后按钮显示检查中并防止重复提交；完成后在原页面提示当前已是最新版，或展示发现的新版本号和下载升级指引。
 - 更新检查继续使用本机管理台的 CSRF 保护；按钮只执行检查，不会自动下载、安装或重启服务。
+- 正确识别 Pi `message_end` 事件里的 `stopReason: "error"` 与 `errorMessage`，不再把 Node.js 版本尾注当成失败原因。
+- 已有 Pi Session 遇到连接或网络类错误时使用同一 Session 自动重试一次；权限、配额等非连接错误不会重试。
 
 ### 安装与升级
 
 升级并重新启动 ThreadFerry 后，打开管理台“偏好设置”即可手动检查更新。现有配置、机器人凭据、
 Workspace、Runtime Session 和群聊授权不受影响。
 
-[查看 v0.26.11...v0.26.12 的完整变更](https://github.com/GnaixEuy/threadferry/compare/v0.26.11...v0.26.12)
+[查看 v0.26.11...v0.26.13 的完整变更](https://github.com/GnaixEuy/threadferry/compare/v0.26.11...v0.26.13)
 
 ## 0.26.11
 

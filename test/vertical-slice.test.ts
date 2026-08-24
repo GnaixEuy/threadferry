@@ -15,6 +15,7 @@ import { runCodex } from "../src/runtimes/codex.js";
 import { runGrok } from "../src/runtimes/grok.js";
 import { allowedReadPath } from "../src/runtimes/pi-readonly-extension.js";
 import { runPi } from "../src/runtimes/pi.js";
+import { runtimeFailure } from "../src/runtimes/runtime-error.js";
 import { ThreadFerryState } from "../src/state.js";
 import type { AgentView, AttachmentResource, CommandRunner, GroupMessage, IncomingMention, IncomingWecomEvent, ThreadFerryConfig } from "../src/types.js";
 
@@ -1789,6 +1790,43 @@ test("Pi uses only guarded read tools and parses its machine-readable result", a
   assert.equal(piSkillPaths.length, 14);
   assert.ok(piSkillPaths.every((path) => /\.agents\/skills\/wecomcli-[^/]+$/.test(path)));
   assert.equal(received?.args[received.args.indexOf("--model") + 1], "provider/model");
+});
+
+test("Pi retries a resumed session after a connection error and reports the real stderr reason", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "threadferry-pi-retry-test-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const workspace = await realpath(root);
+  let calls = 0;
+  const runner: CommandRunner = async () => {
+    calls += 1;
+    if (calls === 1) {
+      throw new CommandExecutionError(
+        "pi",
+        1,
+        `${JSON.stringify({ type: "message_end", message: { role: "assistant", stopReason: "error", errorMessage: "Connection error." } })}\n`,
+        "TypeError: fetch failed\n    at request (client.js:1:1)\nNode.js v26.7.0\n",
+      );
+    }
+    return {
+      stdout: `${JSON.stringify({ type: "session", id: "existing-session" })}\n${JSON.stringify({
+        type: "message_end",
+        message: { role: "assistant", content: [{ type: "text", text: "恢复成功" }] },
+      })}\n`,
+      stderr: "",
+    };
+  };
+
+  const result = await runPi({ agentId: "reviewer", workspace, prompt: "分析", sessionId: "existing-session" }, runner, join(root, "sessions"));
+  assert.equal(calls, 2);
+  assert.deepEqual(result, { text: "恢复成功", sessionId: "existing-session" });
+
+  const failure = runtimeFailure("Pi", new CommandExecutionError(
+    "pi",
+    1,
+    "",
+    "TypeError: fetch failed\n    at request (client.js:1:1)\nNode.js v26.7.0\n",
+  ));
+  assert.equal(failure.message, "Pi：TypeError: fetch failed");
 });
 
 test("Claude Code runs headlessly with only read tools and resumes its session", async (t) => {
