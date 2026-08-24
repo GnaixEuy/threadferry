@@ -5,6 +5,7 @@ AGENTS.md
 threadferry.yaml
 *.log
 tmp/
+release/
 
 .idea/
 

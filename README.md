@@ -53,6 +53,11 @@ Windows PowerShell:
 irm https://raw.githubusercontent.com/GnaixEuy/threadferry/main/install.ps1 | iex
 ```
 
+After installing the CLI and completing first-time setup, download the desktop app for everyday use
+from [GitHub Releases](https://github.com/GnaixEuy/threadferry/releases/latest): a universal DMG on
+macOS, the NSIS installer on Windows, or AppImage/DEB on Linux. The desktop app adds the tray entry;
+the runtime and official `wecom-cli` continue to use the local installation and login above.
+
 ## First run
 
 Run the onboarding wizard in an interactive terminal:
@@ -64,7 +69,15 @@ threadferry onboard
 The wizard installs the official WeCom Skills, authorizes the bot, identifies its Owner, selects a
 runtime and workspace, runs diagnostics, and starts ThreadFerry.
 
-Start configured agents later with:
+After that, open the ThreadFerry desktop app. It starts configured agents automatically. Its menu-bar
+or notification-area icon opens the admin console, restarts or stops the service, reveals the log, and
+quits cleanly. Closing the admin window only returns it to the tray.
+The lower-left console utilities include trace logs and Preferences. Trace logs locate sanitized records by
+error ID, agent, action, or resource and can be hidden in Preferences. Preferences also controls the theme,
+launch at login, automatic service startup, opening the console after startup, and the optional macOS Dock
+entry. Desktop preferences stay on the device.
+
+For terminal operation, configured agents can still be started with:
 
 ```sh
 threadferry start
@@ -148,8 +161,7 @@ The Owner manages a bot's groups by sending commands in direct chat with that bo
 
 | Command | Purpose |
 | --- | --- |
-| `threadferry groups` | List visible groups and their configuration state |
-| `threadferry bind <group>` | Bind a group to this bot |
+| `threadferry groups` | List visible groups and their availability state |
 | `threadferry users <group>` | List authorized users |
 | `threadferry invite <group>` | Create a one-time invitation code |
 | `threadferry add <group> <name>` | Authorize a user |
@@ -158,13 +170,15 @@ The Owner manages a bot's groups by sending commands in direct chat with that bo
 | `threadferry close <group>` | Restore the authorized-user list |
 | `threadferry whoami` | Show the caller's ThreadFerry userid |
 
-Group discovery covers groups with messages in the last seven days. Send a message in a new group,
-refresh the list, then bind it.
+Add the bot to an internal group and mention it once. ThreadFerry enables that bot for the group on
+the first callback, with only its Owner authorized by default. The admin console group detail page
+controls whether the bot is available and which members may use it; no separate binding step is
+required. Group discovery covers groups with messages in the last seven days.
 
 ## Security
 
 - Direct-agent requests are accepted only from that bot's Owner.
-- Unconfigured groups, unauthorized users, and messages without a bot mention do not start a runtime.
+- Stopped groups, unauthorized users, and messages without a bot mention do not start a runtime.
 - Agents do not share credentials, Owners, sessions, chat history, or workspace access.
 - Codex runs without network or file writes. Pi exposes path-guarded `read` and `ls`. Claude Code uses
   Safe Mode and read-only tools. Grok Build uses a strict sandbox with web, subagents, and memory disabled.
@@ -200,6 +214,7 @@ Local files:
 npm ci --ignore-scripts
 npm run typecheck
 npm test
+npm run desktop:pack
 ```
 
 Use [POC.md](./POC.md) for acceptance testing and [CONTRIBUTING.md](./CONTRIBUTING.md) for the Gitmoji

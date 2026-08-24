@@ -6,7 +6,7 @@ import test from "node:test";
 import { createApp } from "../src/app.js";
 import { cleanupAttachmentResources, createAttachmentRoot } from "../src/attachments.js";
 import { createWecomMessageDispatcher, listWecomGroups, runWecomAction, searchWecomUsers, sendWecomReply, standardizeAuthChange, standardizeMessage, wecomFailureReason } from "../src/channels/wecom.js";
-import { addAgent, agentView, loadConfig, onboardingDefaults, pairConfig, refreshAgentView, resolveWorkspace, saveConfig, setupConfig } from "../src/config.js";
+import { addAgent, agentView, ensureGroupAccess, loadConfig, onboardingDefaults, pairConfig, refreshAgentView, resolveWorkspace, saveConfig, setupConfig } from "../src/config.js";
 import { fetchWecomHistory, WecomHistory } from "../src/history/wecom-cli.js";
 import { LocalWecomHistory } from "../src/history/local.js";
 import { CommandExecutionError, runCommand } from "../src/process.js";
@@ -38,6 +38,16 @@ function fullConfig(workspace = "/workspace", ownerUser = "user", groupId = "gro
     security: { requireMention: true, readOnly: true },
   };
 }
+
+test("confirmed group sessions are enabled once while an explicit stop is preserved", () => {
+  const config = fullConfig();
+  config.groups = {};
+  assert.equal(ensureGroupAccess(config, "joined-group", "default"), true);
+  assert.deepEqual(config.groups["joined-group"]?.agents.default, { allowUsers: ["user"] });
+  config.groups["joined-group"]!.agents.default!.enabled = false;
+  assert.equal(ensureGroupAccess(config, "joined-group", "default"), false);
+  assert.equal(agentView(config, "default").groups["joined-group"]?.enabled, false);
+});
 
 function wecomProposal(command: string[], skill: string, summary: string, reply = "", userIntent: "explicit" | "confirm" = "explicit"): string {
   return `${reply}${reply ? "\n\n" : ""}\`\`\`threadferry-action\n${JSON.stringify({
@@ -210,7 +220,6 @@ test("robot owner manages per-group users in direct chat", async () => {
   const config = testConfig("/workspace", "owner");
   config.agents.reviewer = { workspace: "/review-workspace", runtime: "pi", model: "provider/reviewer", ownerUser: "owner" };
   const persisted: Array<{ groupId: string; users: string[] }> = [];
-  const boundGroups: string[] = [];
   const runtimeAgents: string[] = [];
   const runtimeSessions: Array<string | undefined> = [];
   const runtimePrompts: string[] = [];
@@ -226,7 +235,6 @@ test("robot owner manages per-group users in direct chat", async () => {
       return { text: "分析结果", sessionId: `${request.agentId}-session` };
     },
     updateAllowUsers: async (groupId, users) => { persisted.push({ groupId, users: [...users] }); },
-    bindGroup: async (groupId) => { boundGroups.push(groupId); },
     listGroups: async () => [
       { id: "group", name: "AI Coding" },
       { id: "group-unconfigured", name: "未配置群" },
@@ -263,7 +271,11 @@ test("robot owner manages per-group users in direct chat", async () => {
   }, async (content) => { replies.push(content); });
 
   assert.equal(await direct("owner", "threadferry help"), "command");
-  assert.match(replies.at(-1) ?? "", /接入群聊.*数据访问权限.*threadferry groups.*threadferry bind/s);
+  assert.match(replies.at(-1) ?? "", /接入群聊.*第一条.*自动启用.*threadferry groups/s);
+  assert.doesNotMatch(replies.at(-1) ?? "", /threadferry bind/);
+  assert.equal(await direct("owner", "threadferry bind 未配置群"), "command");
+  assert.match(replies.at(-1) ?? "", /不需要手动绑定.*自动启用/s);
+  assert.equal(config.groups["group-unconfigured"], undefined);
   // 1:1 之后 help 不再提 Agent 参数，也不再有 use 命令。
   assert.doesNotMatch(replies.at(-1) ?? "", /threadferry use </);
   assert.doesNotMatch(replies.at(-1) ?? "", /bind <群名或ID> <Agent名>/);
@@ -271,20 +283,9 @@ test("robot owner manages per-group users in direct chat", async () => {
   assert.match(replies.at(-1) ?? "", /只有.*Owner/);
   assert.equal(await direct("owner", "threadferry groups"), "command");
   assert.match(replies.at(-1) ?? "", /AI Coding/);
-  assert.match(replies.at(-1) ?? "", /\[default\].*\[未配置 Agent\]/s);
+  assert.match(replies.at(-1) ?? "", /\[default\].*\[等待首次 @ 自动启用\]/s);
   assert.equal(await direct("owner", "threadferry agents"), "command");
   assert.match(replies.at(-1) ?? "", /reviewer.*pi.*provider\/reviewer/s);
-  // bind 不接受 Agent 参数：绑定到「正在对话的这个 Agent」。
-  assert.equal(await direct("owner", "threadferry bind 未配置群"), "command");
-  assert.deepEqual(boundGroups, ["group-unconfigured"]);
-  assert.equal(config.groups["group-unconfigured"]?.agent, "default");
-  assert.match(replies.at(-1) ?? "", /已绑定到我/);
-  // 已绑定的群不能重复绑定。
-  assert.equal(await direct("owner", "threadferry bind 未配置群"), "command");
-  assert.match(replies.at(-1) ?? "", /已经绑给我了/);
-  // 机器人看不见的群要说清楚，而不是含糊报错。
-  assert.equal(await direct("owner", "threadferry bind 不存在的群"), "command");
-  assert.match(replies.at(-1) ?? "", /我看不到群/);
   // 非 Owner 的私聊被拒绝时，回调 userid 会映射到目录 ID 以判断是否 Owner（缓存后不再搜索）。
   assert.equal(searchCalls, 1);
   assert.equal(await group("owner", "@机器人 先用默认 Agent 分析"), "handled");
@@ -1030,6 +1031,11 @@ test("workspace paths cannot be relative or escape through a symlink", async (t)
   delete compact.groups.group!.agents.default!.allowAll;
   await saveConfig(compactPath, compact);
   assert.equal((await loadConfig(compactPath)).groups.group?.agents.default?.allowAll, undefined);
+
+  compact.groups.group!.agents.default!.enabled = false;
+  await saveConfig(compactPath, compact);
+  assert.equal((await loadConfig(compactPath)).groups.group?.agents.default?.enabled, false);
+  assert.match(await readFile(compactPath, "utf8"), /enabled: false/);
 });
 
 test("one group can run two bots at once, each with its own allowlist and switch", async (t) => {
@@ -1229,6 +1235,10 @@ test("legacy and extra configuration fields are rejected", async (t) => {
   const badAccessPath = join(root, "bad-access.yaml");
   await writeFile(badAccessPath, `version: 6\nagents:\n  default:\n    runtime: codex\n    workspace: ${JSON.stringify(await realpath(root))}\n    owner_user: user\n    groups:\n      group:\n        allow_users: [user]\n        allow_all: 1\n`);
   await assert.rejects(loadConfig(badAccessPath), /allow_all 必须是布尔值/);
+
+  const badEnabledPath = join(root, "bad-enabled.yaml");
+  await writeFile(badEnabledPath, `version: 6\nagents:\n  default:\n    runtime: codex\n    workspace: ${JSON.stringify(await realpath(root))}\n    owner_user: user\n    groups:\n      group:\n        allow_users: [user]\n        enabled: no\n`);
+  await assert.rejects(loadConfig(badEnabledPath), /enabled 必须是布尔值/);
 });
 
 test("a newer group message makes the completed analysis stale", async () => {

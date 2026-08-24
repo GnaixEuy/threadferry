@@ -123,6 +123,17 @@ export function pairConfig(
   }, agentId, userId));
 }
 
+/** 机器人已确认在群时补上默认授权；已存在（包括已停用）的配置保持不变。 */
+export function ensureGroupAccess(config: ThreadFerryConfig, groupId: string, agentId: string): boolean {
+  const owner = config.agents[agentId]?.ownerUser;
+  if (!owner) throw new Error(`Agent ${agentId} 未配置`);
+  const binding = config.groups[groupId] ?? { agents: {}, context: { lookbackHours: 6, maxMessages: 80 } };
+  if (binding.agents[agentId]) return false;
+  binding.agents[agentId] = { allowUsers: [owner] };
+  config.groups[groupId] = binding;
+  return true;
+}
+
 // 换企业或重建机器人后回调 userid 会变。把 Owner 迁移到新 userid，并把各群授权
 // 列表里的旧 Owner 一并替换，避免迁移后 Owner 反而不在自己群的可用名单里。
 export function adoptOwner(config: ThreadFerryConfig, agentId: string, userId: string): ThreadFerryConfig {
@@ -158,7 +169,11 @@ export function configText(config: ThreadFerryConfig): string {
     for (const [agentId, access] of Object.entries(group.agents)) {
       if (!config.agents[agentId]) throw new Error(`群 ${groupId} 引用了不存在的 Agent ${agentId}`);
       const bucket = groupsByAgent.get(agentId) ?? {};
-      bucket[groupId] = { allow_users: access.allowUsers, ...(access.allowAll ? { allow_all: true } : {}) };
+      bucket[groupId] = {
+        allow_users: access.allowUsers,
+        ...(access.allowAll ? { allow_all: true } : {}),
+        ...(access.enabled === false ? { enabled: false } : {}),
+      };
       groupsByAgent.set(agentId, bucket);
     }
   }
@@ -209,6 +224,7 @@ function viewGroups(config: ThreadFerryConfig, agentId: string): Record<string, 
       agent: agentId,
       allowUsers: access.allowUsers,
       ...(access.allowAll ? { allowAll: true } : {}),
+      ...(access.enabled === false ? { enabled: false as const } : {}),
       context: group.context,
     };
   }
@@ -257,7 +273,7 @@ export async function saveConfig(path: string, config: ThreadFerryConfig): Promi
 // 之后由 loadConfig 做语义校验（workspace 解析、userid 格式、allow_users 不变式）。
 // 内存结构仍是扁平的（顶层 ownerUser + 带 agent 字段的 groups），Phase 1b 才会改。
 interface FlatAgentRaw { runtime: unknown; workspace: unknown; owner_user: unknown; model?: unknown; config_dir?: unknown }
-interface FlatGroupRaw { id: string; agent: string; allow_users: unknown; allow_all?: unknown }
+interface FlatGroupRaw { id: string; agent: string; allow_users: unknown; allow_all?: unknown; enabled?: unknown }
 interface FlatDocument { agents: Record<string, FlatAgentRaw>; groups: FlatGroupRaw[] }
 
 function rejectExtraKeys(actual: Record<string, unknown>, allowed: string[], label: string): void {
@@ -285,12 +301,13 @@ function readV6Document(root: Record<string, unknown>): FlatDocument {
     };
     for (const [groupId, groupValue] of Object.entries(object(agent.groups ?? {}, `Agent ${agentId} 的 groups`))) {
       const group = object(groupValue, `群 ${groupId}`);
-      rejectExtraKeys(group, ["allow_users", "allow_all"], `群 ${groupId} `);
+      rejectExtraKeys(group, ["allow_users", "allow_all", "enabled"], `群 ${groupId} `);
       groups.push({
         id: groupId,
         agent: agentId,
         allow_users: group.allow_users,
         ...(group.allow_all !== undefined ? { allow_all: group.allow_all } : {}),
+        ...(group.enabled !== undefined ? { enabled: group.enabled } : {}),
       });
     }
   }
@@ -347,6 +364,7 @@ export async function loadConfig(path: string): Promise<ThreadFerryConfig> {
     const label = `群 ${groupId}（Agent ${group.agent}）`;
     if (!agents[group.agent]) throw new Error(`群 ${groupId} 引用了不存在的 Agent`);
     if (group.allow_all !== undefined && typeof group.allow_all !== "boolean") throw new Error(`${label} 的 allow_all 必须是布尔值`);
+    if (group.enabled !== undefined && typeof group.enabled !== "boolean") throw new Error(`${label} 的 enabled 必须是布尔值`);
     if (!Array.isArray(group.allow_users) || !group.allow_users.every((user) => typeof user === "string" && USER_ID.test(user))) {
       throw new Error(`${label} 的 allow_users 必须是非空字符串数组`);
     }
@@ -358,6 +376,7 @@ export async function loadConfig(path: string): Promise<ThreadFerryConfig> {
     binding.agents[group.agent] = {
       allowUsers: [...new Set(group.allow_users as string[])],
       ...(group.allow_all === true ? { allowAll: true } : {}),
+      ...(group.enabled === false ? { enabled: false as const } : {}),
     };
     groups[groupId] = binding;
   }

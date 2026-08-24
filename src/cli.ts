@@ -18,6 +18,7 @@ import {
   addAgent,
   adoptOwner,
   agentView,
+  ensureGroupAccess,
   loadConfig,
   pairConfig,
   refreshAgentView,
@@ -50,9 +51,14 @@ import { findUpdate, installUpdate } from "./update.js";
 import { installOfficialWecomSkills, officialWecomSkillsInstalled } from "./wecom-skills.js";
 import { runWorkflowTick } from "./workflow.js";
 
-const VERSION = "0.25.2";
+const VERSION = "0.26.7";
 const UPDATE_INTERVAL_MS = 6 * 60 * 60 * 1_000;
 const WORKFLOW_INTERVAL_MS = 30_000;
+interface DesktopParentPort {
+  on(event: "message", listener: (event: { data: unknown }) => void): void;
+  off(event: "message", listener: (event: { data: unknown }) => void): void;
+  postMessage(message: unknown): void;
+}
 const USAGE = `ThreadFerry ${VERSION}
 
 Usage:
@@ -101,6 +107,7 @@ async function applyUpdate(): Promise<string | undefined> {
 }
 
 async function autoUpdate(): Promise<string | undefined> {
+  if (process.env.THREADFERRY_DESKTOP === "1") return undefined;
   try {
     const binary = await applyUpdate();
     if (!binary) console.log(`[update] 已检查，ThreadFerry ${VERSION} 已是最新版本。`);
@@ -976,6 +983,14 @@ async function start(
       views.set(agentId, view);
       const runner = wecomRunner(configDir);
       const history = new WecomHistory(agentId, runner);
+      const listGroups = async () => {
+        const groups = await listWecomGroups(runner);
+        const joined = groups.filter((group) => group.hasBotSession);
+        if (joined.some((group) => !config.groups[group.id]?.agents[agentId])) {
+          await updateConfig((latest) => { for (const group of joined) ensureGroupAccess(latest, group.id, agentId); });
+        }
+        return groups;
+      };
       await confirmOwnerIdentity(config, agentId, updateConfig);
       const app = createApp(view, {
       history: (chatId, options) => history.list(chatId, options),
@@ -993,16 +1008,7 @@ async function start(
         if (allowAll) access.allowAll = true;
         else delete access.allowAll;
       }),
-      // 绑定到「这个 host 的 Agent」，Agent 由闭包捕获，不从用户输入来。
-      bindGroup: (groupId) => updateConfig((latest) => {
-        const owner = latest.agents[agentId]?.ownerUser;
-        if (!owner) throw new Error(`Agent ${agentId} 未配置`);
-        const binding = latest.groups[groupId] ?? { agents: {}, context: { lookbackHours: 6, maxMessages: 80 } };
-        if (binding.agents[agentId]) throw new Error("这个群已经绑给我了");
-        binding.agents[agentId] = { allowUsers: [owner] };
-        latest.groups[groupId] = binding;
-      }),
-      listGroups: () => listWecomGroups(runner),
+      listGroups,
       searchUsers: (keywords) => searchWecomUsers(keywords, runner),
       agentIds: () => Object.keys(config.agents),
       agentOwners: () => Object.fromEntries(Object.entries(config.agents).map(([id, agent]) => [id, agent.ownerUser])),
@@ -1027,7 +1033,7 @@ async function start(
       },
       onError: ({ errorId, phase, reason }) => console.error(`[wecom] Agent ${agentId} 处理失败 error=${errorId} phase=${phase}${reason ? ` reason=${reason}` : ""}`),
       }, state);
-      return { agentId, view, runner, app, credentials: { botId, secret } };
+      return { agentId, view, runner, listGroups, app, credentials: { botId, secret } };
     }));
 
     // 管理台看全量配置，但所有企业微信查询都按 Agent 走它自己的机器人。
@@ -1040,17 +1046,20 @@ async function start(
     // 同样是后台预热 + 只读缓存，没权限就一直显示 id。
     const names = new DirectoryNameCache();
     const groupsOf = (agentId: string) =>
-      Object.entries(config.groups).filter(([, group]) => group.agents[agentId]).map(([groupId]) => groupId);
+      Object.entries(config.groups).filter(([, group]) => {
+        const access = group.agents[agentId];
+        return access && access.enabled !== false;
+      }).map(([groupId]) => groupId);
     for (const host of hosts) void names.refresh(host.agentId, host.runner, groupsOf(host.agentId)).catch(() => undefined);
     const admin = await startAdminServer(config, {
       updateConfig,
       listGroups: async (agentId) => {
-        const runner = runnerFor(agentId);
-        if (!runner) return [];
+        const host = hosts.find((item) => item.agentId === agentId);
+        if (!host) return [];
         // 顺手安排一次姓名收集；schedule 自己不等待，页面渲染不受影响。
-        names.schedule(agentId, runner, groupsOf(agentId));
+        names.schedule(agentId, host.runner, groupsOf(agentId));
         try {
-          return await listWecomGroups(runner);
+          return await host.listGroups();
         } catch (error) {
           // 管理台只能显示 Error.message，所以在这里就把 wecom-cli 的真实原因和本项目的补救办法接上。
           const reason = wecomFailureReason(error);
@@ -1100,7 +1109,10 @@ async function start(
           message.text,
           receivedBy,
           hosts.map((host) => ({ ...host, ...origins.read(host.agentId, host.runner) })),
-          (agentId) => Boolean(config.groups[message.groupId]?.agents[agentId]),
+          (agentId) => {
+            const access = config.groups[message.groupId]?.agents[agentId];
+            return Boolean(access && access.enabled !== false);
+          },
         );
         await Promise.all(peers.map(async (peer) => {
           try {
@@ -1130,6 +1142,9 @@ async function start(
         }));
       };
       const connections = hosts.map(({ agentId, app, credentials }) => startWecomChannel(credentials, async (event, reply) => {
+        if (event.chatType === "group" && !config.groups[event.message.groupId]?.agents[agentId]) {
+          await updateConfig((latest) => { ensureGroupAccess(latest, event.message.groupId, agentId); });
+        }
         const handling = event.chatType === "single"
           ? app.handleDirect(event.message, reply)
           : app.handle(event.message, reply);
@@ -1141,7 +1156,7 @@ async function start(
       }));
       hosts.forEach((host, index) => clients.set(host.agentId, connections[index]!));
       for (const { agentId, view } of hosts) {
-        console.log(`[bot] Agent ${agentId} 已连接，监听 ${Object.keys(view.groups).length} 个已配置群`);
+        console.log(`[bot] Agent ${agentId} 已连接，监听 ${Object.values(view.groups).filter((group) => group.enabled !== false).length} 个可用群`);
       }
       console.log(`ThreadFerry 已启动，${hosts.length} 个 Agent 各自一条企业微信机器人连接。`);
 
@@ -1217,9 +1232,11 @@ async function start(
         let workflowCheck: Promise<void> | undefined;
         let updateTimer: NodeJS.Timeout;
         let workflowTimer: NodeJS.Timeout;
+        const desktopPort = (process as NodeJS.Process & { parentPort?: DesktopParentPort }).parentPort;
         const stop = (cancel: boolean) => {
           if (stopping) return;
           stopping = true;
+          desktopPort?.off("message", onParentMessage);
           clearInterval(updateTimer);
           clearInterval(workflowTimer);
           for (const connection of connections) connection.disconnect();
@@ -1246,6 +1263,11 @@ async function start(
         workflowTimer = setInterval(runWorkflows, WORKFLOW_INTERVAL_MS);
         workflowTimer.unref();
         runWorkflows();
+        const onParentMessage = (event: { data: unknown }) => {
+          if ((event.data as { type?: unknown } | undefined)?.type === "threadferry:stop") stop(true);
+        };
+        desktopPort?.on("message", onParentMessage);
+        desktopPort?.postMessage({ type: "threadferry:ready", url: admin.url });
         process.once("SIGINT", () => stop(true));
         process.once("SIGTERM", () => stop(true));
       });
@@ -1378,7 +1400,10 @@ async function main(): Promise<void> {
   throw new Error(`未知命令: ${command}\n${USAGE}`);
 }
 
-void main().catch((error) => {
+void main().then(() => {
+  if (process.env.THREADFERRY_DESKTOP === "1") process.exit(process.exitCode ?? 0);
+}).catch((error) => {
   console.error(`ThreadFerry: ${error instanceof Error ? error.message : String(error)}`);
+  if (process.env.THREADFERRY_DESKTOP === "1") process.exit(1);
   process.exitCode = 1;
 });

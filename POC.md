@@ -37,6 +37,7 @@ npm run typecheck
 npm test
 npm audit --omit=dev
 npm pack --dry-run
+npm run desktop:pack
 git diff --check
 ```
 
@@ -46,6 +47,7 @@ git diff --check
 - 生产依赖漏洞数量为 0。
 - npm 包包含 CLI、双语 README、CHANGELOG、POC、安装脚本、配置示例和 README 图片。
 - npm 包不包含凭据、状态文件、本地配置、临时资源或开发交接文件。
+- 当前系统能生成可启动的桌面应用目录，应用图标来自 `build/icon.svg`。
 - Markdown 与源码没有空白错误。
 
 ## 3. Mock 端到端
@@ -79,15 +81,33 @@ node dist/src/cli.js start --config ./threadferry.yaml --mock
       `threadferry agent login <name>` 提示。
 - [ ] 再启动一个 ThreadFerry 进程，确认它因实例锁退出，不创建第二个 WebSocket 消费者。
 - [ ] 打开 `http://127.0.0.1:17638`，确认管理台仅监听 `127.0.0.1`。
+- [ ] 打开 ThreadFerry 桌面应用，确认菜单栏或任务栏通知区域出现图标，状态从“正在启动”变为“正在运行”。
+- [ ] 确认侧栏左下角依次显示“日志追踪”“偏好设置”和“服务运行中”，页面中不再显示独立主题切换按钮或
+      `仅监听 127.0.0.1` 文案。
+- [ ] 打开“日志追踪”，按错误编号、Agent、动作或资源定位记录，确认页面只显示脱敏失败状态和 Activity，
+      不显示消息正文。
+- [ ] 打开“偏好设置”，确认主题、日志追踪入口、登录时启动、自动启动服务、启动后打开管理台和 macOS
+      Dock 入口按平台正确显示；修改后重启桌面应用，确认选择仍然保留。
+- [ ] 点击“打开管理台”，确认复用现有管理台且不会打开外部网页；关闭窗口后托盘和机器人连接继续运行。
+- [ ] 从托盘依次验证重启、停止、再次启动和退出；确认 Runtime、WebSocket 和实例锁均正常收尾，没有遗留
+      Host 进程。
+- [ ] 在终端先运行一个 Host，再打开桌面应用；确认托盘显示“已由其他进程启动”，可以打开管理台，但不会
+      提供停止或重启这个外部进程的能力。
+- [ ] 在未初始化环境启动桌面应用，确认托盘显示启动失败，可以查看明确原因并复制 `threadferry onboard`；
+      日志不包含 Bot Secret 或企业私密正文。
+- [ ] 分别核验 Release 中的 macOS Universal DMG/ZIP、Windows NSIS、Linux AppImage/DEB 和
+      `SHA256SUMS`；至少在对应系统完成一次安装、托盘启动和卸载烟测。
 
 ## 5. 私聊、群聊与权限
 
 - [ ] Owner 私聊机器人发送普通分析请求，不使用 `@`，确认收到处理回执和最终结果。
 - [ ] 非 Owner 私聊同一机器人，确认 Runtime 不启动，回复不泄露已配置 Owner 的 userid。
-- [ ] Owner 私聊发送 `threadferry groups`，选择测试群并发送 `threadferry bind <群名或ID>`。
+- [ ] 把机器人拉入测试群，由 Owner 发送第一条 `@机器人 帮我分析`；确认群自动出现在管理台且直接可用，
+      全程不需要手动绑定。
 - [ ] 在群中先发送三条普通消息，再由授权成员发送 `@机器人 帮我分析`；确认回复出现在同一群，并引用
       最近 6 小时上下文。
-- [ ] 验证未配置群、未授权成员和没有 `@机器人` 的群消息均不启动 Runtime。
+- [ ] 在群详情停用机器人，确认群内 `@机器人` 不启动 Runtime；重新启用后授权名单和 Session 仍保留。
+- [ ] 验证未授权成员和没有 `@机器人` 的群消息均不启动 Runtime。
 - [ ] 使用 `threadferry add`、`remove`、`invite`、`join`、`open`、`close` 验证授权变更即时生效。
 - [ ] 搜索同名成员时，确认系统返回候选部门与 userid，未选择前不修改授权名单。
 - [ ] 在群中发送管理命令，确认系统要求 Owner 改用私聊。
@@ -121,7 +141,7 @@ threadferry start --agents reviewer
 ```
 
 - [ ] 两个 Agent 显示不同机器人身份和独立凭据目录。
-- [ ] 两个机器人分别绑定测试群后，`@` 哪个机器人就只运行对应 Agent 和 Workspace。
+- [ ] 两个机器人分别在测试群收到首次 `@` 并自动启用后，`@` 哪个机器人就只运行对应 Agent 和 Workspace。
 - [ ] 同一群同时 `@` 两个机器人时，两边独立完成，Session 和资源互不串用。
 - [ ] A 机器人的 Owner 私聊 B 机器人时，B 按自己的 Owner 规则拒绝。
 - [ ] 分别重启 Codex、Pi、Claude 或 Grok Agent，确认只恢复自己的 Session。
@@ -166,6 +186,7 @@ threadferry start --agents reviewer
 | --- | --- | --- | --- |
 | 工程质量门禁 |  |  |  |
 | 安装与升级 |  |  |  |
+| 桌面托盘 |  |  |  |
 | 私聊与群聊 |  |  |  |
 | 官方 Skill 与企业能力 |  |  |  |
 | 多 Agent 与 Runtime 隔离 |  |  |  |

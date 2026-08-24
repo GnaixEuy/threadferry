@@ -603,6 +603,9 @@ default	codex	default	/Users/gnaixeuy/Desktop/ThreadFerry	aibS5gFrdrjbT-Fluj16Lw
       **这条即 Phase 1c 说的「将来出现新的消费者」——用的是「群内按 Agent 分授权」而不是整体嵌套。**
 - [x] 管理台待绑定候选改成复选框，一次可把一个群绑给多台机器人；Agent 卡片显示 Owner 顶层部门
       （企业微信无企业名查询，由 whoami 的 Owner 姓名反查通讯录得到）和 Owner 姓名
+- [x] 群接入改为自动：机器人第一次收到群内 `@` 回调，或会话列表确认 `hasBotSession` 时，自动写入
+      Owner 默认授权；管理台不再要求二次绑定，只保留机器人可用开关和成员权限。显式停用写入
+      `enabled: false`，后续群消息不会自动重新启用；删除机器人时一并清理它的已停用群记录
 - [x] 归属信息抽成 `src/agent-origin.ts`：**通讯录权限是可选的，绝不阻塞**——页面只读缓存、
       后台刷新、限时 5 秒、身份先落缓存再查通讯录、失败按 TTL 抑制重试、启动时后台预热
 - [x] 群成员名单显示姓名（`src/directory-names.ts`）：企业微信**不支持按 userid 反查通讯录**

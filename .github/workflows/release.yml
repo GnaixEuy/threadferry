@@ -9,7 +9,7 @@ permissions:
   contents: write
 
 jobs:
-  release:
+  cli:
     runs-on: ubuntu-latest
     steps:
       - name: Check out source
@@ -22,14 +22,7 @@ jobs:
           cache: npm
 
       - name: Verify release version
-        shell: bash
-        run: |
-          package_version="$(node -p "require('./package.json').version")"
-          if [[ "$GITHUB_REF_NAME" != "v${package_version}" ]]; then
-            printf 'Tag %s does not match package version %s.\n' "$GITHUB_REF_NAME" "$package_version" >&2
-            exit 1
-          fi
-          printf 'PACKAGE_VERSION=%s\n' "$package_version" >> "$GITHUB_ENV"
+        run: node --eval "const version = require('./package.json').version; if (process.env.GITHUB_REF_NAME !== 'v' + version) throw new Error('Tag does not match package version ' + version)"
 
       - name: Install development dependencies
         run: npm ci --ignore-scripts
@@ -40,7 +33,7 @@ jobs:
       - name: Test
         run: npm test
 
-      - name: Build release package
+      - name: Build CLI release package
         shell: bash
         run: |
           mkdir release
@@ -50,25 +43,93 @@ jobs:
             process.stdin.on("end", () => process.stdout.write(JSON.parse(input)[0].filename));
           ')"
           mv "release/${package_file}" release/threadferry.tgz
-          (cd release && sha256sum threadferry.tgz > SHA256SUMS)
 
       - name: Verify packaged CLI
         shell: bash
         run: |
+          package_version="$(node -p "require('./package.json').version")"
           install_prefix="$RUNNER_TEMP/threadferry-install"
           npm install --global --ignore-scripts --prefix "$install_prefix" ./release/threadferry.tgz
-          test "$("$install_prefix/bin/threadferry" --version)" = "$PACKAGE_VERSION"
+          test "$("$install_prefix/bin/threadferry" --version)" = "$package_version"
 
       - name: Prepare release notes
-        run: node scripts/release-notes.mjs "$PACKAGE_VERSION" > release/RELEASE_NOTES.md
+        run: node scripts/release-notes.mjs "$(node -p "require('./package.json').version")" > release/RELEASE_NOTES.md
+
+      - name: Upload CLI assets
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: cli-release
+          path: release/*
+          if-no-files-found: error
+
+  desktop:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            name: macos
+          - os: windows-latest
+            name: windows
+          - os: ubuntu-latest
+            name: linux
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Verify release version
+        run: node --eval "const version = require('./package.json').version; if (process.env.GITHUB_REF_NAME !== 'v' + version) throw new Error('Tag does not match package version ' + version)"
+
+      - name: Install development dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Build desktop package
+        run: npm run desktop:dist
+
+      - name: Upload desktop assets
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: desktop-${{ matrix.name }}
+          path: |
+            release/desktop/*.dmg
+            release/desktop/*.zip
+            release/desktop/*.exe
+            release/desktop/*.AppImage
+            release/desktop/*.deb
+          if-no-files-found: error
+
+  release:
+    needs: [cli, desktop]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download release assets
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          path: release
+          merge-multiple: true
+
+      - name: Create checksums
+        shell: bash
+        run: |
+          cd release
+          find . -maxdepth 1 -type f ! -name RELEASE_NOTES.md ! -name SHA256SUMS -print0 |
+            sort -z | xargs -0 sha256sum > SHA256SUMS
 
       - name: Create GitHub Release
+        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-        run: >-
-          gh release create "$GITHUB_REF_NAME"
-          release/threadferry.tgz
-          release/SHA256SUMS
-          --verify-tag
-          --notes-file release/RELEASE_NOTES.md
-          --title "ThreadFerry $GITHUB_REF_NAME"
+          GH_REPO: ${{ github.repository }}
+        run: |
+          mapfile -t assets < <(find release -maxdepth 1 -type f ! -name RELEASE_NOTES.md -print | sort)
+          gh release create "$GITHUB_REF_NAME" "${assets[@]}" \
+            --verify-tag \
+            --notes-file release/RELEASE_NOTES.md \
+            --title "ThreadFerry $GITHUB_REF_NAME"

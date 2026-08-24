@@ -6,7 +6,7 @@ export type Authorization =
 
 export function authorize(config: AgentView, message: IncomingMention): Authorization {
   const group = config.groups[message.groupId];
-  if (!group) return { allowed: false, reason: "group" };
+  if (!group || group.enabled === false) return { allowed: false, reason: "group" };
   if (!message.mentioned) return { allowed: false, reason: "mention" };
   if (!group.allowAll && !group.allowUsers.includes(message.senderId)) return { allowed: false, reason: "user" };
   return { allowed: true, group };

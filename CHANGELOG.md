@@ -4,6 +4,33 @@ ThreadFerry 的每个 GitHub Release 都使用这里对应版本的内容，不�
 
 ## Unreleased
 
+## 0.26.7
+
+首次提供可直接安装的跨平台桌面应用，并把群接入、管理台和桌面启动体验整理为一条完整链路。
+
+### 主要变化
+
+- GitHub Release 现在同时提供 macOS Universal DMG/ZIP、Windows NSIS EXE、Linux AppImage/DEB、
+  CLI `threadferry.tgz` 和统一的 `SHA256SUMS`。桌面包内已包含 ThreadFerry 与 Electron 运行环境，安装后
+  可直接从菜单栏或任务栏通知区域启动，不需要在源码目录执行构建命令。
+- 新增常驻托盘桌面应用，可打开管理台、启动、停止或重启 Host、查看本机日志并安全退出。外部终端已经
+  启动 Host 时只接管显示，不越权停止其他进程；从图形界面启动时会恢复登录 Shell 的 `PATH`。
+- 管理台新增日志追踪和偏好设置，可切换主题、隐藏日志入口，并按平台控制登录启动、自动启动服务、
+  启动后打开管理台和 macOS Dock 图标；桌面偏好只保存在当前设备。
+- 群接入改为机器人第一次收到群内 `@` 后自动启用，默认仅 Owner 可用，不再要求私聊执行二次绑定；
+  群详情可停用单台机器人并保留授权名单和 Session。
+- 概览页并行读取群会话与运行状态；托盘重复打开当前管理页面时复用已有窗口，不再整页重载和重复查询。
+- 桌面窗口继续启用上下文隔离与沙箱，只允许访问本机管理台；机器人凭据、Runtime、Workspace 和 Session
+  仍按 Agent 隔离，桌面包不会嵌入 Bot Secret 或本机配置。
+
+### 安装与升级
+
+新用户先运行安装脚本和 `threadferry onboard` 完成官方 `wecom-cli`、Runtime、机器人与 Workspace 设置，
+再从 GitHub Release 下载当前系统的桌面安装包。已有用户可以直接安装 `0.26.7` 桌面版；现有配置、
+机器人凭据、Runtime Session 和本机历史不受影响。当前桌面资产未做商业证书签名，系统可能显示来源确认。
+
+[查看 v0.25.2...v0.26.7 的完整变更](https://github.com/GnaixEuy/threadferry/compare/v0.25.2...v0.26.7)
+
 ## 0.25.2
 
 修复企业微信动作意图由宿主关键词正则猜测、多机器人管理端通讯录固定使用首个机器人，以及一次
