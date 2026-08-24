@@ -1,6 +1,6 @@
 {
   "name": "threadferry",
-  "version": "0.26.8",
+  "version": "0.26.11",
   "description": "Safely ferry enterprise chat context to read-only local AI agents.",
   "author": "GnaixEuy",
   "homepage": "https://github.com/GnaixEuy/threadferry",
@@ -51,21 +51,23 @@
     "appId": "com.threadferry.desktop",
     "productName": "ThreadFerry",
     "artifactName": "ThreadFerry-${version}-${os}-${arch}.${ext}",
+    "electronLanguages": ["en-US", "zh-CN", "zh_CN"],
     "directories": {
       "buildResources": "build",
       "output": "release/desktop"
     },
     "files": [
-      "dist/src/**/*",
+      "dist/src/**/*.js",
       "build/desktop-preload.cjs",
       "build/tray*.png",
-      "package.json"
+      "package.json",
+      "!**/*.d.ts",
+      "!**/*.map"
     ],
     "mac": {
       "category": "public.app-category.developer-tools",
       "target": [
-        { "target": "dmg", "arch": ["universal"] },
-        { "target": "zip", "arch": ["universal"] }
+        { "target": "dmg", "arch": ["arm64", "x64"] }
       ]
     },
     "win": {

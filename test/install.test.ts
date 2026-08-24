@@ -20,7 +20,15 @@ const project = fileURLToPath(new URL("../..", import.meta.url));
 const cli = fileURLToPath(new URL("../src/cli.js", import.meta.url));
 const packageMetadata = JSON.parse(
   readFileSync(fileURLToPath(new URL("../../package.json", import.meta.url)), "utf8"),
-) as { scripts?: Record<string, string>; version: string };
+) as {
+  scripts?: Record<string, string>;
+  version: string;
+  build?: {
+    electronLanguages?: string[];
+    files?: string[];
+    mac?: { target?: Array<{ target: string; arch: string[] }> };
+  };
+};
 
 test("installer dry-run is non-destructive and points to onboarding", () => {
   const result = spawnSync("bash", ["install.sh", "--dry-run", "--no-onboard"], {
@@ -166,8 +174,13 @@ test("release workflow publishes directly installable desktop packages", () => {
   const workflow = readFileSync(join(project, ".github", "workflows", "release.yml"), "utf8");
 
   assert.match(packageMetadata.scripts?.["desktop:dist"] ?? "", /electron-builder --publish never$/);
+  assert.deepEqual(packageMetadata.build?.electronLanguages, ["en-US", "zh-CN", "zh_CN"]);
+  assert.ok(packageMetadata.build?.files?.includes("!**/*.d.ts"));
+  assert.ok(packageMetadata.build?.files?.includes("!**/*.map"));
+  assert.deepEqual(packageMetadata.build?.mac?.target, [{ target: "dmg", arch: ["arm64", "x64"] }]);
   for (const runner of ["macos-latest", "windows-latest", "ubuntu-latest"]) assert.match(workflow, new RegExp(`os: ${runner}`));
-  for (const extension of ["dmg", "zip", "exe", "AppImage", "deb"]) assert.match(workflow, new RegExp(`release/desktop/\\*\\.${extension}`));
+  for (const extension of ["dmg", "exe", "AppImage", "deb"]) assert.match(workflow, new RegExp(`release/desktop/\\*\\.${extension}`));
+  assert.doesNotMatch(workflow, /release\/desktop\/\*\.zip/);
   assert.match(workflow, /needs: \[cli, desktop\]/);
   assert.match(workflow, /merge-multiple: true/);
   assert.match(workflow, /sha256sum > SHA256SUMS/);

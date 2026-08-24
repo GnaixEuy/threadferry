@@ -1,4 +1,4 @@
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { readdir, realpath, stat } from "node:fs/promises";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
@@ -7,7 +7,7 @@ import { basename, dirname, isAbsolute, join } from "node:path";
 import { CLIENT_SCRIPT, STYLESHEET } from "./admin-assets.js";
 import { addAgent, ensureGroupAccess, resolveWorkspace } from "./config.js";
 import { resolveDirectoryUser } from "./directory.js";
-import type { StateSnapshot } from "./state.js";
+import { sessionScope, type StateSnapshot } from "./state.js";
 import { isRuntimeName } from "./types.js";
 import type { DirectoryUser, GroupAccess, GroupBinding, RuntimeName, ThreadFerryConfig } from "./types.js";
 
@@ -328,6 +328,19 @@ async function fetchSnapshot(dependencies: AdminDependencies): Promise<StateSnap
   }
 }
 
+async function fetchBotStatuses(config: ThreadFerryConfig, dependencies: AdminDependencies): Promise<Map<string, AgentBotStatus>> {
+  const statuses = new Map<string, AgentBotStatus>();
+  await Promise.all(Object.keys(config.agents).map(async (agentId) => {
+    try {
+      const status = await dependencies.botStatus?.(agentId);
+      if (status) statuses.set(agentId, status);
+    } catch {
+      // 单个 Agent 查询失败不影响其他状态和页面。
+    }
+  }));
+  return statuses;
+}
+
 // 企业微信没有「机器人在哪些群」这个查询，只能列出最近 7 天有消息的群，所以空列表要讲清规则。
 const DISCOVERY_HINT = "企业微信只提供最近 7 天有消息的群；把机器人拉进群并 @它一次，ThreadFerry 收到后会自动启用。";
 
@@ -377,7 +390,7 @@ function shell(
     ["/settings", "settings", "偏好设置", "⚙"],
   ];
   const current = tabs.find(([, key]) => key === active)!;
-  const nav = tabs.slice(0, 3).map(([href, key, label, icon]) => `<a href="${href}"${key === active ? ` class="active" aria-current="page"` : ""}><span class="nav-icon" aria-hidden="true">${icon}</span><span>${label}</span></a>`).join("");
+  const nav = tabs.slice(0, 3).map(([href, key, label, icon]) => `<a href="${href}" data-tour-target="${key}"${key === active ? ` class="active" aria-current="page"` : ""}><span class="nav-icon" aria-hidden="true">${icon}</span><span>${label}</span></a>`).join("");
   const utilities = tabs.slice(3).map(([href, key, label, icon]) => `<a href="${href}"${key === "logs" ? " data-log-nav" : ""}${key === active ? ` class="active" aria-current="page"` : ""}><span class="nav-icon" aria-hidden="true">${icon}</span><span>${label}</span></a>`).join("");
   return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
   <title>ThreadFerry 管理台</title><script src="/admin.js"></script><link rel="stylesheet" href="/admin.css"></head>
@@ -401,6 +414,7 @@ function settingsPage(config: ThreadFerryConfig, url: URL): string {
         <select data-theme-preference aria-label="界面主题"><option value="system">跟随系统</option><option value="light">亮色</option><option value="dark">暗色</option></select>
       </label>
       <label class="setting-row"><span><b>显示日志追踪</b><small>在侧栏左下角显示运行记录定位入口。</small></span><input type="checkbox" data-interface-preference="showLogTracking"></label>
+      <div class="setting-row"><span><b>开始使用引导</b><small>重新查看机器人、私聊和可选群聊的使用说明。</small></span><a class="button ghost" href="/?tour=1">重新查看</a></div>
     </article>
     <article class="card settings-card" data-desktop-settings>
       <div class="section-head"><div><h2>桌面应用</h2><p class="sub">这些选项保存在本机，只控制 ThreadFerry 桌面入口。</p></div><span class="badge" data-desktop-platform>正在识别</span></div>
@@ -447,10 +461,92 @@ async function logsPage(config: ThreadFerryConfig, dependencies: AdminDependenci
     <h2>失败记录</h2>${failureList}<h2>Activity</h2>${activityList}`);
 }
 
+function overviewCharts(snapshot: StateSnapshot, counts: Map<string, number>, now = new Date()): string {
+  const key = (date: Date): string => `${date.getFullYear()}-${date.getMonth()}-${date.getDate()}`;
+  const today = new Date(now);
+  today.setHours(0, 0, 0, 0);
+  const days = Array.from({ length: 7 }, (_, index) => {
+    const date = new Date(today);
+    date.setDate(today.getDate() - 6 + index);
+    return { key: key(date), label: `${date.getMonth() + 1}/${date.getDate()}`, handled: 0, failed: 0, stale: 0 };
+  });
+  const byDay = new Map(days.map((day) => [day.key, day]));
+  for (const turn of snapshot.turns) {
+    const date = new Date(turn.receivedAt);
+    if (Number.isNaN(date.getTime())) continue;
+    const day = byDay.get(key(date));
+    if (!day) continue;
+    if (turn.status === "handled") day.handled += 1;
+    else if (turn.status === "failed") day.failed += 1;
+    else if (turn.status === "stale") day.stale += 1;
+  }
+
+  const completed = counts.get("handled") ?? 0;
+  const active = (counts.get("queued") ?? 0) + (counts.get("running") ?? 0);
+  const failed = counts.get("failed") ?? 0;
+  const stale = counts.get("stale") ?? 0;
+  const statuses = [
+    { label: "已完成", value: completed, className: "handled" },
+    { label: "进行中", value: active, className: "active" },
+    { label: "失败", value: failed, className: "failed" },
+    { label: "已过期", value: stale, className: "stale" },
+  ];
+  const total = statuses.reduce((sum, status) => sum + status.value, 0);
+  const terminalTotal = days.reduce((sum, day) => sum + day.handled + day.failed + day.stale, 0);
+  const trend = terminalTotal > 0
+    ? (() => {
+        const maximum = Math.max(...days.map((day) => day.handled + day.failed + day.stale));
+        const bars = days.map((day, index) => {
+          const x = 34 + index * 94;
+          const parts = [
+            { value: day.handled, className: "handled", label: "完成" },
+            { value: day.failed, className: "failed", label: "失败" },
+            { value: day.stale, className: "stale", label: "过期" },
+          ];
+          let y = 165;
+          const rectangles = parts.map((part) => {
+            const height = part.value / maximum * 120;
+            y -= height;
+            return height > 0
+              ? `<rect class="chart-bar ${part.className}" x="${x}" y="${y.toFixed(1)}" width="48" height="${height.toFixed(1)}"><title>${day.label} ${part.label} ${part.value}</title></rect>`
+              : "";
+          }).join("");
+          const count = day.handled + day.failed + day.stale;
+          return `${rectangles}${count ? `<text class="chart-value" x="${x + 24}" y="${Math.max(22, y - 7).toFixed(1)}">${count}</text>` : ""}<text class="chart-label" x="${x + 24}" y="190">${day.label}</text>`;
+        }).join("");
+        return `<svg class="trend-chart" viewBox="0 0 700 210" role="img" aria-labelledby="turn-trend-title turn-trend-description">
+          <desc id="turn-trend-description">最近七天已完成、失败和过期任务的每日数量</desc>
+          <line class="chart-grid" x1="20" y1="45" x2="680" y2="45"></line><line class="chart-grid" x1="20" y1="165" x2="680" y2="165"></line>${bars}
+        </svg>`;
+      })()
+    : `<div class="chart-empty">近 7 天还没有已结束的任务。</div>`;
+
+  let offset = 0;
+  const segments = statuses.map((status) => {
+    if (!status.value) return "";
+    const percentage = status.value / total * 100;
+    const segment = `<circle class="chart-segment ${status.className}" cx="60" cy="60" r="48" pathLength="100" stroke-dasharray="${percentage} ${100 - percentage}" stroke-dashoffset="-${offset}"><title>${status.label} ${status.value}</title></circle>`;
+    offset += percentage;
+    return segment;
+  }).join("");
+  const distribution = total > 0
+    ? `<div class="status-chart"><svg class="donut-chart" viewBox="0 0 120 120" role="img" aria-labelledby="turn-status-title turn-status-description">
+        <desc id="turn-status-description">当前保留任务记录的状态分布</desc><circle class="donut-base" cx="60" cy="60" r="48"></circle>${segments}
+        <text class="donut-value" x="60" y="57">${total}</text><text class="donut-label" x="60" y="75">条任务</text>
+      </svg><ul class="chart-legend">${statuses.map((status) => `<li><span><i class="legend-dot ${status.className}"></i>${status.label}</span><b>${status.value}</b></li>`).join("")}</ul></div>`
+    : `<div class="chart-empty">暂无任务状态数据。</div>`;
+
+  return `<section class="overview-charts" aria-label="运行概览图表">
+    <article class="card chart-card"><div class="chart-heading"><div><h3 id="turn-trend-title">近 7 天处理趋势</h3><p class="sub">按任务接收日期统计已结束记录</p></div><div class="chart-key"><span><i class="legend-dot handled"></i>完成</span><span><i class="legend-dot failed"></i>失败</span><span><i class="legend-dot stale"></i>过期</span></div></div>${trend}</article>
+    <article class="card chart-card"><div class="chart-heading"><div><h3 id="turn-status-title">任务状态分布</h3><p class="sub">当前保留的任务记录</p></div></div>${distribution}</article>
+  </section>`;
+}
+
 async function overviewPage(config: ThreadFerryConfig, dependencies: AdminDependencies, url: URL): Promise<string> {
-  const [{ sessions, visibleTo, failures }, snapshot] = await Promise.all([
+  const [{ sessions, visibleTo, failures }, snapshot, botStatuses] = await Promise.all([
     fetchSessions(config, dependencies),
     fetchSnapshot(dependencies),
+    fetchBotStatuses(config, dependencies),
   ]);
   const activeGroups = Object.values(config.groups).filter((group) => Object.values(group.agents).some((access) => access.enabled !== false)).length;
   const disabledGroups = Object.values(config.groups).filter((group) => Object.values(group.agents).every((access) => access.enabled === false)).length;
@@ -462,6 +558,19 @@ async function overviewPage(config: ThreadFerryConfig, dependencies: AdminDepend
   const reminders = (snapshot?.reminders ?? []).filter((item) => item.status === "scheduled" || item.status === "running");
   const workItems = (snapshot?.workItems ?? []).filter((item) => item.status !== "completed" && item.status !== "failed");
   const activities = (snapshot?.activities ?? []).slice(-20).reverse();
+  const authorized = [...botStatuses.values()].filter((status) => status.authorized).length;
+  const directSession = snapshot?.sessions.some((session) => Object.entries(config.agents).some(([agentId, agent]) =>
+    session.group === createHash("sha256").update(`direct:${agent.ownerUser}`).digest("hex")
+      && session.workspace === createHash("sha256").update(sessionScope(agentId, agent)).digest("hex"))) ?? false;
+  const coreCompleted = Number(authorized > 0) + Number(directSession);
+  const onboarding = `<details class="onboarding card" data-onboarding${coreCompleted < 2 ? " open" : ""}>
+    <summary><span><b>开始使用</b><small>${coreCompleted} / 2 个核心步骤已完成${activeGroups > 0 ? " · 群聊已接入" : ""}</small></span><span class="onboarding-toggle">${coreCompleted === 2 ? "已完成" : "继续设置"}</span></summary>
+    <ol class="onboarding-list">
+      <li class="${authorized > 0 ? "done" : "current"}"><span class="onboarding-mark" aria-hidden="true">${authorized > 0 ? "✓" : "1"}</span><span><b>${authorized > 0 ? "机器人已授权" : "授权企业微信机器人"}</b><small>${authorized > 0 ? `已有 ${authorized} 台机器人可用。` : "前往机器人管理完成扫码或手工授权。"}</small></span><a href="/agents">机器人管理</a></li>
+      <li class="${directSession ? "done" : authorized > 0 ? "current" : ""}"><span class="onboarding-mark" aria-hidden="true">${directSession ? "✓" : "2"}</span><span><b>${directSession ? "已完成第一次私聊" : "完成第一次私聊"}</b><small>${directSession ? "Owner 私聊 Session 已建立。" : "在企业微信找到已授权机器人，直接发送一句普通消息。"}</small></span></li>
+      <li class="${activeGroups > 0 ? "done" : ""}"><span class="onboarding-mark" aria-hidden="true">${activeGroups > 0 ? "✓" : "＋"}</span><span><b>接入群聊（可选）</b><small>${activeGroups > 0 ? `已有 ${activeGroups} 个群可用。` : "把机器人加入群聊并 @它一次，收到后自动启用。"}</small></span><a href="/groups">群聊管理</a></li>
+    </ol>
+  </details>`;
   const stats: Array<[string, string, string]> = [
     [String(Object.keys(config.agents).length), "机器人", "/agents"],
     [String(activeGroups), "可用群", "/groups"],
@@ -491,10 +600,12 @@ async function overviewPage(config: ThreadFerryConfig, dependencies: AdminDepend
     ? `<article class="card"><ul>${activities.map((item) => `<li><span><code>${html(item.agent)}</code> ${html(item.type)}${item.resource ? ` · ${html(item.resource)}` : ""}</span><span class="badge ${item.outcome === "success" ? "ok" : item.outcome === "failure" ? "warning" : ""}">${html(item.outcome)}</span></li>`).join("")}</ul></article>`
     : `<p class="sub">还没有 Activity。</p>`;
   return shell("overview", config, url, `
+    ${onboarding}
     <div class="stats">${stats.map(([value, label, href]) => href
       ? `<a class="stat" href="${href}"><b>${value}</b><span>${label}</span></a>`
       : `<div class="stat"><b>${value}</b><span>${label}</span></div>`).join("")}</div>
     ${snapshot ? "" : `<p class="sub mt">运行状态暂不可用；机器人和群配置管理不受影响。</p>`}
+    ${snapshot ? overviewCharts(snapshot, counts) : ""}
     <h2>待处理</h2>${todos.length ? `<div class="grid">${todos.join("")}</div>` : `<p class="sub">没有待处理事项。</p>`}
     <h2>主动工作</h2>${proactive.length ? `<div class="grid">${proactive.join("")}</div>` : `<p class="sub">没有运行中的提醒或协作任务。</p>`}
     <h2>最近 Activity</h2>${activityList}`);
@@ -619,15 +730,7 @@ async function agentsPage(config: ThreadFerryConfig, dependencies: AdminDependen
   };
   const browseLink = `/agents/browse?${carryParams(url, { ...(prefill.workspace ? { path: prefill.workspace } : {}), new: "1" })}`;
   // 每个 Agent 一个机器人：授权状态与 Owner 都是 Agent 自己的属性，必须显示出来。
-  const botStatuses = new Map<string, AgentBotStatus>();
-  await Promise.all(Object.keys(config.agents).map(async (agentId) => {
-    try {
-      const status = await dependencies.botStatus?.(agentId);
-      if (status) botStatuses.set(agentId, status);
-    } catch {
-      // 单个 Agent 查询失败不影响整页。
-    }
-  }));
+  const botStatuses = await fetchBotStatuses(config, dependencies);
   const openAuth = url.searchParams.get("auth")?.trim();
   const error = url.searchParams.get("error") ?? undefined;
   const authDialogs: string[] = [];

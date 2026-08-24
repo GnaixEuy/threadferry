@@ -4,6 +4,62 @@ ThreadFerry 的每个 GitHub Release 都使用这里对应版本的内容，不�
 
 ## Unreleased
 
+## 0.26.11
+
+管理台概览增加运行图表，让近期处理量和当前任务状态更容易判断。
+
+### 主要变化
+
+- 概览页增加近 7 天处理趋势，按任务接收日期展示完成、失败和过期记录；没有已结束任务时显示明确空状态。
+- 增加当前任务状态分布，区分已完成、进行中、失败和已过期，并保留原有机器人、群和 Session 数字卡片。
+- 图表使用管理台现有脱敏状态快照和原生 SVG，不增加第三方依赖，也不读取消息正文。
+
+### 安装与升级
+
+升级并重新启动 ThreadFerry 后打开本机管理台即可看到图表。现有配置、机器人凭据、Workspace、
+Runtime Session 和群聊授权不受影响。
+
+[查看 v0.26.10...v0.26.11 的完整变更](https://github.com/GnaixEuy/threadferry/compare/v0.26.10...v0.26.11)
+
+## 0.26.10
+
+管理台增加状态驱动的开始使用引导，让首次完成配置的用户知道当前状态和下一步。
+
+### 主要变化
+
+- 概览页根据真实机器人授权和 Owner 私聊 Session 展示两个核心步骤，并把群聊接入明确标为可选；
+  核心步骤完成后清单自动收起。
+- 首次进入管理台显示三步聚光引导，说明 Agent 与机器人 1:1、机器人管理入口和可选群聊入口；
+  支持跳过、Esc 关闭，并可从偏好设置重新查看。
+- 引导继续使用管理台现有原生 HTML、CSS、JavaScript 和本机 `localStorage`，未增加第三方依赖或改变
+  企业微信授权、Owner 确认与凭据隔离边界。
+
+### 安装与升级
+
+升级并重新启动 ThreadFerry 后打开本机管理台即可看到引导。现有配置、机器人凭据、Workspace、
+Runtime Session 和群聊授权不受影响。
+
+[查看 v0.26.9...v0.26.10 的完整变更](https://github.com/GnaixEuy/threadferry/compare/v0.26.9...v0.26.10)
+
+## 0.26.9
+
+缩小桌面安装包，避免 macOS 用户为另一套 CPU 架构和重复压缩格式付出下载体积。
+
+### 主要变化
+
+- macOS 不再把 x86_64 与 arm64 Electron 合成一个 Universal 包，改为分别提供 Apple Silicon arm64
+  DMG 和 Intel x64 DMG；实测单个 DMG 从约 207 MiB 降到 103–105 MiB。
+- 移除与 DMG 内容重复的 macOS ZIP，Release 只保留两种架构的标准安装镜像。
+- 桌面包只保留英文和简体中文 Electron 语言资源，并排除运行时不需要的 TypeScript 声明与 Source Map；
+  不改变 ThreadFerry 功能、Runtime、企业微信能力或安全边界。
+
+### 安装与升级
+
+Apple Silicon Mac 下载文件名含 `arm64` 的 DMG，Intel Mac 下载含 `x64` 的 DMG。Windows 和 Linux
+继续使用对应的 EXE、AppImage 或 DEB。现有配置、机器人凭据、Runtime Session 和本机历史不受影响。
+
+[查看 v0.26.8...v0.26.9 的完整变更](https://github.com/GnaixEuy/threadferry/compare/v0.26.8...v0.26.9)
+
 ## 0.26.8
 
 修复 Tag 构建时桌面打包器越过统一发布作业自行上传，正式产出可直接安装的跨平台桌面资产。

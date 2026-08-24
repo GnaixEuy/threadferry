@@ -54,9 +54,10 @@ irm https://raw.githubusercontent.com/GnaixEuy/threadferry/main/install.ps1 | ie
 ```
 
 After installing the CLI and completing first-time setup, download the desktop app for everyday use
-from [GitHub Releases](https://github.com/GnaixEuy/threadferry/releases/latest): a universal DMG on
-macOS, the NSIS installer on Windows, or AppImage/DEB on Linux. The desktop app adds the tray entry;
-the runtime and official `wecom-cli` continue to use the local installation and login above.
+from [GitHub Releases](https://github.com/GnaixEuy/threadferry/releases/latest): the arm64 DMG for
+Apple Silicon Macs, the x64 DMG for Intel Macs, the NSIS installer on Windows, or AppImage/DEB on
+Linux. The desktop app adds the tray entry; the runtime and official `wecom-cli` continue to use the
+local installation and login above.
 
 ## First run
 
@@ -75,7 +76,10 @@ quits cleanly. Closing the admin window only returns it to the tray.
 The lower-left console utilities include trace logs and Preferences. Trace logs locate sanitized records by
 error ID, agent, action, or resource and can be hidden in Preferences. Preferences also controls the theme,
 launch at login, automatic service startup, opening the console after startup, and the optional macOS Dock
-entry. Desktop preferences stay on the device.
+entry. On first open, the console shows a state-driven getting-started checklist and a three-step interface
+tour. The checklist collapses after bot authorization and the first Owner direct message; group setup remains
+optional, and the tour can be skipped or restarted from Preferences. The overview also visualizes sanitized
+runtime state with a seven-day processing trend and task-status distribution. Desktop preferences stay on the device.
 
 For terminal operation, configured agents can still be started with:
 

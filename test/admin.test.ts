@@ -35,7 +35,12 @@ test("overview loads group discovery and runtime state in parallel", { timeout: 
   }, 0);
   t.after(() => admin.close());
 
-  assert.equal((await fetch(`${admin.url}/`)).status, 200);
+  const response = await fetch(`${admin.url}/`);
+  assert.equal(response.status, 200);
+  const page = await response.text();
+  assert.match(page, /0 \/ 2 个核心步骤已完成/);
+  assert.match(page, /近 7 天还没有已结束的任务/);
+  assert.match(page, /暂无任务状态数据/);
   assert.deepEqual([...started].sort(), ["groups", "snapshot"]);
 });
 
@@ -81,7 +86,10 @@ test("localhost admin manages agents, groups, and users with CSRF protection", a
         { id: digest("msg-1"), group: digest("group"), status: "running", receivedAt: now, updatedAt: now },
         { id: digest("msg-2"), group: digest("group"), status: "failed", receivedAt: now, updatedAt: now, errorId: "TF-12345678", failurePhase: "runtime" },
       ],
-      sessions: [{ group: digest("group"), workspace: digest(workspace), sessionId: "session-1", updatedAt: now }],
+      sessions: [
+        { group: digest("group"), workspace: digest(workspace), sessionId: "session-1", updatedAt: now },
+        { group: digest("direct:owner"), workspace: digest(`default\0codex\0${workspace}`), sessionId: "session-direct", updatedAt: now },
+      ],
       inbox: [],
       outbox: [],
       reminders: [{ id: "R-123456789ABC", agent: "default", chatId: "owner", chatType: "single", createdBy: "owner", instruction: "检查待办", nextRunAt: now, status: "scheduled", failures: 0, createdAt: now, updatedAt: now }],
@@ -101,11 +109,25 @@ test("localhost admin manages agents, groups, and users with CSRF protection", a
   assert.doesNotMatch(overview, /data-theme-toggle/);
   assert.match(overview, /class="sidebar-bottom"/);
   assert.match(overview, /日志追踪[\s\S]*偏好设置[\s\S]*服务运行中/);
+  assert.match(overview, /data-tour-target="agents"/);
+  assert.match(overview, /data-tour-target="groups"/);
   assert.doesNotMatch(overview, /仅监听 127\.0\.0\.1/);
   assert.doesNotMatch(overview, /class="top-actions"/);
+  assert.match(overview, /data-onboarding/);
+  assert.match(overview, /2 \/ 2 个核心步骤已完成 · 群聊已接入/);
+  assert.match(overview, /已完成第一次私聊/);
+  assert.match(overview, /接入群聊（可选）/);
+  assert.doesNotMatch(overview, /data-onboarding open/);
   assert.match(overview, /等待首次 @/);
   assert.match(overview, /新群/);
   assert.match(overview, /排队 \/ 运行中/);
+  assert.match(overview, /近 7 天处理趋势/);
+  assert.match(overview, /任务状态分布/);
+  assert.match(overview, /class="chart-bar failed"/);
+  assert.match(overview, /class="chart-segment active"/);
+  assert.match(overview, /class="chart-segment failed"/);
+  assert.match(overview, /进行中<\/span><b>1<\/b>/);
+  assert.match(overview, /失败<\/span><b>1<\/b>/);
   assert.match(overview, /TF-12345678/);
   assert.match(overview, /主动工作[\s\S]*R-123456789ABC[\s\S]*核对季度复盘/);
   assert.match(overview, /最近 Activity[\s\S]*action\.read[\s\S]*doc:doc-1/);
@@ -138,6 +160,9 @@ test("localhost admin manages agents, groups, and users with CSRF protection", a
   assert.match(clientScript, /showModal/);
   assert.match(clientScript, /threadferry-theme/);
   assert.match(clientScript, /threadferry-show-log-tracking/);
+  assert.match(clientScript, /threadferry-onboarding-tour-v1/);
+  assert.match(clientScript, /aria-modal/);
+  assert.match(clientScript, /event\.key === "Escape"/);
   assert.match(clientScript, /threadferryDesktop/);
 
   const logs = await (await fetch(`${admin.url}/logs`)).text();
@@ -157,6 +182,7 @@ test("localhost admin manages agents, groups, and users with CSRF protection", a
   assert.match(settings, /href="\/settings" class="active" aria-current="page"/);
   assert.match(settings, /data-theme-preference/);
   assert.match(settings, /data-interface-preference="showLogTracking"/);
+  assert.match(settings, /href="\/\?tour=1">重新查看<\/a>/);
   assert.match(settings, /data-desktop-preference="launchAtLogin"/);
   assert.match(settings, /data-desktop-preference="autoStartService"/);
   assert.match(settings, /data-desktop-preference="openManagementOnLaunch"/);
