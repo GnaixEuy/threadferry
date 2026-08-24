@@ -173,6 +173,33 @@ a.stat:hover{border-color:#46536a;transform:translateY(-1px)}
 .stat b{display:block;font-size:28px;line-height:1.2;margin-bottom:4px}
 .stat span{color:var(--muted);font-size:13px}
 
+.overview-charts{display:grid;grid-template-columns:minmax(0,1.5fr) minmax(280px,.7fr);gap:14px;margin-top:14px}
+.chart-card{min-width:0}
+.chart-heading{display:flex;align-items:start;justify-content:space-between;gap:16px;margin-bottom:12px}
+.chart-heading h3{margin:0;color:var(--text-strong)}
+.chart-heading p{margin:3px 0 0;font-size:12.5px}
+.chart-key{display:flex;gap:12px;flex-wrap:wrap;color:var(--muted);font-size:12px}
+.chart-key span{display:flex;align-items:center;gap:5px}
+.legend-dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--line-strong)}
+.legend-dot.handled{background:var(--ok)}.legend-dot.active{background:var(--accent)}.legend-dot.failed{background:var(--danger)}.legend-dot.stale{background:var(--warn)}
+.trend-chart{display:block;width:100%;height:auto;min-height:180px}
+.chart-grid{stroke:var(--line);stroke-width:1}
+.chart-bar.handled{fill:var(--ok)}.chart-bar.failed{fill:var(--danger)}.chart-bar.stale{fill:var(--warn)}
+.chart-label,.chart-value{fill:var(--muted);font:11px ui-sans-serif,system-ui,-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;text-anchor:middle}
+.chart-value{fill:var(--text-strong);font-weight:700}
+.chart-empty{min-height:180px;display:grid;place-items:center;color:var(--muted);font-size:13px;text-align:center}
+.status-chart{min-height:180px;display:grid;grid-template-columns:minmax(130px,1fr) minmax(120px,1fr);align-items:center;gap:14px}
+.donut-chart{display:block;width:min(180px,100%);height:auto;margin:auto}
+.donut-base,.chart-segment{fill:none;stroke-width:16}
+.donut-base{stroke:var(--line)}
+.chart-segment{transform:rotate(-90deg);transform-origin:60px 60px}
+.chart-segment.handled{stroke:var(--ok)}.chart-segment.active{stroke:var(--accent)}.chart-segment.failed{stroke:var(--danger)}.chart-segment.stale{stroke:var(--warn)}
+.donut-value,.donut-label{fill:var(--text-strong);font:700 22px ui-sans-serif,system-ui,-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;text-anchor:middle}
+.donut-label{fill:var(--muted);font-size:10px;font-weight:500}
+.chart-legend{list-style:none;margin:0;padding:0}
+.chart-legend li{display:flex;align-items:center;justify-content:space-between;gap:18px;padding:7px 0;border-top:1px solid var(--line);color:var(--muted);font-size:13px}
+.chart-legend li:first-child{border-top:0}.chart-legend li>span{display:flex;align-items:center;gap:7px}.chart-legend b{color:var(--text-strong)}
+
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(340px,100%),1fr));gap:14px}
 .card{background:var(--surface);border:1px solid var(--line);border-radius:var(--radius);padding:19px;box-shadow:var(--card-shadow)}
 .row{display:flex;justify-content:space-between;gap:16px;align-items:start}
@@ -210,6 +237,40 @@ li form{margin:0}
 ul.links li{border:none;padding:4px 0;justify-content:flex-start;gap:10px}
 ul.links a{color:var(--link);text-decoration:none}
 ul.links a:hover{text-decoration:underline}
+
+.onboarding{padding:0;margin-bottom:20px;overflow:hidden}
+.onboarding summary{display:flex;align-items:center;justify-content:space-between;gap:20px;padding:17px 19px;cursor:pointer;list-style:none}
+.onboarding summary::-webkit-details-marker{display:none}
+.onboarding summary>span:first-child{display:grid;gap:2px}
+.onboarding summary b{color:var(--text-strong);font-size:17px}
+.onboarding summary small{color:var(--muted)}
+.onboarding-toggle{color:var(--link);font-size:13px;font-weight:650}
+.onboarding[open] summary{border-bottom:1px solid var(--line)}
+.onboarding-list{list-style:none;margin:0;padding:4px 19px 12px}
+.onboarding-list li{display:grid;grid-template-columns:30px minmax(0,1fr) auto;align-items:center;gap:12px;border-top:1px solid var(--line);padding:13px 0}
+.onboarding-list li:first-child{border-top:0}
+.onboarding-list li>span:nth-child(2){display:grid;gap:2px}
+.onboarding-list b{color:var(--text-strong)}
+.onboarding-list small{color:var(--muted);font-size:13px}
+.onboarding-list a{color:var(--link);text-decoration:none;font-weight:650;white-space:nowrap}
+.onboarding-list a:hover{text-decoration:underline}
+.onboarding-mark{width:27px;height:27px;display:grid;place-items:center;border:1px solid var(--line-strong);border-radius:50%;color:var(--muted);font-size:12px;font-weight:750}
+.onboarding-list .current .onboarding-mark{border-color:var(--accent);color:var(--accent);background:var(--nav-active)}
+.onboarding-list .done .onboarding-mark{border-color:var(--ok);color:var(--ok);background:var(--success-bg)}
+
+.tour-blocker{position:fixed;inset:0;z-index:38}
+.tour-mask{position:fixed;z-index:39;pointer-events:none;border:2px solid var(--accent);border-radius:11px;box-shadow:0 0 0 9999px var(--overlay)}
+.tour-mask.full{inset:0;border:0;border-radius:0;background:var(--overlay);box-shadow:none}
+.tour-panel{position:fixed;z-index:41;width:min(340px,calc(100vw - 32px));padding:18px;background:var(--surface);border:1px solid var(--line-strong);border-radius:var(--radius);box-shadow:0 24px 60px rgb(0 0 0 / .38)}
+.tour-panel.center{left:50%;top:50%;transform:translate(-50%,-50%)}
+.tour-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:12px}
+.tour-step{color:var(--muted);font-size:12px;font-weight:700;letter-spacing:.08em}
+.tour-close{min-height:30px;width:30px;padding:0;background:transparent;border-color:transparent;color:var(--muted);font-size:20px}
+.tour-close:hover{background:var(--nav-hover);color:var(--text-strong)}
+.tour-panel h2{margin:0 0 7px;font-size:19px}
+.tour-panel p{color:var(--muted);margin:0}
+.tour-actions{display:flex;justify-content:space-between;gap:10px;margin-top:18px;padding-top:14px;border-top:1px solid var(--line)}
+.tour-actions button{min-width:82px}
 
 .notice{max-width:1320px;padding:11px 14px;border-radius:10px;margin:0 auto 18px;background:var(--success-bg);color:var(--success-text)}
 .notice.error{background:var(--error-bg);color:var(--error-text)}
@@ -284,10 +345,11 @@ dialog.modal:not(:modal){position:static;margin:0 auto 24px}
   main{padding:22px 16px 60px}
   header.top{align-items:start;margin-bottom:20px;padding-bottom:18px}
   .toolbar{align-items:start;flex-direction:column}
+  .overview-charts{grid-template-columns:1fr}
   .group-row{grid-template-columns:minmax(0,1fr) auto}.group-agents{display:none}
   .trace-filter{grid-template-columns:minmax(0,1fr) 140px auto}.clear-filter{grid-column:1/-1;justify-content:start}
 }
-@media(max-width:520px){.instance{display:none}.nav-icon{display:none}.grid{grid-template-columns:1fr}.card{padding:16px}.section-head,.detail-title{align-items:flex-start;flex-direction:column}.group-row{padding:13px 14px}.group-state .badge{display:none}.setting-row{align-items:flex-start;flex-direction:column}.setting-row select{width:100%}.trace-filter{grid-template-columns:1fr}.trace-row{grid-template-columns:1fr}.trace-row>.badge{justify-self:start}}
+@media(max-width:520px){.instance{display:none}.nav-icon{display:none}.grid{grid-template-columns:1fr}.card{padding:16px}.onboarding{padding:0}.onboarding-list li{grid-template-columns:30px minmax(0,1fr)}.onboarding-list li>a{grid-column:2}.chart-heading{display:grid}.chart-key{gap:9px}.status-chart{grid-template-columns:1fr 1fr;gap:8px}.section-head,.detail-title{align-items:flex-start;flex-direction:column}.group-row{padding:13px 14px}.group-state .badge{display:none}.setting-row{align-items:flex-start;flex-direction:column}.setting-row select{width:100%}.trace-filter{grid-template-columns:1fr}.trace-row{grid-template-columns:1fr}.trace-row>.badge{justify-self:start}}
 `;
 
 export const CLIENT_SCRIPT = `"use strict";
@@ -314,9 +376,129 @@ document.addEventListener("DOMContentLoaded", function () {
   setupInterfacePreferences();
   setupDesktopPreferences();
   setupDialogs();
+  setupOnboardingTour();
   each("[data-auth-form]", setupAuthMode);
   each("[data-picker]", attachPicker);
 });
+
+function setupOnboardingTour() {
+  if (!document.querySelector("[data-onboarding]")) return;
+  var forced = new URLSearchParams(window.location.search).get("tour") === "1";
+  var completed = false;
+  try { completed = localStorage.getItem("threadferry-onboarding-tour-v1") === "done"; } catch (_) {}
+  if (completed && !forced) return;
+
+  var steps = [
+    { title: "一个 Agent 对应一个机器人", description: "每个机器人都有独立的 Owner、Workspace、Runtime、凭据和 Session。想使用哪个项目，就私聊对应的机器人。" },
+    { target: "agents", title: "在这里管理机器人", description: "查看机器人授权、Owner、Runtime 和 Workspace；需要增加项目时，再添加一台机器人。" },
+    { target: "groups", title: "群聊接入是可选的", description: "把机器人加入目标群并 @它一次，ThreadFerry 收到后会自动启用，不需要手动绑定。" },
+  ];
+  var index = 0;
+  var target = null;
+  var previousFocus = document.activeElement;
+  var blocker = element("div", null, "tour-blocker");
+  var mask = element("div", null, "tour-mask");
+  var panel = element("section", null, "tour-panel");
+  var head = element("div", null, "tour-head");
+  var indicator = element("span", null, "tour-step");
+  var close = element("button", "×", "tour-close");
+  var title = element("h2");
+  var description = element("p");
+  var actions = element("div", null, "tour-actions");
+  var skip = element("button", "跳过", "ghost");
+  var next = element("button", "下一步");
+  close.type = skip.type = next.type = "button";
+  close.setAttribute("aria-label", "关闭使用引导");
+  panel.setAttribute("role", "dialog");
+  panel.setAttribute("aria-modal", "true");
+  panel.setAttribute("aria-labelledby", "tour-title");
+  title.id = "tour-title";
+  head.appendChild(indicator);
+  head.appendChild(close);
+  actions.appendChild(skip);
+  actions.appendChild(next);
+  panel.appendChild(head);
+  panel.appendChild(title);
+  panel.appendChild(description);
+  panel.appendChild(actions);
+  document.body.appendChild(blocker);
+  document.body.appendChild(mask);
+  document.body.appendChild(panel);
+
+  function finish() {
+    try { localStorage.setItem("threadferry-onboarding-tour-v1", "done"); } catch (_) {}
+    window.removeEventListener("resize", place);
+    document.removeEventListener("keydown", onKeydown);
+    blocker.remove();
+    mask.remove();
+    panel.remove();
+    if (previousFocus && typeof previousFocus.focus === "function") previousFocus.focus();
+  }
+
+  function place() {
+    var step = steps[index];
+    panel.classList.toggle("center", !step.target);
+    mask.classList.toggle("full", !step.target || !target);
+    if (!step.target || !target) {
+      panel.style.left = panel.style.top = panel.style.transform = "";
+      mask.style.left = mask.style.top = mask.style.width = mask.style.height = "";
+      return;
+    }
+    panel.style.transform = "none";
+    var rect = target.getBoundingClientRect();
+    mask.style.left = Math.max(4, rect.left - 5) + "px";
+    mask.style.top = Math.max(4, rect.top - 5) + "px";
+    mask.style.width = Math.min(window.innerWidth - 8, rect.width + 10) + "px";
+    mask.style.height = Math.min(window.innerHeight - 8, rect.height + 10) + "px";
+    var width = panel.offsetWidth;
+    var height = panel.offsetHeight;
+    var beside = window.innerWidth - rect.right >= width + 28;
+    panel.style.left = Math.max(16, Math.min(beside ? rect.right + 16 : rect.left, window.innerWidth - width - 16)) + "px";
+    panel.style.top = Math.max(16, Math.min(beside ? rect.top : rect.bottom + 12, window.innerHeight - height - 16)) + "px";
+  }
+
+  function render() {
+    var step = steps[index];
+    target = step.target ? document.querySelector('[data-tour-target="' + step.target + '"]') : null;
+    indicator.textContent = String(index + 1) + " / " + String(steps.length);
+    title.textContent = step.title;
+    description.textContent = step.description;
+    next.textContent = index === steps.length - 1 ? "完成" : "下一步";
+    place();
+    next.focus();
+  }
+
+  function onKeydown(event) {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      finish();
+      return;
+    }
+    if (event.key !== "Tab") return;
+    var controls = [close, skip, next];
+    var current = controls.indexOf(document.activeElement);
+    if (event.shiftKey && current <= 0) {
+      event.preventDefault();
+      next.focus();
+    } else if (!event.shiftKey && current === controls.length - 1) {
+      event.preventDefault();
+      close.focus();
+    }
+  }
+
+  close.addEventListener("click", finish);
+  skip.addEventListener("click", finish);
+  next.addEventListener("click", function () {
+    if (index === steps.length - 1) finish();
+    else {
+      index += 1;
+      render();
+    }
+  });
+  window.addEventListener("resize", place);
+  document.addEventListener("keydown", onKeydown);
+  render();
+}
 
 function setupThemePreference() {
   var select = document.querySelector("[data-theme-preference]");

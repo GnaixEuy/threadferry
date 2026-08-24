@@ -53,9 +53,9 @@ irm https://raw.githubusercontent.com/GnaixEuy/threadferry/main/install.ps1 | ie
 ```
 
 完成 CLI 安装和首次设置后，日常使用推荐从
-[GitHub Releases](https://github.com/GnaixEuy/threadferry/releases/latest) 下载桌面版：macOS 使用 Universal
-DMG，Windows 使用 NSIS 安装程序，Linux 使用 AppImage 或 DEB。桌面版提供常驻托盘菜单；Runtime 和
-企业微信官方 `wecom-cli` 仍沿用上面的本机安装与登录状态。
+[GitHub Releases](https://github.com/GnaixEuy/threadferry/releases/latest) 下载桌面版：Apple Silicon Mac
+使用 arm64 DMG，Intel Mac 使用 x64 DMG，Windows 使用 NSIS 安装程序，Linux 使用 AppImage 或 DEB。
+桌面版提供常驻托盘菜单；Runtime 和企业微信官方 `wecom-cli` 仍沿用上面的本机安装与登录状态。
 
 ## 首次运行
 
@@ -72,7 +72,9 @@ ThreadFerry。
 ThreadFerry 图标，可以打开管理台、重启或停止服务、查看日志和退出。关闭管理台窗口只会收回托盘。
 管理台左下角提供日志追踪和偏好设置。日志追踪用于按错误编号、Agent、动作或资源定位脱敏运行记录，
 入口可以在偏好设置中隐藏；偏好设置还可以切换主题，并控制登录时启动、服务自动启动、启动后打开
-管理台和 macOS Dock 入口。桌面偏好只保存在当前设备。
+管理台和 macOS Dock 入口。首次打开管理台会显示状态驱动的开始使用清单和三步界面引导；完成
+机器人授权和第一次 Owner 私聊后清单自动收起，群聊接入保持可选，引导可以跳过或从偏好设置重新查看。
+概览还会用近 7 天处理趋势和任务状态分布展示脱敏运行状态。桌面偏好只保存在当前设备。
 
 需要终端运维时仍可直接启动：
 

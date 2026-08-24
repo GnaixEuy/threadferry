@@ -99,7 +99,6 @@ jobs:
           name: desktop-${{ matrix.name }}
           path: |
             release/desktop/*.dmg
-            release/desktop/*.zip
             release/desktop/*.exe
             release/desktop/*.AppImage
             release/desktop/*.deb

@@ -95,7 +95,7 @@ node dist/src/cli.js start --config ./threadferry.yaml --mock
       提供停止或重启这个外部进程的能力。
 - [ ] 在未初始化环境启动桌面应用，确认托盘显示启动失败，可以查看明确原因并复制 `threadferry onboard`；
       日志不包含 Bot Secret 或企业私密正文。
-- [ ] 分别核验 Release 中的 macOS Universal DMG/ZIP、Windows NSIS、Linux AppImage/DEB 和
+- [ ] 分别核验 Release 中的 macOS arm64/x64 DMG、Windows NSIS、Linux AppImage/DEB 和
       `SHA256SUMS`；至少在对应系统完成一次安装、托盘启动和卸载烟测。
 
 ## 5. 私聊、群聊与权限

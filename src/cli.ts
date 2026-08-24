@@ -51,7 +51,7 @@ import { findUpdate, installUpdate } from "./update.js";
 import { installOfficialWecomSkills, officialWecomSkillsInstalled } from "./wecom-skills.js";
 import { runWorkflowTick } from "./workflow.js";
 
-const VERSION = "0.26.8";
+const VERSION = "0.26.11";
 const UPDATE_INTERVAL_MS = 6 * 60 * 60 * 1_000;
 const WORKFLOW_INTERVAL_MS = 30_000;
 interface DesktopParentPort {
