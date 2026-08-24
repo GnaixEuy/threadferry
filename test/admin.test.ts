@@ -62,6 +62,7 @@ test("localhost admin manages agents, groups, and users with CSRF protection", a
   const resetCalls: string[] = [];
   const authCalls: Array<{ agentId: string; mode: string; botId?: string; secret?: string }> = [];
   const directoryAgents: string[] = [];
+  let updateChecks = 0;
   const admin = await startAdminServer(config, {
     updateConfig: async (change) => { await change(config); },
     listGroups: async (agentId) => agentId === "default"
@@ -96,6 +97,7 @@ test("localhost admin manages agents, groups, and users with CSRF protection", a
       workItems: [{ id: "W-123456789ABC", title: "核对季度复盘", description: "读取复盘", createdBy: "owner", createdAgent: "default", assignedAgent: "reviewer", reviewerAgent: "default", sourceChatId: "owner", sourceChatType: "single", status: "queued", createdAt: now, updatedAt: now }],
       activities: [{ id: "A-123456789ABC", agent: "default", type: "action.read", outcome: "success", resource: "doc:doc-1", at: now }],
     }),
+    checkUpdate: async () => { updateChecks += 1; return { version: "9.9.9" }; },
     resetSession: async (groupId, agentId) => { resetCalls.push(`${groupId}:${agentId}`); return true; },
   }, 0);
   t.after(() => admin.close());
@@ -164,6 +166,7 @@ test("localhost admin manages agents, groups, and users with CSRF protection", a
   assert.match(clientScript, /aria-modal/);
   assert.match(clientScript, /event\.key === "Escape"/);
   assert.match(clientScript, /threadferryDesktop/);
+  assert.match(clientScript, /检查中…/);
 
   const logs = await (await fetch(`${admin.url}/logs`)).text();
   assert.match(logs, /href="\/logs" data-log-nav class="active" aria-current="page"/);
@@ -187,6 +190,9 @@ test("localhost admin manages agents, groups, and users with CSRF protection", a
   assert.match(settings, /data-desktop-preference="autoStartService"/);
   assert.match(settings, /data-desktop-preference="openManagementOnLaunch"/);
   assert.match(settings, /data-desktop-preference="showDockIcon"/);
+  assert.match(settings, /action="\/settings\/update"/);
+  assert.match(settings, /data-update-check/);
+  assert.match(settings, />检查更新<\/button>/);
 
   const first = await fetch(`${admin.url}/groups`);
   const page = await first.text();
@@ -248,6 +254,13 @@ test("localhost admin manages agents, groups, and users with CSRF protection", a
     headers: { "content-type": "application/x-www-form-urlencoded" },
     body: new URLSearchParams({ ...(withCsrf ? { csrf } : {}), ...values }),
   });
+
+  const update = await post("/settings/update", {});
+  assert.equal(update.status, 303);
+  const updateLocation = new URL(update.headers.get("location") ?? "", admin.url);
+  assert.equal(updateLocation.pathname, "/settings");
+  assert.match(updateLocation.searchParams.get("ok") ?? "", /^发现新版本 ThreadFerry 9\.9\.9/);
+  assert.equal(updateChecks, 1);
 
   assert.equal((await post("/agents/add", { agentId: "blocked", runtime: "pi", workspace }, false)).status, 403);
   assert.equal(config.agents.blocked, undefined);

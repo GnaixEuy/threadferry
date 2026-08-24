@@ -51,7 +51,7 @@ import { findUpdate, installUpdate } from "./update.js";
 import { installOfficialWecomSkills, officialWecomSkillsInstalled } from "./wecom-skills.js";
 import { runWorkflowTick } from "./workflow.js";
 
-const VERSION = "0.26.11";
+const VERSION = "0.26.12";
 const UPDATE_INTERVAL_MS = 6 * 60 * 60 * 1_000;
 const WORKFLOW_INTERVAL_MS = 30_000;
 interface DesktopParentPort {
@@ -1091,6 +1091,7 @@ async function start(
         return authorizeBotFromAdmin(agentId, agent.configDir, authorization);
       },
       snapshot: () => state.snapshot(),
+      checkUpdate: () => findUpdate(VERSION),
       resetSession: (groupId, agentId) => {
         const agent = config.agents[agentId];
         if (!config.groups[groupId]?.agents[agentId] || !agent) throw new Error("该群未绑定给这个 Agent");

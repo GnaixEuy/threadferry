@@ -49,6 +49,7 @@ export interface AdminDependencies {
   /** 凭据只交给该 Agent 的 wecom-cli 加密存储，不写入 ThreadFerry 配置或日志。 */
   authorizeBot?: (agentId: string, authorization: BotAuthorization) => Promise<void>;
   snapshot?: () => Promise<StateSnapshot>;
+  checkUpdate?: () => Promise<{ version: string } | undefined>;
   /** 按「群 + Agent」重置：同一个群里每台机器人各有自己的 Session。 */
   resetSession?: (groupId: string, agentId: string) => Promise<boolean>;
 }
@@ -406,7 +407,7 @@ function shell(
   </div></body></html>`;
 }
 
-function settingsPage(config: ThreadFerryConfig, url: URL): string {
+function settingsPage(config: ThreadFerryConfig, url: URL, token: string): string {
   return shell("settings", config, url, `<div class="settings-stack">
     <article class="card settings-card">
       <div class="section-head"><div><h2>外观</h2><p class="sub">只影响当前浏览器或桌面管理窗口。</p></div></div>
@@ -425,6 +426,12 @@ function settingsPage(config: ThreadFerryConfig, url: URL): string {
         <label class="setting-row" data-capability="dockIcon"><span><b>在 Dock 中显示</b><small>菜单栏空间不足时，可保留一个 Dock 入口。</small></span><input type="checkbox" data-desktop-preference="showDockIcon"></label>
       </fieldset>
       <p class="settings-status" data-desktop-status>正在读取桌面偏好…</p>
+    </article>
+    <article class="card settings-card">
+      <div class="section-head"><div><h2>软件更新</h2><p class="sub">手动检查 GitHub Release 是否有新版本。</p></div></div>
+      <form class="setting-list" method="post" action="/settings/update" data-update-check>${field(token)}
+        <div class="setting-row"><span><b>ThreadFerry 更新</b><small>只检查更新，不会自动下载或安装。</small></span><button class="ghost" type="submit">检查更新</button></div>
+      </form>
     </article>
   </div>`);
 }
@@ -927,7 +934,7 @@ export async function startAdminServer(
         if (url.pathname === "/groups") return send(response, 200, await groupsPage(config, dependencies, url));
         if (url.pathname === "/groups/detail") return send(response, 200, await groupDetailPage(config, dependencies, token, url));
         if (url.pathname === "/logs") return send(response, 200, await logsPage(config, dependencies, url));
-        if (url.pathname === "/settings") return send(response, 200, settingsPage(config, url));
+        if (url.pathname === "/settings") return send(response, 200, settingsPage(config, url, token));
         return send(response, 404, "Not found");
       } catch {
         return send(response, 500, "ThreadFerry 管理台暂时无法读取配置");
@@ -947,7 +954,14 @@ export async function startAdminServer(
     let errorTarget: string | undefined;
     let message = "配置已更新并立即生效";
     try {
-      if (url.pathname === "/agents/add") {
+      if (url.pathname === "/settings/update") {
+        target = "/settings";
+        if (!dependencies.checkUpdate) throw new Error("当前启动方式不支持检查更新");
+        const release = await dependencies.checkUpdate();
+        message = release
+          ? `发现新版本 ThreadFerry ${release.version}，请前往 GitHub Releases 下载升级`
+          : "ThreadFerry 已是最新版本";
+      } else if (url.pathname === "/agents/add") {
         target = "/agents";
         errorTarget = `/agents?${new URLSearchParams({
           new: "1",
