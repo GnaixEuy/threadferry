@@ -29,6 +29,10 @@ const message: IncomingMention = {
 test("authorization requires configured group, mention, and allowlisted user", () => {
   assert.equal(authorize(config, message).allowed, true);
   assert.deepEqual(authorize(config, { ...message, groupId: "group_other" }), { allowed: false, reason: "group" });
+  assert.deepEqual(authorize({
+    ...config,
+    groups: { group_allowed: { ...config.groups.group_allowed!, enabled: false } },
+  }, message), { allowed: false, reason: "group" });
   assert.deepEqual(authorize(config, { ...message, mentioned: false }), { allowed: false, reason: "mention" });
   assert.deepEqual(authorize(config, { ...message, senderId: "user_other" }), { allowed: false, reason: "user" });
 });

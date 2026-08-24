@@ -108,6 +108,7 @@ body{margin:0;background:var(--bg)}
 .nav-icon{width:20px;text-align:center;font-size:17px;color:#8994aa}
 .side-nav a.active .nav-icon{color:var(--link)}
 .sidebar-bottom{margin-top:auto;display:grid;gap:14px}
+.hide-log-tracking [data-log-nav]{display:none}
 .sidebar-foot{padding:14px 11px 0;border-top:1px solid var(--line);display:flex;align-items:center;gap:8px;color:var(--muted);font-size:12px}
 .status-dot{width:7px;height:7px;border-radius:50%;background:var(--ok);box-shadow:0 0 0 3px var(--status-ring)}
 main{min-width:0;padding:30px clamp(24px,4vw,56px) 80px}
@@ -136,11 +137,32 @@ h2.flush{margin:0}
 h3,h4,p{margin:0 0 10px}
 .sub,.muted{color:var(--muted)}
 .js .no-js{display:none}
-.theme-toggle{display:flex;width:100%;align-items:center;justify-content:flex-start;gap:9px;color:var(--text);font-weight:600}
-.theme-toggle:hover{background:var(--nav-hover)}
 .instance{display:grid;grid-template-columns:auto auto;align-items:baseline;column-gap:7px;padding:10px 14px;border:1px solid var(--line);border-radius:11px;background:var(--surface)}
 .instance b{font-size:20px}.instance span{color:var(--text)}.instance small{grid-column:1/-1;color:var(--muted);font-size:11px}
 .page-content{max-width:1320px;margin:0 auto}
+.settings-stack{display:grid;gap:16px;max-width:900px}
+.settings-card .section-head{margin-top:0;padding-bottom:16px;border-bottom:1px solid var(--line)}
+.setting-list{border:0;padding:0;margin:0}
+.setting-list:disabled{opacity:.62}
+.setting-row{display:flex;align-items:center;justify-content:space-between;gap:24px;padding:16px 2px;border-top:1px solid var(--line);color:var(--text);cursor:pointer}
+.setting-row:first-child{border-top:0}
+.setting-row[hidden]{display:none}
+.setting-row>span{display:grid;gap:3px}
+.setting-row b{color:var(--text-strong)}
+.setting-row small{color:var(--muted);font-size:13px}
+.setting-row select{min-width:150px}
+.setting-row input[type=checkbox]{flex:0 0 auto;min-width:0;width:20px;height:20px;accent-color:var(--accent);cursor:pointer}
+.settings-status{margin:10px 2px 0;color:var(--muted);font-size:13px}
+.settings-status.ok{color:var(--ok)}
+.settings-status.error{color:var(--danger)}
+
+.trace-filter{display:grid;grid-template-columns:minmax(240px,1fr) 150px auto auto;gap:10px;align-items:center;padding:14px;background:var(--surface);border:1px solid var(--line);border-radius:var(--radius);box-shadow:var(--card-shadow)}
+.clear-filter{display:inline-grid;place-items:center;min-height:var(--control-height);text-decoration:none}
+.trace-list{max-width:1080px}
+.trace-row{display:grid;grid-template-columns:minmax(180px,.8fr) minmax(0,1.7fr) auto;align-items:center;gap:18px;padding:14px 18px;border-top:1px solid var(--line)}
+.trace-row:first-child{border-top:0}
+.trace-row>span{display:grid;gap:4px;min-width:0}
+.trace-row small{color:var(--muted);font-size:12px;overflow-wrap:anywhere}
 
 .toolbar{display:flex;justify-content:space-between;align-items:end;gap:16px;margin:0 0 16px}
 .toolbar p{margin:6px 0 0}
@@ -257,14 +279,15 @@ dialog.modal:not(:modal){position:static;margin:0 auto 24px}
   .app-shell{display:block}
   .sidebar{position:relative;width:auto;height:auto;padding:14px 16px 0;border-right:0;border-bottom:1px solid var(--line)}
   .brand{padding:0 2px 13px}.brand small,.sidebar-foot{display:none}
-  .sidebar-bottom{position:absolute;top:14px;right:16px;margin:0}.theme-toggle{width:auto}
+  .sidebar-bottom{margin:3px 0 0;display:block}.utility-nav{border-top:1px solid var(--line)}
   .side-nav{display:flex;gap:3px;overflow-x:auto}.side-nav a{flex:0 0 auto;padding:9px 11px;border-radius:9px 9px 0 0}.side-nav a.active{box-shadow:inset 0 -2px var(--accent)}
   main{padding:22px 16px 60px}
   header.top{align-items:start;margin-bottom:20px;padding-bottom:18px}
   .toolbar{align-items:start;flex-direction:column}
   .group-row{grid-template-columns:minmax(0,1fr) auto}.group-agents{display:none}
+  .trace-filter{grid-template-columns:minmax(0,1fr) 140px auto}.clear-filter{grid-column:1/-1;justify-content:start}
 }
-@media(max-width:520px){.instance{display:none}.theme-toggle [data-theme-label]{display:none}.nav-icon{display:none}.grid{grid-template-columns:1fr}.card{padding:16px}.section-head,.detail-title{align-items:flex-start;flex-direction:column}.group-row{padding:13px 14px}.group-state .badge{display:none}}
+@media(max-width:520px){.instance{display:none}.nav-icon{display:none}.grid{grid-template-columns:1fr}.card{padding:16px}.section-head,.detail-title{align-items:flex-start;flex-direction:column}.group-row{padding:13px 14px}.group-state .badge{display:none}.setting-row{align-items:flex-start;flex-direction:column}.setting-row select{width:100%}.trace-filter{grid-template-columns:1fr}.trace-row{grid-template-columns:1fr}.trace-row>.badge{justify-self:start}}
 `;
 
 export const CLIENT_SCRIPT = `"use strict";
@@ -273,38 +296,119 @@ document.documentElement.classList.add("js");
 
 var savedTheme;
 try { savedTheme = localStorage.getItem("threadferry-theme"); } catch (_) {}
-var theme = savedTheme === "light" || savedTheme === "dark"
-  ? savedTheme
-  : (window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
-document.documentElement.setAttribute("data-theme", theme);
+var themePreference = savedTheme === "light" || savedTheme === "dark" ? savedTheme : "system";
+var systemTheme = window.matchMedia("(prefers-color-scheme: dark)");
+applyThemePreference();
+systemTheme.addEventListener("change", function () {
+  if (themePreference === "system") applyThemePreference();
+});
+
+var showLogTracking = true;
+try { showLogTracking = localStorage.getItem("threadferry-show-log-tracking") !== "false"; } catch (_) {}
+document.documentElement.classList.toggle("hide-log-tracking", !showLogTracking);
 
 var openPicker = null;
 
 document.addEventListener("DOMContentLoaded", function () {
-  setupThemeToggle();
+  setupThemePreference();
+  setupInterfacePreferences();
+  setupDesktopPreferences();
   setupDialogs();
   each("[data-auth-form]", setupAuthMode);
   each("[data-picker]", attachPicker);
 });
 
-function setupThemeToggle() {
-  var button = document.querySelector("[data-theme-toggle]");
-  if (!button) return;
-  var icon = button.querySelector("[data-theme-icon]");
-  var label = button.querySelector("[data-theme-label]");
-  function update() {
-    var dark = document.documentElement.getAttribute("data-theme") === "dark";
-    if (icon) icon.textContent = dark ? "☀" : "☾";
-    if (label) label.textContent = dark ? "亮色主题" : "暗色主题";
-    button.setAttribute("aria-label", dark ? "切换到亮色主题" : "切换到暗色主题");
-  }
-  button.addEventListener("click", function () {
-    var next = document.documentElement.getAttribute("data-theme") === "dark" ? "light" : "dark";
-    document.documentElement.setAttribute("data-theme", next);
-    try { localStorage.setItem("threadferry-theme", next); } catch (_) {}
-    update();
+function setupThemePreference() {
+  var select = document.querySelector("[data-theme-preference]");
+  if (!select) return;
+  select.value = themePreference;
+  select.addEventListener("change", function () { saveThemePreference(select.value); });
+}
+
+function saveThemePreference(next) {
+  themePreference = next === "light" || next === "dark" ? next : "system";
+  try {
+    if (themePreference === "system") localStorage.removeItem("threadferry-theme");
+    else localStorage.setItem("threadferry-theme", themePreference);
+  } catch (_) {}
+  applyThemePreference();
+}
+
+function applyThemePreference() {
+  var theme = themePreference === "system" ? (systemTheme.matches ? "dark" : "light") : themePreference;
+  document.documentElement.setAttribute("data-theme", theme);
+  var select = document.querySelector("[data-theme-preference]");
+  if (select) select.value = themePreference;
+}
+
+function setupInterfacePreferences() {
+  var input = document.querySelector('[data-interface-preference="showLogTracking"]');
+  if (!input) return;
+  input.checked = showLogTracking;
+  input.addEventListener("change", function () {
+    showLogTracking = input.checked;
+    document.documentElement.classList.toggle("hide-log-tracking", !showLogTracking);
+    try { localStorage.setItem("threadferry-show-log-tracking", String(showLogTracking)); } catch (_) {}
   });
-  update();
+}
+
+function setupDesktopPreferences() {
+  var root = document.querySelector("[data-desktop-settings]");
+  if (!root) return;
+  var fields = root.querySelector("[data-desktop-fields]");
+  var status = root.querySelector("[data-desktop-status]");
+  var platform = root.querySelector("[data-desktop-platform]");
+  var bridge = window.threadferryDesktop;
+  function message(text, kind) {
+    status.textContent = text;
+    status.className = "settings-status" + (kind ? " " + kind : "");
+  }
+  if (!bridge || typeof bridge.getPreferences !== "function" || typeof bridge.setPreferences !== "function") {
+    if (platform) platform.textContent = "浏览器模式";
+    message("桌面偏好请在 ThreadFerry 桌面应用的管理台中设置。", "");
+    return;
+  }
+  function render(state) {
+    var labels = { darwin: "macOS", win32: "Windows", linux: "Linux" };
+    if (platform) platform.textContent = labels[state.platform] || state.platform;
+    each("[data-capability]", function (row) {
+      row.hidden = state.capabilities[row.getAttribute("data-capability")] !== true;
+    });
+    each("[data-desktop-preference]", function (input) {
+      input.checked = state.preferences[input.getAttribute("data-desktop-preference")] === true;
+    });
+    fields.disabled = false;
+  }
+  function save() {
+    var values = {};
+    each("[data-desktop-preference]", function (input) {
+      values[input.getAttribute("data-desktop-preference")] = input.checked;
+    });
+    fields.disabled = true;
+    message("正在保存…", "");
+    bridge.setPreferences(values).then(function (state) {
+      render(state);
+      message("偏好已保存。", "ok");
+    }).catch(function (error) {
+      fields.disabled = false;
+      message("保存失败：" + (error && error.message ? error.message : "未知错误"), "error");
+    });
+  }
+  fields.addEventListener("change", function (event) {
+    var input = event.target.closest("[data-desktop-preference]");
+    if (!input) return;
+    var autoStart = fields.querySelector('[data-desktop-preference="autoStartService"]');
+    var openManagement = fields.querySelector('[data-desktop-preference="openManagementOnLaunch"]');
+    if (input === autoStart && !autoStart.checked) openManagement.checked = false;
+    if (input === openManagement && openManagement.checked) autoStart.checked = true;
+    save();
+  });
+  bridge.getPreferences().then(function (state) {
+    render(state);
+    message("偏好保存在当前设备。", "");
+  }).catch(function (error) {
+    message("无法读取桌面偏好：" + (error && error.message ? error.message : "未知错误"), "error");
+  });
 }
 
 function each(selector, run) {

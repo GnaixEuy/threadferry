@@ -27,7 +27,6 @@ export interface AppDependencies {
   runtime: (request: RuntimeRequest) => Promise<RuntimeResult>;
   updateAllowUsers?: (groupId: string, users: string[]) => Promise<void>;
   updateGroupAccess?: (groupId: string, allowAll: boolean) => Promise<void>;
-  bindGroup?: (groupId: string) => Promise<void>;
   listGroups?: () => Promise<Array<{ id: string; name?: string }>>;
   searchUsers?: (keywords: string[]) => Promise<DirectoryUser[]>;
   /** 全量配置中的 Agent 名，只用于校验显式任务交接目标；不共享它们的 Session 或凭据。 */
@@ -289,20 +288,6 @@ export function createApp(config: AgentView, dependencies: AppDependencies, stat
     return operation;
   }
 
-  // 一个 app 实例只服务一个 Agent，所以绑定就是「绑到我」——不需要也不接受 Agent 参数。
-  function bindGroup(groupId: string): Promise<void> {
-    const operation = accessTail.then(async () => {
-      if (config.groups[groupId]) throw new Error("这个群已经绑给我了");
-      const [agentId] = Object.entries(config.agents)[0] ?? [];
-      if (!agentId) throw new Error("当前没有可用 Agent。");
-      if (!dependencies.bindGroup) throw new Error("当前启动方式不支持群绑定");
-      await dependencies.bindGroup(groupId);
-      config.groups[groupId] = { agent: agentId, allowUsers: [config.ownerUser], context: { lookbackHours: 6, maxMessages: 80 } };
-    });
-    accessTail = operation.then(() => undefined, () => undefined);
-    return operation;
-  }
-
   // Skill 决定业务流程和 CLI 命令；本循环只做通用校验、授权、执行，并把不可信结果交还同一 Agent。
   async function runRuntimeWithActions(request: RuntimeRequest, requestedBy: string, groupId?: string, scope = groupId ?? `direct:${requestedBy}`): Promise<RuntimeResult> {
     let prompt = request.prompt;
@@ -427,24 +412,8 @@ export function createApp(config: AgentView, dependencies: AppDependencies, stat
     if (configured.length > 1) {
       throw new Error(`有多个同名群“${reference}”，请改用群 ID：\n${configured.map((group) => `- \`${group.id}\``).join("\n")}`);
     }
-    if (matches.length > 0) throw new Error(`群“${reference}”还没绑定给我，请先发送 \`threadferry bind ${reference}\`。`);
+    if (matches.length > 0) throw new Error(`群“${reference}”还没和我建立机器人会话，请先在该群 @我 一次，系统会自动启用。`);
     throw new Error(`没有找到已配置群“${reference}”。请先发送 \`threadferry groups\`。`);
-  }
-
-  // bind 用：群必须是「这个机器人看得见、但还没配置」的。
-  async function resolveUnboundGroup(reference: string): Promise<{ id: string; name?: string }> {
-    if (!reference) throw new Error("缺少群名。请先发送 `threadferry groups` 查看可绑定的群。");
-    if (config.groups[reference]) throw new Error("该群已经配置");
-    const sessions = await groupSessions();
-    const byId = sessions.find((session) => session.id === reference);
-    if (byId) return byId;
-    const matches = sessions.filter((session) => session.name === reference);
-    if (matches.length === 1) return matches[0]!;
-    if (matches.length > 1) {
-      throw new Error(`有多个同名群“${reference}”，请改用群 ID：\n${matches.map((group) => `- \`${group.id}\``).join("\n")}`);
-    }
-    throw new Error(`我看不到群“${reference}”。把我拉进该内部群后，群里最近 7 天要有消息才能被发现——`
-      + `可以在群里随便发一条或 @ 我一次，然后发送 \`threadferry groups\`。`);
   }
 
   async function resolveGroupAndValue(arguments_: string[], label: string): Promise<{ group: { id: string; name?: string }; value: string }> {
@@ -455,7 +424,7 @@ export function createApp(config: AgentView, dependencies: AppDependencies, stat
     const sessions = await groupSessions();
     const byId = sessions.find((session) => session.id === arguments_[0]);
     if (byId) {
-      throw new Error(`群 \`${byId.id}\` 还没绑定给我，请先发送 \`threadferry bind ${byId.name ?? byId.id}\`。`);
+      throw new Error(`群 \`${byId.id}\` 还没和我建立机器人会话，请先在该群 @我 一次，系统会自动启用。`);
     }
     const input = arguments_.join(" ");
     const named = sessions
@@ -467,7 +436,7 @@ export function createApp(config: AgentView, dependencies: AppDependencies, stat
     if (matches.length > 1) {
       throw new Error(`有多个同名群“${longest}”，请改用群 ID：\n${matches.map((group) => `- \`${group.id}\``).join("\n")}`);
     }
-    if (matches.length === 0) throw new Error(`群“${longest}”还没绑定给我，请先发送 \`threadferry bind ${longest}\`。`);
+    if (matches.length === 0) throw new Error(`群“${longest}”还没和我建立机器人会话，请先在该群 @我 一次，系统会自动启用。`);
     return { group: matches[0]!, value: input.slice(longest.length).trim() };
   }
 
@@ -585,8 +554,9 @@ export function createApp(config: AgentView, dependencies: AppDependencies, stat
     if (command.name === "help") {
       const [selfId, self] = Object.entries(config.agents)[0] ?? [];
       const selfLine = selfId ? `你正在和 Agent \`${selfId}\` 对话，Workspace 是 ${self!.workspace}。\n\n` : "";
-      return respond(reply, `${selfLine}直接发送普通消息即可让我在这个 Workspace 里分析。\n\n接入群聊：\n1. 请企业管理员批准机器人的数据访问权限，并把我加入目标内部群\n2. 发送 \`threadferry groups\` 查看群名或群 ID\n3. 发送 \`threadferry bind <群名或ID>\` 把该群绑定给我\n\n其他管理命令：\n- \`threadferry users <群名>\` 查看可使用用户\n- \`threadferry invite <群名>\` 生成一次性邀请码\n- \`threadferry add <群名> <姓名>\` 直接授权\n- \`threadferry remove <群名> <姓名>\` 移除授权\n- \`threadferry open <群名>\` 允许群内所有成员使用\n- \`threadferry close <群名>\` 恢复仅授权成员可用\n- \`threadferry whoami\` 查看自己的 userid\n\n每个 Agent 对应一个机器人：想用别的 Workspace，就去和那个机器人私聊。\n群或成员重名时，按我返回的 ID 重新发送即可。`);
+      return respond(reply, `${selfLine}直接发送普通消息即可让我在这个 Workspace 里分析。\n\n接入群聊：\n1. 请企业管理员批准机器人的数据访问权限，并把我加入目标内部群\n2. 在群里 @我 发送第一条消息；收到后自动启用，不需要再绑定\n3. 私聊发送 \`threadferry groups\` 查看状态并管理成员权限\n\n其他管理命令：\n- \`threadferry users <群名>\` 查看可使用用户\n- \`threadferry invite <群名>\` 生成一次性邀请码\n- \`threadferry add <群名> <姓名>\` 直接授权\n- \`threadferry remove <群名> <姓名>\` 移除授权\n- \`threadferry open <群名>\` 允许群内所有成员使用\n- \`threadferry close <群名>\` 恢复仅授权成员可用\n- \`threadferry whoami\` 查看自己的 userid\n\n每个 Agent 对应一个机器人：想用别的 Workspace，就去和那个机器人私聊。\n群或成员重名时，按我返回的 ID 重新发送即可。`);
     }
+    if (command.name === "bind") return respond(reply, "现在不需要手动绑定。把机器人拉进群并 @我 发送第一条消息，ThreadFerry 收到后会自动启用。");
     if (command.name === "confirm") {
       const code = command.arguments[0]?.toUpperCase() ?? "";
       const pending = pendingActions.get(code);
@@ -645,7 +615,8 @@ export function createApp(config: AgentView, dependencies: AppDependencies, stat
         const configured = Boolean(config.groups[id]);
         const agent = config.groups[id]?.agent;
         const openTag = config.groups[id]?.allowAll ? " 全员可用" : "";
-        return `- ${configured ? `[${agent}]` : "[未配置 Agent]"}${openTag} ${session?.name ?? "未获取群名"}\n  \`${id}\``;
+        const enabledTag = config.groups[id]?.enabled === false ? " 已停用" : "";
+        return `- ${configured ? `[${agent}]` : "[等待首次 @ 自动启用]"}${enabledTag}${openTag} ${session?.name ?? "未获取群名"}\n  \`${id}\``;
       });
       return respond(reply, `机器人最近群会话：\n${lines.length ? lines.join("\n") : "暂无可见群会话"}`);
     }
@@ -656,8 +627,6 @@ export function createApp(config: AgentView, dependencies: AppDependencies, stat
       if (command.name === "add" || command.name === "remove") {
         target = await resolveGroupAndValue(command.arguments, "用户姓名");
         group = target.group;
-      } else if (command.name === "bind") {
-        group = await resolveUnboundGroup(command.arguments.join(" "));
       } else {
         group = await resolveGroup(command.arguments.join(" "));
       }
@@ -665,14 +634,6 @@ export function createApp(config: AgentView, dependencies: AppDependencies, stat
       return respond(reply, error instanceof Error ? error.message : "群名解析失败。");
     }
     const groupLabel = group.name ?? group.id;
-    if (command.name === "bind") {
-      try {
-        await bindGroup(group.id);
-        return respond(reply, `群“${groupLabel}”已绑定到我。群内成员 @我 即可使用，可用 \`threadferry open ${groupLabel}\` 放开给全员。`);
-      } catch (error) {
-        return respond(reply, error instanceof Error ? error.message : "群绑定失败。");
-      }
-    }
     const configured = config.groups[group.id]!;
     if (command.name === "users") {
       const heading = configured.allowAll
@@ -731,7 +692,7 @@ export function createApp(config: AgentView, dependencies: AppDependencies, stat
   }
 
   async function handleGroupCommand(message: IncomingMention, reply: Reply, command: { name: ManagementCommand; arguments: string[] }): Promise<HandleResult> {
-    if (!config.groups[message.groupId]) return "unauthorized_group";
+    if (!config.groups[message.groupId] || config.groups[message.groupId]?.enabled === false) return "unauthorized_group";
     if (!(await state.claimCommand(message.msgId, message.groupId, selfAgent()))) return "duplicate";
     if (command.name === "whoami") return respond(reply, `你的 ThreadFerry userid：\`${await authoritativeId(message.senderId)}\``);
     if (command.name === "join") return join(message.senderId, command.arguments[0], reply, message.groupId);

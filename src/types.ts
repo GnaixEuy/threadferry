@@ -89,6 +89,8 @@ export type AgentDefinition = Omit<AgentConfig, "ownerUser">;
 export interface GroupAccess {
   allowUsers: string[];
   allowAll?: boolean;
+  /** 缺省可用；显式 false 用于保留名单但停用该机器人，避免群消息把它自动重新启用。 */
+  enabled?: false;
 }
 
 /**
@@ -108,6 +110,7 @@ export interface GroupConfig {
   agent: string;
   allowUsers: string[];
   allowAll?: boolean;
+  enabled?: false;
   context: {
     lookbackHours: number;
     maxMessages: number;

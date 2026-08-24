@@ -52,6 +52,11 @@ Windows PowerShell：
 irm https://raw.githubusercontent.com/GnaixEuy/threadferry/main/install.ps1 | iex
 ```
 
+完成 CLI 安装和首次设置后，日常使用推荐从
+[GitHub Releases](https://github.com/GnaixEuy/threadferry/releases/latest) 下载桌面版：macOS 使用 Universal
+DMG，Windows 使用 NSIS 安装程序，Linux 使用 AppImage 或 DEB。桌面版提供常驻托盘菜单；Runtime 和
+企业微信官方 `wecom-cli` 仍沿用上面的本机安装与登录状态。
+
 ## 首次运行
 
 在交互式终端运行初始化向导：
@@ -63,7 +68,13 @@ threadferry onboard
 向导会安装企业微信官方 Skills、授权机器人、确认 Owner、选择 Runtime 和 Workspace、执行诊断并启动
 ThreadFerry。
 
-以后可直接启动已配置 Agent：
+以后直接打开 ThreadFerry 桌面应用即可。它会自动启动已配置 Agent；点击菜单栏或任务栏通知区域中的
+ThreadFerry 图标，可以打开管理台、重启或停止服务、查看日志和退出。关闭管理台窗口只会收回托盘。
+管理台左下角提供日志追踪和偏好设置。日志追踪用于按错误编号、Agent、动作或资源定位脱敏运行记录，
+入口可以在偏好设置中隐藏；偏好设置还可以切换主题，并控制登录时启动、服务自动启动、启动后打开
+管理台和 macOS Dock 入口。桌面偏好只保存在当前设备。
+
+需要终端运维时仍可直接启动：
 
 ```sh
 threadferry start
@@ -142,8 +153,7 @@ Owner 通过私聊目标机器人管理它自己的群：
 
 | 命令 | 用途 |
 | --- | --- |
-| `threadferry groups` | 查看可见群和配置状态 |
-| `threadferry bind <群>` | 把群绑定到当前机器人 |
+| `threadferry groups` | 查看可见群和可用状态 |
 | `threadferry users <群>` | 查看授权用户 |
 | `threadferry invite <群>` | 生成一次性邀请码 |
 | `threadferry add <群> <姓名>` | 授权用户 |
@@ -152,12 +162,14 @@ Owner 通过私聊目标机器人管理它自己的群：
 | `threadferry close <群>` | 恢复授权名单 |
 | `threadferry whoami` | 查看当前用户的 ThreadFerry userid |
 
-群列表可发现最近 7 天有消息的群。机器人进入新群后，先在群中发送一条消息，再刷新列表并绑定。
+把机器人拉入内部群后，在群里 @它一次。ThreadFerry 收到第一次回调就会自动启用这台机器人，默认仅
+Owner 可用，不再需要单独绑定。之后在管理台群详情中控制机器人是否可用，以及哪些群成员可以使用。
+群列表可发现最近 7 天有消息的群。
 
 ## 安全边界
 
 - 每台机器人只接受自己 Owner 的私聊 Agent 请求。
-- 未配置群、未授权用户和没有 `@机器人` 的消息不会启动 Runtime。
+- 已停用群、未授权用户和没有 `@机器人` 的消息不会启动 Runtime。
 - Agent 之间不共享凭据、Owner、Session、会话历史或 Workspace。
 - Codex 禁用网络和文件写入；Pi 只开放经过路径守卫的 `read` 和 `ls`；Claude Code 使用 Safe Mode
   和只读工具；Grok Build 使用 strict sandbox，并关闭 Web、子 Agent 和 Memory。
@@ -192,6 +204,7 @@ threadferry update
 npm ci --ignore-scripts
 npm run typecheck
 npm test
+npm run desktop:pack
 ```
 
 验收步骤见 [POC.md](./POC.md)，Gitmoji 提交规范见 [CONTRIBUTING.md](./CONTRIBUTING.md)。项目使用

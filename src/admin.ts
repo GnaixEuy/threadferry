@@ -5,7 +5,7 @@ import type { AddressInfo } from "node:net";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join } from "node:path";
 import { CLIENT_SCRIPT, STYLESHEET } from "./admin-assets.js";
-import { addAgent, resolveWorkspace } from "./config.js";
+import { addAgent, ensureGroupAccess, resolveWorkspace } from "./config.js";
 import { resolveDirectoryUser } from "./directory.js";
 import type { StateSnapshot } from "./state.js";
 import { isRuntimeName } from "./types.js";
@@ -296,6 +296,14 @@ async function fetchSessions(
       failures.push({ agentId, reason: error instanceof Error ? error.message : "群查询失败" });
       return;
     }
+    const joined = visible.filter((session) => session.hasBotSession);
+    if (joined.some((session) => !config.groups[session.id]?.agents[agentId])) {
+      try {
+        await dependencies.updateConfig((latest) => { for (const session of joined) ensureGroupAccess(latest, session.id, agentId); });
+      } catch (error) {
+        failures.push({ agentId, reason: `自动启用群聊失败：${error instanceof Error ? error.message : "配置更新失败"}` });
+      }
+    }
     for (const session of visible) {
       if (!sessions.has(session.id)) sessions.set(session.id, session);
       const holders = visibleTo.get(session.id) ?? new Set<string>();
@@ -320,9 +328,8 @@ async function fetchSnapshot(dependencies: AdminDependencies): Promise<StateSnap
   }
 }
 
-// 企业微信没有「机器人在哪些群」这个查询，只能列出最近 7 天有消息的群，所以空列表要讲清规则，
-// 不能显示成「都绑定完了」。
-const DISCOVERY_HINT = "企业微信只提供「最近 7 天有消息的群」，把机器人拉进群后先在群里发一条消息或 @ 一次机器人，再刷新本页。";
+// 企业微信没有「机器人在哪些群」这个查询，只能列出最近 7 天有消息的群，所以空列表要讲清规则。
+const DISCOVERY_HINT = "企业微信只提供最近 7 天有消息的群；把机器人拉进群并 @它一次，ThreadFerry 收到后会自动启用。";
 
 function errorBar(message: string): string {
   return `<div class="notice error">${html(message)}</div>`;
@@ -339,53 +346,22 @@ function failureCard(failures: Array<{ agentId: string; reason: string }>): stri
     </article>`;
 }
 
-// 一个群可以同时启用多台机器人，所以候选是复选框而不是下拉——一次勾几台就绑几台。
-function agentChoices(agentIds: string[], confirmed: Set<string>, prefix: string): string {
-  const single = agentIds.length === 1;
-  return `<div class="choices">${agentIds.map((agentId, index) => {
-    const boxId = `${prefix}-${index}`;
-    return `<label class="choice" for="${html(boxId)}">
-      <input type="checkbox" id="${html(boxId)}" name="agentId" value="${html(agentId)}"${single ? " checked" : ""}>
-      <span>${html(agentId)}${confirmed.has(agentId) ? `<span class="badge ok">机器人已在群</span>` : ""}</span>
-    </label>`;
-  }).join("")}</div>`;
-}
-
-function bindCard(
-  config: ThreadFerryConfig,
-  token: string,
+function waitingCard(
   id: string,
   label: string,
-  holders: Set<string>,
-  confirmed: Set<string>,
-  index: number,
+  visible: Set<string>,
 ): string {
-  // 已确认机器人在群的 Agent 排前面：它们绑完就能直接用。
-  const agentIds = [...holders].filter((agentId) => config.agents[agentId])
-    .sort((left, right) => Number(confirmed.has(right)) - Number(confirmed.has(left)));
-  if (agentIds.length === 0) {
-    return `
-    <article class="card">
-      <div class="row"><div><h3>${html(label)}</h3><code>${html(id)}</code></div><span class="badge warning">无可绑定 Agent</span></div>
-      <p class="muted">没有任何已配置 Agent 能看到这个群。把对应机器人加入该群后刷新。</p>
-    </article>`;
-  }
   return `
     <article class="card">
-      <div class="row"><div><h3>${html(label)}</h3><code>${html(id)}</code></div><span class="badge warning">待绑定</span></div>
-      <form method="post" action="/groups/bind">${field(token)}<input type="hidden" name="groupId" value="${html(id)}">
-        ${agentChoices(agentIds, confirmed, `bind-${index}`)}<button>绑定所选</button>
-      </form>
-      <p class="muted">${agentIds.length > 1
-        ? "群里有几台机器人就勾几台，@ 谁谁回答，名单和开关各自独立。"
-        : "勾选要启用的机器人。"}${agentIds.some((agentId) => confirmed.has(agentId))
-        ? "标注「机器人已在群」的已确认有会话，绑完即可 @ 使用。"
-        : "企业微信不提供群成员查询，这里只能确认「群里有消息」；绑定后在群里 @ 一次机器人，它没反应说明那台还不在群里。"}</p>
+      <div class="row"><div><h3>${html(label)}</h3><code>${html(id)}</code></div><span class="badge warning">等待首次 @</span></div>
+      <p class="muted">${visible.size > 0
+        ? "在群里 @需要使用的机器人发送第一条消息，ThreadFerry 收到后会自动启用，不需要手动绑定。"
+        : "把机器人加入该群并 @它发送第一条消息，ThreadFerry 收到后会自动启用。"}</p>
     </article>`;
 }
 
 function shell(
-  active: "overview" | "agents" | "groups",
+  active: "overview" | "agents" | "groups" | "logs" | "settings",
   config: ThreadFerryConfig,
   url: URL,
   content: string,
@@ -397,15 +373,18 @@ function shell(
     ["/", "overview", "概览", "⌂"],
     ["/agents", "agents", "机器人管理", "◇"],
     ["/groups", "groups", "群聊管理", "◎"],
+    ["/logs", "logs", "日志追踪", "⌁"],
+    ["/settings", "settings", "偏好设置", "⚙"],
   ];
   const current = tabs.find(([, key]) => key === active)!;
-  const nav = tabs.map(([href, key, label, icon]) => `<a href="${href}"${key === active ? ` class="active" aria-current="page"` : ""}><span class="nav-icon" aria-hidden="true">${icon}</span><span>${label}</span></a>`).join("");
+  const nav = tabs.slice(0, 3).map(([href, key, label, icon]) => `<a href="${href}"${key === active ? ` class="active" aria-current="page"` : ""}><span class="nav-icon" aria-hidden="true">${icon}</span><span>${label}</span></a>`).join("");
+  const utilities = tabs.slice(3).map(([href, key, label, icon]) => `<a href="${href}"${key === "logs" ? " data-log-nav" : ""}${key === active ? ` class="active" aria-current="page"` : ""}><span class="nav-icon" aria-hidden="true">${icon}</span><span>${label}</span></a>`).join("");
   return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
   <title>ThreadFerry 管理台</title><script src="/admin.js"></script><link rel="stylesheet" href="/admin.css"></head>
   <body><div class="app-shell">
     <aside class="sidebar"><a class="brand" href="/"><span class="brand-mark">TF</span><span><b>ThreadFerry</b><small>本机管理台</small></span></a>
       <nav class="side-nav" aria-label="管理台导航">${nav}</nav>
-      <div class="sidebar-bottom"><button class="theme-toggle ghost" type="button" data-theme-toggle aria-label="切换明暗主题"><span data-theme-icon aria-hidden="true">☀</span><span data-theme-label>亮色主题</span></button><div class="sidebar-foot"><span class="status-dot"></span><span>仅监听 127.0.0.1</span></div></div>
+      <div class="sidebar-bottom"><nav class="side-nav utility-nav" aria-label="工具与设置">${utilities}</nav><div class="sidebar-foot" role="status"><span class="status-dot"></span><span>服务运行中</span></div></div>
     </aside>
     <main><header class="top"><div><p class="eyebrow">管理台</p><h1>${current[2]}</h1></div><div class="instance"><b>${html(Object.keys(config.agents).length)}</b><span>个机器人</span><small>1 个机器人对应 1 个 Agent</small></div></header>
       ${notice ? `<div class="notice">${html(notice)}</div>` : ""}${error ? errorBar(error) : ""}
@@ -414,11 +393,68 @@ function shell(
   </div></body></html>`;
 }
 
-async function overviewPage(config: ThreadFerryConfig, dependencies: AdminDependencies, token: string, url: URL): Promise<string> {
-  const { sessions, visibleTo, confirmedBy, failures } = await fetchSessions(config, dependencies);
+function settingsPage(config: ThreadFerryConfig, url: URL): string {
+  return shell("settings", config, url, `<div class="settings-stack">
+    <article class="card settings-card">
+      <div class="section-head"><div><h2>外观</h2><p class="sub">只影响当前浏览器或桌面管理窗口。</p></div></div>
+      <label class="setting-row"><span><b>界面主题</b><small>可以跟随系统，也可以固定使用亮色或暗色。</small></span>
+        <select data-theme-preference aria-label="界面主题"><option value="system">跟随系统</option><option value="light">亮色</option><option value="dark">暗色</option></select>
+      </label>
+      <label class="setting-row"><span><b>显示日志追踪</b><small>在侧栏左下角显示运行记录定位入口。</small></span><input type="checkbox" data-interface-preference="showLogTracking"></label>
+    </article>
+    <article class="card settings-card" data-desktop-settings>
+      <div class="section-head"><div><h2>桌面应用</h2><p class="sub">这些选项保存在本机，只控制 ThreadFerry 桌面入口。</p></div><span class="badge" data-desktop-platform>正在识别</span></div>
+      <fieldset class="setting-list" data-desktop-fields disabled>
+        <label class="setting-row" data-capability="launchAtLogin"><span><b>登录时启动</b><small>登录系统后自动启动 ThreadFerry 桌面应用。</small></span><input type="checkbox" data-desktop-preference="launchAtLogin"></label>
+        <label class="setting-row"><span><b>自动启动服务</b><small>打开桌面应用时自动连接已配置机器人。</small></span><input type="checkbox" data-desktop-preference="autoStartService"></label>
+        <label class="setting-row"><span><b>启动后打开管理台</b><small>服务就绪后自动显示概览页面。</small></span><input type="checkbox" data-desktop-preference="openManagementOnLaunch"></label>
+        <label class="setting-row" data-capability="dockIcon"><span><b>在 Dock 中显示</b><small>菜单栏空间不足时，可保留一个 Dock 入口。</small></span><input type="checkbox" data-desktop-preference="showDockIcon"></label>
+      </fieldset>
+      <p class="settings-status" data-desktop-status>正在读取桌面偏好…</p>
+    </article>
+  </div>`);
+}
+
+async function logsPage(config: ThreadFerryConfig, dependencies: AdminDependencies, url: URL): Promise<string> {
   const snapshot = await fetchSnapshot(dependencies);
-  const boundIds = new Set(Object.keys(config.groups));
-  const unbound = sessions.filter((session) => !boundIds.has(session.id));
+  const query = (url.searchParams.get("q")?.trim() ?? "").slice(0, 128);
+  const requestedOutcome = url.searchParams.get("outcome")?.trim() ?? "";
+  const outcome = ["success", "failure", "info"].includes(requestedOutcome) ? requestedOutcome : "";
+  const needle = query.toLocaleLowerCase();
+  const matches = (...values: Array<string | undefined>): boolean => !needle
+    || values.some((value) => value?.toLocaleLowerCase().includes(needle));
+  const failures = (snapshot?.turns ?? [])
+    .filter((turn) => (!outcome || outcome === "failure")
+      && turn.status === "failed" && matches(turn.errorId, turn.failurePhase, turn.updatedAt))
+    .slice(-100).reverse();
+  const activities = (snapshot?.activities ?? [])
+    .filter((item) => (!outcome || item.outcome === outcome)
+      && matches(item.id, item.agent, item.type, item.outcome, item.resource, item.at))
+    .slice(-200).reverse();
+  const filters = `<form class="trace-filter" method="get" action="/logs">
+    <input name="q" value="${html(query)}" maxlength="128" placeholder="错误编号、Agent、动作或资源" aria-label="搜索日志追踪">
+    <select name="outcome" aria-label="结果"><option value=""${outcome ? "" : " selected"}>全部结果</option><option value="success"${outcome === "success" ? " selected" : ""}>成功</option><option value="failure"${outcome === "failure" ? " selected" : ""}>失败</option><option value="info"${outcome === "info" ? " selected" : ""}>信息</option></select>
+    <button type="submit">定位</button>${query || outcome ? `<a class="ghost clear-filter" href="/logs">清除</a>` : ""}
+  </form>`;
+  const failureList = failures.length
+    ? `<div class="list-panel trace-list">${failures.map((turn) => `<div class="trace-row"><span><code>${html(turn.errorId ?? "无错误编号")}</code><small>${html(turn.updatedAt)}</small></span><span><b>处理失败</b><small>阶段 ${html(turn.failurePhase ?? "unknown")}</small></span><span class="badge warning">failure</span></div>`).join("")}</div>`
+    : `<p class="sub">没有匹配的失败记录。</p>`;
+  const activityList = activities.length
+    ? `<div class="list-panel trace-list">${activities.map((item) => `<div class="trace-row"><span><code>${html(item.id)}</code><small>${html(item.at)}</small></span><span><b>${html(item.type)}</b><small>Agent ${html(item.agent)}${item.resource ? ` · ${html(item.resource)}` : ""}</small></span><span class="badge ${item.outcome === "success" ? "ok" : item.outcome === "failure" ? "warning" : ""}">${html(item.outcome)}</span></div>`).join("")}</div>`
+    : `<p class="sub">没有匹配的 Activity。</p>`;
+  return shell("logs", config, url, `<div class="toolbar"><div><h2 class="flush">运行记录</h2><p class="sub">按错误编号、Agent、动作或资源定位最近记录；这里只展示脱敏状态，不展示消息正文。</p></div></div>
+    ${filters}${snapshot ? "" : `<div class="notice error">运行状态暂不可用，请稍后重试。</div>`}
+    <h2>失败记录</h2>${failureList}<h2>Activity</h2>${activityList}`);
+}
+
+async function overviewPage(config: ThreadFerryConfig, dependencies: AdminDependencies, url: URL): Promise<string> {
+  const [{ sessions, visibleTo, failures }, snapshot] = await Promise.all([
+    fetchSessions(config, dependencies),
+    fetchSnapshot(dependencies),
+  ]);
+  const activeGroups = Object.values(config.groups).filter((group) => Object.values(group.agents).some((access) => access.enabled !== false)).length;
+  const disabledGroups = Object.values(config.groups).filter((group) => Object.values(group.agents).every((access) => access.enabled === false)).length;
+  const waiting = sessions.filter((session) => !config.groups[session.id]);
   const counts = new Map<string, number>();
   for (const turn of snapshot?.turns ?? []) counts.set(turn.status, (counts.get(turn.status) ?? 0) + 1);
   const active = (counts.get("queued") ?? 0) + (counts.get("running") ?? 0);
@@ -428,8 +464,9 @@ async function overviewPage(config: ThreadFerryConfig, dependencies: AdminDepend
   const activities = (snapshot?.activities ?? []).slice(-20).reverse();
   const stats: Array<[string, string, string]> = [
     [String(Object.keys(config.agents).length), "机器人", "/agents"],
-    [String(boundIds.size), "已绑定群", "/groups"],
-    [String(unbound.length), "待绑定群", "/groups"],
+    [String(activeGroups), "可用群", "/groups"],
+    [String(disabledGroups), "已停用群", "/groups"],
+    [String(waiting.length), "等待首次 @", "/groups"],
   ];
   if (snapshot) {
     stats.push(
@@ -440,9 +477,8 @@ async function overviewPage(config: ThreadFerryConfig, dependencies: AdminDepend
       [String(workItems.length), "协作任务", ""],
     );
   }
-  const todos: string[] = unbound.map((session, index) =>
-    bindCard(config, token, session.id, session.name ?? "未获取群名",
-      visibleTo.get(session.id) ?? new Set(), confirmedBy.get(session.id) ?? new Set(), index));
+  const todos: string[] = waiting.map((session) =>
+    waitingCard(session.id, session.name ?? "未获取群名", visibleTo.get(session.id) ?? new Set()));
   if (failures.length > 0) todos.unshift(failureCard(failures));
   if (lastFailure) {
     todos.push(`<article class="card"><h3>最近一次失败</h3><p class="muted">错误编号 <code>${html(lastFailure.errorId ?? "无")}</code> · 阶段 ${html(lastFailure.failurePhase ?? "unknown")} · ${html(lastFailure.updatedAt)}</p><p class="muted">请在终端运行 <code>threadferry status</code> 和 <code>threadferry doctor</code> 排查。</p></article>`);
@@ -597,7 +633,10 @@ async function agentsPage(config: ThreadFerryConfig, dependencies: AdminDependen
   const authDialogs: string[] = [];
   const cards = Object.entries(config.agents).map(([id, agent], index) => {
     const bound = boundByAgent.get(id) ?? [];
-    const removable = bound.length === 0 && total > 1;
+    const removable = total > 1 && !Object.values(config.groups).some((group) => {
+      const access = group.agents[id];
+      return access && access.enabled !== false;
+    });
     const bot = botStatuses.get(id);
     const botLine = bot === undefined
       ? ""
@@ -613,7 +652,7 @@ async function agentsPage(config: ThreadFerryConfig, dependencies: AdminDependen
       <p>${html(agent.model ?? "默认模型")}</p><code>${html(agent.workspace)}</code>
       ${botLine}
       <p>Owner ${bot?.ownerName ? `<b>${html(bot.ownerName)}</b> ` : ""}<code>${html(agent.ownerUser)}</code></p>
-      <h4>绑定群</h4>
+      <h4>接入群</h4>
       ${bound.length
         ? `<ul class="links">${bound.map((group) => `<li><a href="${groupAnchor(group.id)}">${html(group.label)}</a><code>${html(group.id)}</code></li>`).join("")}</ul>`
         : `<p class="muted">未被任何群使用</p>`}
@@ -652,8 +691,7 @@ async function browsePage(config: ThreadFerryConfig, url: URL): Promise<string> 
     </article>`);
 }
 
-// 一个群里可以同时启用多台机器人：卡片按 Agent 分段，每段各有自己的授权名单、
-// 全员可用开关、Session 重置和解绑。@ 哪台机器人就由那台回答。
+// 一个群里可以同时启用多台机器人：卡片按 Agent 分段，每段各有自己的可用开关、授权名单和 Session。
 function agentSection(
   token: string,
   groupId: string,
@@ -666,6 +704,7 @@ function agentSection(
   canReset: boolean,
   confirmed: boolean,
 ): string {
+  const enabled = access.enabled !== false;
   // 有名字就把名字放主位、加密 id 退成次要信息；没有名字（没权限或这人没露过面）就只显示 id。
   const users = access.allowUsers.map((userId) => {
     const name = userName?.(userId);
@@ -680,9 +719,14 @@ function agentSection(
   return `
       <section class="agent-block">
         <div class="row">
-          <h4>${html(agentId)}${runtime ? ` <span class="badge">${html(runtime)}</span>` : ""}${confirmed ? ` <span class="badge ok">机器人已在群</span>` : ""}</h4>
+          <h4>${html(agentId)}${runtime ? ` <span class="badge">${html(runtime)}</span>` : ""}${confirmed ? ` <span class="badge ok">机器人已在群</span>` : ""} <span class="badge${enabled ? " ok" : " warning"}">${enabled ? "可用" : "已停用"}</span></h4>
+          <form method="post" action="/groups/enabled">${hidden}<input type="hidden" name="enabled" value="${enabled ? "off" : "on"}"><button class="ghost">${enabled ? "停用机器人" : "启用机器人"}</button></form>
+        </div>
+        ${enabled ? "" : `<p class="muted">这台机器人已停用，群内 @ 不会启动 Agent；成员名单和 Session 仍保留。</p>`}
+        <div class="row">
+          <span class="badge${access.allowAll ? " ok" : ""}">${access.allowAll ? "全员可用" : "仅授权成员"}</span>
           <form method="post" action="/groups/access">${hidden}<input type="hidden" name="allowAll" value="${access.allowAll ? "off" : "on"}">
-            <span class="badge${access.allowAll ? " ok" : ""}">${access.allowAll ? "全员可用" : "仅授权成员"}</span><button class="ghost">${access.allowAll ? "关闭全员可用" : "开启全员可用"}</button>
+            <button class="ghost">${access.allowAll ? "关闭全员可用" : "开启全员可用"}</button>
           </form>
         </div>
         ${access.allowAll ? `<p class="muted">全员可用已开启，群内所有成员都可以 @ 这台机器人；以下名单在关闭后生效。</p>` : ""}
@@ -690,41 +734,32 @@ function agentSection(
         <div class="actions">
           <a class="button ghost" href="${html(groupUserAnchor(groupId, agentId))}" data-dialog="${html(dialogId)}">＋ 添加可使用用户</a>
           ${canReset ? `<form method="post" action="/groups/session/reset">${hidden}<button class="ghost">重置 Session</button></form>` : ""}
-          <form method="post" action="/groups/unbind">${hidden}<button class="danger">解绑</button></form>
         </div>
       </section>`;
 }
 
-function groupListItem(id: string, label: string, group: GroupBinding | undefined, visible: Set<string>, confirmed: Set<string>): string {
+function groupListItem(id: string, label: string, group: GroupBinding | undefined): string {
   const agents = Object.keys(group?.agents ?? {});
-  const bound = agents.length > 0;
-  const available = [...visible].filter((agentId) => !group?.agents[agentId]);
+  const enabled = agents.filter((agentId) => group?.agents[agentId]?.enabled !== false);
+  const state = agents.length === 0 ? "等待首次 @" : enabled.length > 0 ? `${enabled.length} 台可用` : "已停用";
   return `<a class="group-row" href="${html(groupAnchor(id))}">
     <span class="group-main"><span class="group-avatar" aria-hidden="true">群</span><span><b>${html(label)}</b><code>${html(id)}</code></span></span>
-    <span class="group-agents">${bound
-      ? agents.map((agentId) => `<span class="badge${confirmed.has(agentId) ? " ok" : ""}">${html(agentId)}</span>`).join("")
-      : `<span class="muted">${available.length} 台机器人可绑定</span>`}</span>
-    <span class="group-state"><span class="badge ${bound ? "ok" : "warning"}">${bound ? `${agents.length} 台已启用` : "待绑定"}</span><span class="row-arrow" aria-hidden="true">›</span></span>
+    <span class="group-agents">${agents.length
+      ? agents.map((agentId) => `<span class="badge${group?.agents[agentId]?.enabled !== false ? " ok" : " warning"}">${html(agentId)}${group?.agents[agentId]?.enabled === false ? " · 停用" : ""}</span>`).join("")
+      : `<span class="muted">收到机器人首次群 @ 后自动启用</span>`}</span>
+    <span class="group-state"><span class="badge ${enabled.length > 0 ? "ok" : "warning"}">${state}</span><span class="row-arrow" aria-hidden="true">›</span></span>
   </a>`;
 }
 
 async function groupsPage(config: ThreadFerryConfig, dependencies: AdminDependencies, url: URL): Promise<string> {
-  const { sessions, visibleTo, confirmedBy, failures } = await fetchSessions(config, dependencies);
+  const { sessions, failures } = await fetchSessions(config, dependencies);
   const byId = new Map(sessions.map((session) => [session.id, session]));
   const groupIds = [...new Set([...sessions.map((session) => session.id), ...Object.keys(config.groups)])];
-  const unbound: string[] = [];
-  const bound: string[] = [];
-  for (const id of groupIds) {
-    const group = config.groups[id];
-    const item = groupListItem(id, byId.get(id)?.name ?? "未获取群名", group,
-      visibleTo.get(id) ?? new Set(), confirmedBy.get(id) ?? new Set());
-    (group && Object.keys(group.agents).length > 0 ? bound : unbound).push(item);
-  }
+  const groups = groupIds.map((id) => groupListItem(id, byId.get(id)?.name ?? "未获取群名", config.groups[id]));
   return shell("groups", config, url, `
     ${failures.length > 0 ? `<h2>群查询失败</h2><div class="grid">${failureCard(failures)}</div>` : ""}
-    <div class="section-head"><div><h2>待绑定</h2><p class="sub">进入群聊后选择要启用的机器人。</p></div><a class="button ghost" href="/groups">↻ 刷新群列表</a></div>
-    <div class="list-panel">${unbound.join("") || `<p class="empty-state">${sessions.length > 0 ? "已发现的群都绑定完了。" : `还没发现任何群。${DISCOVERY_HINT}`}</p>`}</div>
-    <h2>已配置群</h2><div class="list-panel">${bound.join("") || `<p class="empty-state">暂无已配置群；可在上方待绑定区选择群聊，或私聊机器人发送 threadferry bind 命令。</p>`}</div>`);
+    <div class="section-head"><div><h2>群聊</h2><p class="sub">把机器人拉入群后，第一次 @它 即自动启用；群详情只管理是否可用和哪些成员可用。</p></div><a class="button ghost" href="/groups">↻ 刷新群列表</a></div>
+    <div class="list-panel">${groups.join("") || `<p class="empty-state">还没发现任何群。${DISCOVERY_HINT}</p>`}</div>`);
 }
 
 async function groupDetailPage(config: ThreadFerryConfig, dependencies: AdminDependencies, token: string, url: URL): Promise<string> {
@@ -743,7 +778,7 @@ async function groupDetailPage(config: ThreadFerryConfig, dependencies: AdminDep
   let openedInDialog = false;
   let body: string;
   if (!group || Object.keys(group.agents).length === 0) {
-    body = bindCard(config, token, id, label, visible, confirmed, 0);
+    body = waitingCard(id, label, visible);
   } else {
     const sections = Object.entries(group.agents).map(([agentId, access], index) => {
       const dialogId = `add-user-${index}`;
@@ -754,9 +789,10 @@ async function groupDetailPage(config: ThreadFerryConfig, dependencies: AdminDep
         config.agents[agentId]?.runtime, dialogId, dependencies.userName, Boolean(dependencies.resetSession), confirmed.has(agentId));
     }).join("");
     const spare = [...visible].filter((agentId) => config.agents[agentId] && !group.agents[agentId]);
-    body = `<article class="card group-detail"><div class="row"><div><h3>${html(label)}</h3><code>${html(id)}</code></div><span class="badge ok">${Object.keys(group.agents).length} 台机器人已启用</span></div>
+    const enabled = Object.values(group.agents).filter((access) => access.enabled !== false).length;
+    body = `<article class="card group-detail"><div class="row"><div><h3>${html(label)}</h3><code>${html(id)}</code></div><span class="badge${enabled > 0 ? " ok" : " warning"}">${enabled > 0 ? `${enabled} 台机器人可用` : "机器人已停用"}</span></div>
       <p class="muted">群里 @ 哪台机器人，就由它用自己的 Workspace 回答；名单、开关和 Session 各自独立。</p>${sections}
-      ${spare.length > 0 ? `<form method="post" action="/groups/bind">${field(token)}<input type="hidden" name="groupId" value="${html(id)}"><div class="field"><span>再加机器人</span>${agentChoices(spare, confirmed, "more")}</div><button>绑定所选</button></form>` : ""}</article>`;
+      ${spare.length > 0 ? `<p class="muted">要让其他机器人也接入本群，直接在群里分别 @它们一次；收到后会自动启用。</p>` : ""}</article>`;
   }
   return shell("groups", config, url, `<p><a class="back-link" href="/groups">← 返回群聊列表</a></p>
     <div class="detail-title"><div><p class="eyebrow">群聊详情</p><h2>${html(label)}</h2><code>${html(id)}</code></div><a class="button ghost" href="${html(groupAnchor(id))}">↻ 刷新</a></div>
@@ -782,11 +818,13 @@ export async function startAdminServer(
           if (!config.agents[agentId]) return sendJson(response, 400, { users: [], note: "Agent 无效。" });
           return sendJson(response, 200, await searchDirectoryUsers(dependencies, agentId, url.searchParams.get("q")?.trim() ?? ""));
         }
-        if (url.pathname === "/") return send(response, 200, await overviewPage(config, dependencies, token, url));
+        if (url.pathname === "/") return send(response, 200, await overviewPage(config, dependencies, url));
         if (url.pathname === "/agents") return send(response, 200, await agentsPage(config, dependencies, token, url));
         if (url.pathname === "/agents/browse") return send(response, 200, await browsePage(config, url));
         if (url.pathname === "/groups") return send(response, 200, await groupsPage(config, dependencies, url));
         if (url.pathname === "/groups/detail") return send(response, 200, await groupDetailPage(config, dependencies, token, url));
+        if (url.pathname === "/logs") return send(response, 200, await logsPage(config, dependencies, url));
+        if (url.pathname === "/settings") return send(response, 200, settingsPage(config, url));
         return send(response, 404, "Not found");
       } catch {
         return send(response, 500, "ThreadFerry 管理台暂时无法读取配置");
@@ -858,41 +896,33 @@ export async function startAdminServer(
         const agentId = required(input, "agentId");
         await dependencies.updateConfig((latest) => {
           if (!latest.agents[agentId]) throw new Error("机器人不存在");
-          if (Object.values(latest.groups).some((group) => group.agents[agentId])) {
-            throw new Error("仍有群绑定此机器人，请先在群里解绑它");
+          if (Object.values(latest.groups).some((group) => {
+            const access = group.agents[agentId];
+            return access && access.enabled !== false;
+          })) {
+            throw new Error("仍有群正在使用此机器人，请先在群详情停用它");
           }
           if (Object.keys(latest.agents).length <= 1) throw new Error("至少保留一个机器人");
+          for (const [groupId, group] of Object.entries(latest.groups)) {
+            delete group.agents[agentId];
+            if (Object.keys(group.agents).length === 0) delete latest.groups[groupId];
+          }
           delete latest.agents[agentId];
         });
         message = `机器人 ${agentId} 已删除`;
-      } else if (url.pathname === "/groups/bind") {
+      } else if (url.pathname === "/groups/enabled") {
         const groupId = required(input, "groupId");
-        // 一次可以勾多台机器人：表单是复选框，这里按提交上来的全部处理。
-        const agentIds = [...new Set(input.getAll("agentId").map((value) => value.trim()).filter(Boolean))];
-        target = "/groups";
-        if (!GROUP_ID.test(groupId)) throw new Error("群 ID 无效");
-        if (agentIds.length === 0) throw new Error("请至少勾选一台机器人");
-        for (const agentId of agentIds) {
-          if (!config.agents[agentId]) throw new Error(`Agent ${agentId} 不存在`);
-          // 至少要求「该 Agent 自己看得见这个群」，挡住绑到一个它根本查不到的群上。
-          // 但企业微信不提供群成员查询，看得见 ≠ 机器人一定在群里，所以不在这里声称成员关系。
-          if (!(await dependencies.listGroups(agentId)).some((group) => group.id === groupId)) {
-            throw new Error(`Agent ${agentId} 看不到这个群：把它的机器人拉进群，并确保群里最近 7 天有消息，然后刷新重试`);
-          }
-        }
+        const agentId = required(input, "agentId");
+        const enabled = required(input, "enabled");
+        if (enabled !== "on" && enabled !== "off") throw new Error("可用开关取值无效");
         await dependencies.updateConfig((latest) => {
-          const binding = latest.groups[groupId] ?? { agents: {}, context: { lookbackHours: 6, maxMessages: 80 } };
-          for (const agentId of agentIds) {
-            const owner = latest.agents[agentId]?.ownerUser;
-            if (!owner) throw new Error(`Agent ${agentId} 不存在`);
-            // 只挡「这台已经绑过」，不挡「这个群已经有别人」。
-            if (binding.agents[agentId]) throw new Error(`该群已经绑定了 Agent ${agentId}`);
-            binding.agents[agentId] = { allowUsers: [owner] };
-          }
-          latest.groups[groupId] = binding;
+          const access = latest.groups[groupId]?.agents[agentId];
+          if (!access) throw new Error("该群没有这个机器人记录");
+          if (enabled === "on") delete access.enabled;
+          else access.enabled = false;
         });
         target = groupAnchor(groupId);
-        message = `群已绑定给 ${agentIds.join("、")}，立即生效；如果 @ 某台机器人没反应，说明它还不在群里`;
+        message = enabled === "on" ? `${agentId} 已启用` : `${agentId} 已停用，群内 @ 不会启动 Agent`;
       } else if (url.pathname === "/groups/access") {
         const groupId = required(input, "groupId");
         const agentId = required(input, "agentId");
@@ -900,7 +930,7 @@ export async function startAdminServer(
         if (allowAll !== "on" && allowAll !== "off") throw new Error("访问开关取值无效");
         await dependencies.updateConfig((latest) => {
           const access = latest.groups[groupId]?.agents[agentId];
-          if (!access) throw new Error("该群未绑定给这个 Agent");
+          if (!access) throw new Error("该群没有这个机器人记录");
           if (allowAll === "on") access.allowAll = true;
           else delete access.allowAll;
         });
@@ -908,22 +938,6 @@ export async function startAdminServer(
         message = allowAll === "on"
           ? `已开启：群内所有成员都可以 @ ${agentId}`
           : `已关闭：${agentId} 恢复为仅授权成员可用`;
-      } else if (url.pathname === "/groups/unbind") {
-        const groupId = required(input, "groupId");
-        const agentId = required(input, "agentId");
-        let remaining = 0;
-        await dependencies.updateConfig((latest) => {
-          const binding = latest.groups[groupId];
-          if (!binding?.agents[agentId]) throw new Error("该群未绑定给这个 Agent");
-          delete binding.agents[agentId];
-          remaining = Object.keys(binding.agents).length;
-          // 最后一台机器人也解绑了，这个群就整条移除。
-          if (remaining === 0) delete latest.groups[groupId];
-        });
-        target = remaining > 0 ? groupAnchor(groupId) : "/groups";
-        message = remaining > 0
-          ? `${agentId} 已从该群解绑；群里还有 ${remaining} 台机器人在用`
-          : "群已解绑，该群的消息将不再触发任何 Agent";
       } else if (url.pathname === "/groups/users/add") {
         const groupId = required(input, "groupId");
         const agentId = required(input, "agentId");
@@ -933,7 +947,7 @@ export async function startAdminServer(
         if (!USER_ID.test(user.id)) throw new Error("通讯录返回的 userid 无效");
         await dependencies.updateConfig((latest) => {
           const access = latest.groups[groupId]?.agents[agentId];
-          if (!access) throw new Error("该群未绑定给这个 Agent");
+          if (!access) throw new Error("该群没有这个机器人记录");
           access.allowUsers = [...new Set([...access.allowUsers, user.id])];
           if (access.allowUsers.length > 256) throw new Error("可使用用户已达到 256 人上限");
         });
@@ -946,7 +960,7 @@ export async function startAdminServer(
         const userId = required(input, "userId");
         await dependencies.updateConfig((latest) => {
           const access = latest.groups[groupId]?.agents[agentId];
-          if (!access) throw new Error("该群未绑定给这个 Agent");
+          if (!access) throw new Error("该群没有这个机器人记录");
           if (userId === latest.agents[agentId]?.ownerUser) throw new Error(`不能移除 Agent ${agentId} 的 Owner`);
           access.allowUsers = access.allowUsers.filter((id) => id !== userId);
         });

@@ -162,6 +162,16 @@ test("release workflow publishes curated changelog notes", () => {
   assert.match(notes.stdout, /## 安装与升级/);
 });
 
+test("release workflow publishes directly installable desktop packages", () => {
+  const workflow = readFileSync(join(project, ".github", "workflows", "release.yml"), "utf8");
+
+  for (const runner of ["macos-latest", "windows-latest", "ubuntu-latest"]) assert.match(workflow, new RegExp(`os: ${runner}`));
+  for (const extension of ["dmg", "zip", "exe", "AppImage", "deb"]) assert.match(workflow, new RegExp(`release/desktop/\\*\\.${extension}`));
+  assert.match(workflow, /needs: \[cli, desktop\]/);
+  assert.match(workflow, /merge-multiple: true/);
+  assert.match(workflow, /sha256sum > SHA256SUMS/);
+});
+
 test("main pushes trigger build verification", () => {
   const workflow = readFileSync(join(project, ".github", "workflows", "build.yml"), "utf8");
   assert.match(workflow, /push:\s*\n\s*branches:\s*\n\s*- main/);

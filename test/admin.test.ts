@@ -8,6 +8,37 @@ import test from "node:test";
 import { startAdminServer } from "../src/admin.js";
 import type { ThreadFerryConfig } from "../src/types.js";
 
+test("overview loads group discovery and runtime state in parallel", { timeout: 1_000 }, async (t) => {
+  const started = new Set<string>();
+  let release: (() => void) | undefined;
+  const ready = new Promise<void>((resolve) => { release = resolve; });
+  const waitForBoth = async (name: string): Promise<void> => {
+    started.add(name);
+    if (started.size === 2) release?.();
+    await ready;
+  };
+  const config: ThreadFerryConfig = {
+    version: 6,
+    ownerUser: "owner",
+    agents: { default: { runtime: "codex", workspace: "/tmp", ownerUser: "owner" } },
+    groups: {},
+    security: { requireMention: true, readOnly: true },
+  };
+  const admin = await startAdminServer(config, {
+    updateConfig: async (change) => { await change(config); },
+    listGroups: async () => { await waitForBoth("groups"); return []; },
+    searchUsers: async () => [],
+    snapshot: async () => {
+      await waitForBoth("snapshot");
+      return { turns: [], sessions: [], inbox: [], outbox: [], reminders: [], workItems: [], activities: [] };
+    },
+  }, 0);
+  t.after(() => admin.close());
+
+  assert.equal((await fetch(`${admin.url}/`)).status, 200);
+  assert.deepEqual([...started].sort(), ["groups", "snapshot"]);
+});
+
 test("localhost admin manages agents, groups, and users with CSRF protection", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "threadferry-admin-"));
   t.after(() => rm(root, { recursive: true, force: true }));
@@ -67,10 +98,12 @@ test("localhost admin manages agents, groups, and users with CSRF protection", a
   assert.match(overview, /class="app-shell"/);
   assert.match(overview, /class="sidebar"/);
   assert.match(overview, /aria-current="page"/);
-  assert.match(overview, /data-theme-toggle/);
+  assert.doesNotMatch(overview, /data-theme-toggle/);
   assert.match(overview, /class="sidebar-bottom"/);
+  assert.match(overview, /日志追踪[\s\S]*偏好设置[\s\S]*服务运行中/);
+  assert.doesNotMatch(overview, /仅监听 127\.0\.0\.1/);
   assert.doesNotMatch(overview, /class="top-actions"/);
-  assert.match(overview, /待绑定群/);
+  assert.match(overview, /等待首次 @/);
   assert.match(overview, /新群/);
   assert.match(overview, /排队 \/ 运行中/);
   assert.match(overview, /TF-12345678/);
@@ -104,6 +137,30 @@ test("localhost admin manages agents, groups, and users with CSRF protection", a
   const clientScript = await script.text();
   assert.match(clientScript, /showModal/);
   assert.match(clientScript, /threadferry-theme/);
+  assert.match(clientScript, /threadferry-show-log-tracking/);
+  assert.match(clientScript, /threadferryDesktop/);
+
+  const logs = await (await fetch(`${admin.url}/logs`)).text();
+  assert.match(logs, /href="\/logs" data-log-nav class="active" aria-current="page"/);
+  assert.match(logs, /TF-12345678/);
+  assert.match(logs, /A-123456789ABC/);
+  assert.match(logs, /不展示消息正文/);
+  const filteredLogs = await (await fetch(`${admin.url}/logs?q=TF-12345678`)).text();
+  assert.match(filteredLogs, /TF-12345678/);
+  assert.doesNotMatch(filteredLogs, /A-123456789ABC/);
+  const successfulLogs = await (await fetch(`${admin.url}/logs?outcome=success`)).text();
+  assert.doesNotMatch(successfulLogs, /TF-12345678/);
+  assert.match(successfulLogs, /A-123456789ABC/);
+
+  const settings = await (await fetch(`${admin.url}/settings`)).text();
+  assert.match(settings, /偏好设置/);
+  assert.match(settings, /href="\/settings" class="active" aria-current="page"/);
+  assert.match(settings, /data-theme-preference/);
+  assert.match(settings, /data-interface-preference="showLogTracking"/);
+  assert.match(settings, /data-desktop-preference="launchAtLogin"/);
+  assert.match(settings, /data-desktop-preference="autoStartService"/);
+  assert.match(settings, /data-desktop-preference="openManagementOnLaunch"/);
+  assert.match(settings, /data-desktop-preference="showDockIcon"/);
 
   const first = await fetch(`${admin.url}/groups`);
   const page = await first.text();
@@ -111,7 +168,7 @@ test("localhost admin manages agents, groups, and users with CSRF protection", a
   assert.match(first.headers.get("content-security-policy") ?? "", /default-src 'none'/);
   assert.match(first.headers.get("content-security-policy") ?? "", /script-src 'self'/);
   assert.match(page, /AI Coding/);
-  assert.match(page, /待绑定/);
+  assert.match(page, /等待首次 @/);
   assert.match(page, /href="\/groups">↻ 刷新群列表<\/a>/);
   assert.match(page, /class="list-panel"/);
   assert.match(page, /href="\/groups\/detail\?id=group"/);
@@ -121,8 +178,9 @@ test("localhost admin manages agents, groups, and users with CSRF protection", a
   const groupDetail = await (await fetch(`${admin.url}/groups/detail?id=group`)).text();
   assert.match(groupDetail, /返回群聊列表/);
   assert.match(groupDetail, /重置 Session/);
-  assert.match(groupDetail, /解绑/);
-  assert.match(groupDetail, /1 台机器人已启用/);
+  assert.doesNotMatch(groupDetail, /解绑|移除群记录/);
+  assert.match(groupDetail, /1 台机器人可用/);
+  assert.match(groupDetail, /停用机器人/);
   assert.match(groupDetail, /仅授权成员/);
   assert.match(groupDetail, /开启全员可用/);
   // 名单里有名字就把名字放主位、加密 id 退成次要信息。
@@ -132,10 +190,11 @@ test("localhost admin manages agents, groups, and users with CSRF protection", a
   assert.match(groupDetail, /<dialog id="add-user-0"/);
   assert.match(groupDetail, /data-picker="users"/);
   assert.match(groupDetail, /data-agent-id="default"/);
-  // 候选是复选框：一个群可以一次勾多台机器人。new-group 还没人 @ 过，不能声称机器人在群里。
+  // new-group 还没产生机器人会话，只提示首次 @ 自动启用，不再要求手动绑定。
   const pendingDetail = await (await fetch(`${admin.url}/groups/detail?id=new-group`)).text();
-  assert.match(pendingDetail, /<input type="checkbox" id="bind-0-0" name="agentId" value="default" checked>/);
-  assert.match(pendingDetail, /绑定所选/);
+  assert.match(pendingDetail, /等待首次 @/);
+  assert.match(pendingDetail, /自动启用/);
+  assert.doesNotMatch(pendingDetail, /绑定所选|name="agentId"/);
   assert.doesNotMatch(groupDetail, /id="add-user-0"[^>]*open>/);
   // 对话框按「Agent + 群」定位：同一个群里两台机器人各有各的添加入口。
   const userKey = encodeURIComponent("default\ngroup");
@@ -240,16 +299,20 @@ test("localhost admin manages agents, groups, and users with CSRF protection", a
   const badAccess = await post("/groups/access", { groupId: "group", agentId: "default", allowAll: "yes" });
   assert.match(badAccess.headers.get("location") ?? "", /error=/);
 
-  // 绑定必须用目标 Agent 自己的机器人校验：reviewer 的机器人不在 new-group 里。
-  const wrongBot = await post("/groups/bind", { groupId: "new-group", agentId: "reviewer" });
-  assert.match(wrongBot.headers.get("location") ?? "", /error=/);
-  assert.equal(config.groups["new-group"], undefined);
+  const disabled = await post("/groups/enabled", { groupId: "group", agentId: "default", enabled: "off" });
+  assert.match(disabled.headers.get("location") ?? "", /^\/groups\/detail\?id=group&ok=/);
+  assert.equal(config.groups.group?.agents.default?.enabled, false);
+  assert.match(await (await fetch(`${admin.url}/groups/detail?id=group`)).text(), /已停用[\s\S]*启用机器人/);
+  await post("/groups/enabled", { groupId: "group", agentId: "default", enabled: "on" });
+  assert.equal(config.groups.group?.agents.default?.enabled, undefined);
+  const badEnabled = await post("/groups/enabled", { groupId: "group", agentId: "default", enabled: "yes" });
+  assert.match(badEnabled.headers.get("location") ?? "", /error=/);
 
-  await post("/groups/bind", { groupId: "new-group", agentId: "default" });
-  assert.deepEqual(config.groups["new-group"], {
+  // 模拟 Host 收到 new-group 的首次机器人回调后写入默认授权。
+  config.groups["new-group"] = {
     agents: { default: { allowUsers: ["owner"] } },
     context: { lookbackHours: 6, maxMessages: 80 },
-  });
+  };
 
   const boundRemoval = await post("/agents/remove", { agentId: "default" });
   assert.match(boundRemoval.headers.get("location") ?? "", /error=/);
@@ -261,24 +324,25 @@ test("localhost admin manages agents, groups, and users with CSRF protection", a
   assert.match(reset.headers.get("location") ?? "", /^\/groups\/detail\?id=group&ok=/);
   assert.deepEqual(resetCalls, ["group:default"]);
 
-  const unbound = await post("/groups/unbind", { groupId: "new-group", agentId: "default" });
-  assert.equal(unbound.status, 303);
-  assert.match(unbound.headers.get("location") ?? "", /^\/groups\?ok=/);
-  assert.equal(config.groups["new-group"], undefined);
+  delete config.groups["new-group"];
 
   // default 仍绑着 group，删不掉。
   const stillBound = await post("/agents/remove", { agentId: "default" });
   assert.match(stillBound.headers.get("location") ?? "", /error=/);
   assert.ok(config.agents.default);
 
-  // reviewer 没有任何群，可以删。
+  // 已停用群不会阻止删除机器人，删除时一并清理对应群记录。
+  config.groups["reviewer-group"] = {
+    agents: { reviewer: { allowUsers: ["owner"], enabled: false } },
+    context: { lookbackHours: 6, maxMessages: 80 },
+  };
   const removedReviewer = await post("/agents/remove", { agentId: "reviewer" });
   assert.equal(removedReviewer.status, 303);
   assert.match(removedReviewer.headers.get("location") ?? "", /^\/agents\?ok=/);
   assert.equal(config.agents.reviewer, undefined);
+  assert.equal(config.groups["reviewer-group"], undefined);
 
-  // 只剩 default：即使解绑所有群也必须保留至少一个 Agent。
-  await post("/groups/unbind", { groupId: "group" });
+  // 只剩 default 时必须保留至少一个 Agent。
   const lastRemoval = await post("/agents/remove", { agentId: "default" });
   assert.match(lastRemoval.headers.get("location") ?? "", /error=/);
   assert.ok(config.agents.default);
@@ -385,16 +449,18 @@ test("group discovery reports failures and explains an empty list instead of cla
   assert.match(groups, /群查询失败/);
   assert.match(groups, /errcode 853006/);
   assert.match(groups, /并不完整/);
-  // 列表只做导航，绑定控件进入群详情后才出现。
+  // 已确认机器人会话会自动接入；未确认群只等待首次 @，不显示绑定控件。
   assert.match(groups, /月相工作室/);
   assert.doesNotMatch(groups, /name="agentId" value="alpha"/);
   const seenDetail = await (await fetch(`${admin.url}/groups/detail?id=seen-group`)).text();
   assert.match(seenDetail, /name="agentId" value="alpha"/);
-  assert.match(seenDetail, /value="alpha"[^>]*>[\s\S]{0,80}机器人已在群/);
-  assert.match(seenDetail, /绑完即可 @ 使用/);
+  assert.match(seenDetail, /机器人已在群/);
+  assert.match(seenDetail, /可用/);
+  assert.doesNotMatch(seenDetail, /绑定所选/);
 
-  const empty = await startAdminServer(config, {
-    updateConfig: async (change) => { await change(config); },
+  const emptyConfig: ThreadFerryConfig = { ...config, groups: {} };
+  const empty = await startAdminServer(emptyConfig, {
+    updateConfig: async (change) => { await change(emptyConfig); },
     listGroups: async () => [],
     searchUsers: async () => [],
   }, 0);
@@ -404,5 +470,5 @@ test("group discovery reports failures and explains an empty list instead of cla
   assert.doesNotMatch(emptyPage, /都绑定完了/);
   assert.match(emptyPage, /还没发现任何群/);
   assert.match(emptyPage, /最近 7 天/);
-  assert.match(emptyPage, /@ 一次机器人/);
+  assert.match(emptyPage, /@它一次/);
 });
