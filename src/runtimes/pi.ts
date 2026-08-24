@@ -31,6 +31,10 @@ function assistantText(message: unknown): string | undefined {
   return text || undefined;
 }
 
+function retryableConnectionError(message: string | undefined): boolean {
+  return !!message && /connection error|fetch failed|econnreset|econnrefused|etimedout|enetunreach|network error/i.test(message);
+}
+
 export async function runPi(
   request: Omit<RuntimeRequest, "runtime">,
   runner: CommandRunner = runCommand,
@@ -56,37 +60,46 @@ export async function runPi(
     ...(request.sessionId ? ["--session-id", request.sessionId] : []),
     ...prepared.images.map((resource) => `@${resource.path}`),
   ];
-  // Pi 原先完全没处理非零退出：runner 抛出的 CommandExecutionError 直接冒泡，
-  // 结果只剩「pi 执行失败（退出码 N）」，stdout 里的真实原因被丢掉。
-  let stdout: string;
-  try {
-    ({ stdout } = await runner("pi", args, {
-      cwd: workspace,
-      env: safeEnvironment(),
-      input: prepared.prompt,
-      timeoutMs: 10 * 60_000,
-      signal: request.signal,
-    }));
-  } catch (error) {
-    throw runtimeFailure("Pi", error);
-  }
-
-  let sessionId = request.sessionId;
-  let finalMessage: string | undefined;
-  for (const line of stdout.split("\n")) {
-    if (!line.trim()) continue;
-    let event: Record<string, unknown>;
+  let retried = false;
+  while (true) {
+    let stdout: string;
     try {
-      event = JSON.parse(line) as Record<string, unknown>;
-    } catch {
+      ({ stdout } = await runner("pi", args, {
+        cwd: workspace,
+        env: safeEnvironment(),
+        input: prepared.prompt,
+        timeoutMs: 10 * 60_000,
+        signal: request.signal,
+      }));
+    } catch (error) {
+      const failure = runtimeFailure("Pi", error);
+      if (!retried && request.sessionId && retryableConnectionError(failure.message)) {
+        retried = true;
+        continue;
+      }
+      throw failure;
+    }
+
+    let sessionId = request.sessionId;
+    let finalMessage: string | undefined;
+    for (const line of stdout.split("\n")) {
+      if (!line.trim()) continue;
+      let event: Record<string, unknown>;
+      try {
+        event = JSON.parse(line) as Record<string, unknown>;
+      } catch {
+        continue;
+      }
+      if (event.type === "session" && typeof event.id === "string") sessionId = event.id;
+      if (event.type === "message_end") finalMessage = assistantText(event.message) ?? finalMessage;
+    }
+    if (finalMessage) return { text: finalMessage, ...(sessionId ? { sessionId } : {}) };
+
+    const reported = structuredRuntimeError(stdout);
+    if (!retried && request.sessionId && retryableConnectionError(reported)) {
+      retried = true;
       continue;
     }
-    if (event.type === "session" && typeof event.id === "string") sessionId = event.id;
-    if (event.type === "message_end") finalMessage = assistantText(event.message) ?? finalMessage;
-  }
-  if (!finalMessage) {
-    const reported = structuredRuntimeError(stdout);
     throw new Error(reported ? `Pi：${reported}` : "Pi 未返回可解析的最终消息");
   }
-  return { text: finalMessage, ...(sessionId ? { sessionId } : {}) };
 }

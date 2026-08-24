@@ -375,6 +375,13 @@ document.addEventListener("DOMContentLoaded", function () {
   setupThemePreference();
   setupInterfacePreferences();
   setupDesktopPreferences();
+  each("[data-update-check]", function (form) {
+    form.addEventListener("submit", function () {
+      var button = form.querySelector("button");
+      button.disabled = true;
+      button.textContent = "检查中…";
+    });
+  });
   setupDialogs();
   setupOnboardingTour();
   each("[data-auth-form]", setupAuthMode);

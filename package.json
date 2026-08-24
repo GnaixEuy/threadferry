@@ -1,6 +1,6 @@
 {
   "name": "threadferry",
-  "version": "0.26.11",
+  "version": "0.26.13",
   "description": "Safely ferry enterprise chat context to read-only local AI agents.",
   "author": "GnaixEuy",
   "homepage": "https://github.com/GnaixEuy/threadferry",

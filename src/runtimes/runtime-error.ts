@@ -13,6 +13,7 @@ function messageOf(value: unknown): string | undefined {
   if (!value || typeof value !== "object") return undefined;
   const record = value as Record<string, unknown>;
   if (typeof record.message === "string") return record.message;
+  if (typeof record.errorMessage === "string") return record.errorMessage;
   if (typeof record.error === "string") return record.error;
   if (typeof record.result === "string") return record.result;
   if (record.error && typeof record.error === "object") {
@@ -36,8 +37,11 @@ export function structuredRuntimeError(stdout: string): string | undefined {
     if (!event || typeof event !== "object") continue;
     const record = event as Record<string, unknown>;
     const type = record.type;
-    if (type !== "error" && type !== "turn.failed" && record.is_error !== true) continue;
-    const message = messageOf(event) ?? messageOf(record.item);
+    const messageEvent = record.message && typeof record.message === "object"
+      ? record.message as Record<string, unknown>
+      : undefined;
+    if (type !== "error" && type !== "turn.failed" && record.is_error !== true && messageEvent?.stopReason !== "error") continue;
+    const message = messageOf(event) ?? messageOf(record.item) ?? messageOf(messageEvent);
     if (message?.trim()) found = message.trim();
   }
   return found;
@@ -50,7 +54,7 @@ export function structuredRuntimeError(stdout: string): string | undefined {
 export function runtimeFailure(command: string, error: unknown): Error {
   if (!(error instanceof CommandExecutionError)) return error instanceof Error ? error : new Error(String(error));
   const structured = structuredRuntimeError(error.stdout);
-  const stderrLine = error.stderr.split("\n").map((line) => line.trim()).filter(Boolean).at(-1);
+  const stderrLine = error.stderr.split("\n").map((line) => line.trim()).find(Boolean);
   const detail = structured ?? stderrLine;
   if (!detail) return error;
   const trimmed = detail.length > MAX_REASON ? `${detail.slice(0, MAX_REASON)}…` : detail;
