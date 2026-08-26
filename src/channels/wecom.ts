@@ -291,7 +291,7 @@ function cliTime(date: Date): string {
   return `${date.getFullYear()}-${part(date.getMonth() + 1)}-${part(date.getDate())} ${part(date.getHours())}:${part(date.getMinutes())}:${part(date.getSeconds())}`;
 }
 
-function envelopeData(stdout: string, label: string): Record<string, unknown> {
+function cliEnvelope(stdout: string, label: string): Record<string, unknown> {
   let response: unknown;
   try {
     response = JSON.parse(stdout.trim());
@@ -300,13 +300,25 @@ function envelopeData(stdout: string, label: string): Record<string, unknown> {
   }
   if (!response || typeof response !== "object") throw new Error(`wecom-cli ${label} 返回结构无效`);
   const envelope = response as Record<string, unknown>;
-  if (typeof envelope.errcode === "number" && envelope.errcode !== 0) {
-    if (envelope.errcode === 853006) {
+  const nested = envelope.error && typeof envelope.error === "object" && !Array.isArray(envelope.error)
+    ? envelope.error as Record<string, unknown>
+    : undefined;
+  const rawCode = envelope.errcode ?? nested?.code;
+  const code = rawCode === undefined ? undefined : Number(rawCode);
+  const rawMessage = envelope.errmsg ?? nested?.message;
+  const message = typeof rawMessage === "string" ? rawMessage.replace(/\s+/g, " ").trim().slice(0, 300) : "";
+  if ((nested && rawCode === undefined) || (rawCode !== undefined && (!Number.isFinite(code) || code !== 0))) {
+    if (code === 853006) {
       throw new Error(`企业未授权机器人访问会话数据（errcode 853006）；请让企业管理员批准机器人数据访问权限`);
     }
-    throw new Error(`wecom-cli ${label} 失败（errcode ${envelope.errcode}）`);
+    throw new Error(`wecom-cli ${label} 失败${code === undefined || !Number.isFinite(code) ? "" : `（errcode ${code}）`}${message ? `：${message}` : ""}`);
   }
-  const data = envelope.data ?? envelope.result ?? response;
+  return envelope;
+}
+
+function envelopeData(stdout: string, label: string): Record<string, unknown> {
+  const envelope = cliEnvelope(stdout, label);
+  const data = envelope.data ?? envelope.result ?? envelope;
   if (!data || typeof data !== "object") throw new Error(`wecom-cli ${label} 返回缺少数据`);
   return data as Record<string, unknown>;
 }
@@ -506,7 +518,8 @@ export async function runWecomAction(
   if (write) {
     const dryRun = [...command];
     dryRun.splice(jsonIndex, 0, "--dry-run");
-    await runner("wecom-cli", dryRun, { timeoutMs: 30_000 });
+    const { stdout } = await runner("wecom-cli", dryRun, { timeoutMs: 30_000 });
+    cliEnvelope(stdout, `${command.slice(0, jsonIndex).join(".")} dry-run`);
   }
   const action = command.slice(0, jsonIndex).join(".");
   const outputDirectory = !write && FILE_OUTPUT_ACTIONS.has(action)
@@ -554,17 +567,7 @@ export async function sendWecomReply(groupId: string, content: string, runner: C
     markdown: { content },
   });
   const { stdout } = await runner("wecom-cli", ["message", "aibot", "send", "--json", request], { timeoutMs: 30_000 });
-  let response: unknown;
-  try {
-    response = JSON.parse(stdout.trim());
-  } catch {
-    throw new Error("wecom-cli message.aibot.send 返回了无效 JSON");
-  }
-  if (!response || typeof response !== "object") throw new Error("wecom-cli message.aibot.send 返回结构无效");
-  const envelope = response as Record<string, unknown>;
-  if (typeof envelope.errcode === "number" && envelope.errcode !== 0) {
-    throw new Error(`wecom-cli message.aibot.send 失败（errcode ${envelope.errcode}）`);
-  }
+  const envelope = cliEnvelope(stdout, "message.aibot.send");
   const data = envelope.data ?? envelope.result;
   if (data && typeof data === "object" && (data as { success?: unknown }).success === false) {
     throw new Error("wecom-cli message.aibot.send 未成功投递");

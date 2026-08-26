@@ -273,7 +273,12 @@ export class WecomHistory {
     } catch (error) {
       if (options.chatType === "group") throw error;
     }
-    const local = await this.local.list(options.chatType, chatId, options);
-    return mergeHistory(remote, local, options.maxMessages);
+    try {
+      const local = await this.local.list(options.chatType, chatId, options);
+      return mergeHistory(remote, local, options.maxMessages);
+    } catch (error) {
+      await cleanupAttachmentResources(remote.flatMap((message) => message.resources ?? []));
+      throw error;
+    }
   }
 }

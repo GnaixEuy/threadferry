@@ -566,36 +566,45 @@ export function createApp(config: AgentView, dependencies: AppDependencies, stat
       }
       if (!dependencies.runAction && pending.prepared.command[0] !== "internal") return respond(reply, "当前启动方式不支持代为执行企业微信动作。");
       pendingActions.delete(code);
-      let result: Record<string, unknown>;
-      try {
-        result = await executePreparedAction(pending.prepared, true, message.senderId, pending.groupId);
-      } catch (error) {
-        const reason = failureReason(error);
-        return respond(reply, withReason("动作执行失败。", reason, "direct"));
-      }
-      let content = `已执行：\n${pending.prepared.summary}`;
-      if (pending.continuation) {
+      return serial(pending.continuation?.scope ?? `direct:${message.senderId}`, async () => {
+        let result: Record<string, unknown>;
         try {
-          const finalized = await dependencies.runtime({
-            ...pending.continuation.request,
-            prompt: actionResultPrompt(pending.prepared, result, true),
-          });
-          if (finalized.sessionId) await state.setSession(pending.continuation.scope, pending.continuation.scopeKey, finalized.sessionId);
-          const cleaned = extractAction(finalized.text).reply.trim();
-          if (cleaned) content = cleaned;
+          result = await executePreparedAction(pending.prepared, true, message.senderId, pending.groupId);
+        } catch (error) {
+          const reason = failureReason(error);
+          return respond(reply, withReason("动作执行失败。", reason, "direct"));
+        }
+        let content = `已执行：\n${pending.prepared.summary}`;
+        if (pending.continuation) {
+          try {
+            const currentSession = await state.session(pending.continuation.scope, pending.continuation.scopeKey);
+            const finalized = await dependencies.runtime({
+              ...pending.continuation.request,
+              ...(currentSession ? { sessionId: currentSession } : {}),
+              prompt: actionResultPrompt(pending.prepared, result, true),
+            });
+            if (finalized.sessionId) await state.setSession(pending.continuation.scope, pending.continuation.scopeKey, finalized.sessionId);
+            const cleaned = extractAction(finalized.text).reply.trim();
+            if (cleaned) content = cleaned;
+          } catch (error) {
+            const errorId = newErrorId();
+            const reason = failureReason(error);
+            dependencies.onError?.({ errorId, phase: "runtime", ...(reason ? { reason } : {}) });
+            content += `\n\n操作已成功，但 Agent 整理结果失败（错误编号 ${errorId}）。`;
+          }
+        }
+        if (!pending.groupId) return respond(reply, content);
+        try {
+          if (!dependencies.notifyGroup) throw new Error("当前启动方式不支持群回执");
+          await dependencies.notifyGroup(pending.groupId, content);
+          return respond(reply, `已确认执行，结果已回执原群。\n\n${content}`);
         } catch (error) {
           const errorId = newErrorId();
           const reason = failureReason(error);
-          dependencies.onError?.({ errorId, phase: "runtime", ...(reason ? { reason } : {}) });
-          content += `\n\n操作已成功，但 Agent 整理结果失败（错误编号 ${errorId}）。`;
+          dependencies.onError?.({ errorId, phase: "reply", ...(reason ? { reason } : {}) });
+          return respond(reply, `已确认执行，但结果回执原群失败（错误编号 ${errorId}）。\n\n${content}`);
         }
-      }
-      // 提议发生在群里就把回执发回群里，省得群里的人不知道到底做没做。
-      if (pending.groupId) {
-        await dependencies.notifyGroup?.(pending.groupId, content)
-          .catch(() => undefined);
-      }
-      return respond(reply, pending.groupId ? `已确认执行，结果已回执原群。\n\n${content}` : content);
+      });
     }
     if (command.name === "agents") {
       const lines = Object.entries(config.agents).map(([id, agent]) => `- \`${id}\`：${agent.runtime}${agent.model ? ` / ${agent.model}` : ""}\n  ${agent.workspace}`);
