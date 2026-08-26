@@ -507,6 +507,75 @@ test("a write request is proposed, waits for the owner, and only then executes",
   assert.equal(executed.length, 1);
 });
 
+test("a failed group receipt is reported truthfully", async () => {
+  const config = testConfig("/workspace", "owner");
+  config.groups.group!.allowUsers.push("requester");
+  const replies: string[] = [];
+  let runtimeCall = 0;
+  const app = createApp(config, {
+    history: async () => [],
+    runtime: async () => ({ text: runtimeCall++ === 0
+      ? wecomProposal(["calendar", "schedules", "create", "--json", "{}"], "wecomcli-calendar", "创建日程")
+      : "日程已创建。" }),
+    runAction: async () => ({ schedule_id: "schedule-1" }),
+    notifyGroup: async () => { throw new Error("网络不可用"); },
+  });
+  await app.handle({
+    msgId: "receipt-group", groupId: "group", senderId: "requester", time: new Date(), text: "创建日程", mentioned: true,
+  }, async (content, finish = true) => { if (finish) replies.push(content); });
+  const code = /threadferry confirm ([0-9A-F]{6})/.exec(replies.at(-1) ?? "")![1]!;
+  await app.handleDirect({ msgId: "receipt-confirm", senderId: "owner", time: new Date(), text: `threadferry confirm ${code}` },
+    async (content) => { replies.push(content); });
+  assert.match(replies.at(-1) ?? "", /回执原群失败/);
+  assert.doesNotMatch(replies.at(-1) ?? "", /结果已回执原群/);
+});
+
+test("a confirmed group action waits for the active group turn", async () => {
+  const config = testConfig("/workspace", "owner");
+  config.groups.group!.allowUsers.push("requester");
+  const replies: string[] = [];
+  let releaseTurn!: () => void;
+  let markTurnStarted!: () => void;
+  const turnStarted = new Promise<void>((resolve) => { markTurnStarted = resolve; });
+  const turnBlocked = new Promise<void>((resolve) => { releaseTurn = resolve; });
+  let runtimeCall = 0;
+  let executions = 0;
+  let confirmationSession: string | undefined;
+  const app = createApp(config, {
+    history: async () => [],
+    runtime: async (request) => {
+      runtimeCall += 1;
+      if (runtimeCall === 1) return { text: wecomProposal(["calendar", "schedules", "create", "--json", "{}"], "wecomcli-calendar", "创建日程"), sessionId: "session-1" };
+      if (runtimeCall === 2) {
+        markTurnStarted();
+        await turnBlocked;
+        return { text: "第二轮完成", sessionId: "session-2" };
+      }
+      confirmationSession = request.sessionId;
+      return { text: "日程已创建" };
+    },
+    runAction: async () => { executions += 1; return {}; },
+    notifyGroup: async () => undefined,
+  });
+  await app.handle({
+    msgId: "serial-proposal", groupId: "group", senderId: "requester", time: new Date(), text: "创建日程", mentioned: true,
+  }, async (content, finish = true) => { if (finish) replies.push(content); });
+  const code = /threadferry confirm ([0-9A-F]{6})/.exec(replies.at(-1) ?? "")![1]!;
+  const active = app.handle({
+    msgId: "serial-active", groupId: "group", senderId: "requester", time: new Date(), text: "分析新问题", mentioned: true,
+  }, async () => undefined);
+  await turnStarted;
+  const confirmation = app.handleDirect({
+    msgId: "serial-confirm", senderId: "owner", time: new Date(), text: `threadferry confirm ${code}`,
+  }, async () => undefined);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(executions, 0);
+  releaseTurn();
+  await Promise.all([active, confirmation]);
+  assert.equal(executions, 1);
+  assert.equal(confirmationSession, "session-2");
+});
+
 test("an owner meeting request executes the Skill-built command and returns the result to the Agent", async () => {
   const executed: string[][] = [];
   const replies: string[] = [];
@@ -795,6 +864,18 @@ test("wecom actions pass dry-run before the real write", async () => {
     return { stdout: "current schema", stderr: "" };
   }, false), { documentation: "current schema" });
   assert.deepEqual(calls, [["meeting", "create", "--schema"]]);
+});
+
+test("wecom actions and replies reject structured CLI errors", async () => {
+  const failed = { stdout: JSON.stringify({ error: { code: 853006, message: "permission denied" } }), stderr: "" };
+  let calls = 0;
+  await assert.rejects(runWecomAction(["meeting", "create", "--json", "{}"], async () => {
+    calls += 1;
+    return failed;
+  }), /853006/);
+  assert.equal(calls, 1);
+  await assert.rejects(runWecomAction(["contact", "users", "search", "--json", "{}"], async () => failed, false), /853006/);
+  await assert.rejects(sendWecomReply("group", "reply", async () => failed), /853006/);
 });
 
 test("long enterprise content is read from an isolated temp directory without leaking its path", async () => {
@@ -1481,6 +1562,31 @@ test("wecom history accepts small UTF-8 files returned inline", async () => {
   }, runner);
   assert.equal(await readFile(messages[0]!.resources![0]!.path, "utf8"), "inline history content");
   await cleanupAttachmentResources(messages.flatMap((message) => message.resources ?? []));
+});
+
+test("wecom history cleans remote resources when local history fails", async (t) => {
+  const localRoot = await mkdtemp(join(tmpdir(), "threadferry-broken-history-test-"));
+  t.after(() => rm(localRoot, { recursive: true, force: true }));
+  await writeFile(join(localRoot, "index.json"), "{broken");
+  let outputDirectory = "";
+  const history = new WecomHistory("broken-history", async (_command, args) => {
+    if (args.slice(0, 3).join(".") === "chat.messages.list") {
+      return {
+        stdout: JSON.stringify({ data: { messages: [{
+          msg_type: "image", send_time: "2026-08-18 10:01:00", userid: "user-1", image: { media_id: "media-1" },
+        }], has_more: false } }),
+        stderr: "",
+      };
+    }
+    outputDirectory = args[args.indexOf("--output-dir") + 1]!;
+    return { stdout: JSON.stringify({ data: { media_item: { content: "image", media_type: "image" } } }), stderr: "" };
+  }, localRoot);
+  await assert.rejects(history.list("group", {
+    chatType: "group", lookbackHours: 6, maxMessages: 80,
+    endTime: new Date("2026-08-18T10:05:00+08:00"), includeResources: true,
+  }));
+  assert.ok(outputDirectory);
+  await assert.rejects(stat(outputDirectory), /ENOENT/);
 });
 
 test("wecom history reports unavailable corporation permission", async () => {

@@ -4,6 +4,24 @@ ThreadFerry 的每个 GitHub Release 都使用这里对应版本的内容，不�
 
 ## Unreleased
 
+## 0.26.14
+
+修复企业微信动作错误误报成功、历史附件异常时遗留临时文件，以及群回执失败后的错误提示。
+
+### 主要变化
+
+- Broker 统一识别 `errcode` 和 `error.code/error.message`，写操作 dry-run、真实调用和主动回复都不再把结构化错误当成成功。
+- 远端历史附件下载后，即使本机历史索引损坏或读取失败，也会删除本轮的隔离临时目录。
+- Owner 确认的动作与原群或私聊 Session 串行执行，避免与新消息同时恢复同一 Runtime Session。
+- 动作已执行但原群回执失败时，Owner 会收到真实失败状态、错误编号和完整结果，不再误报“已回执原群”。
+
+### 安装与升级
+
+升级并重新启动 ThreadFerry 即可；现有配置、机器人凭据、Workspace、Runtime Session、
+群聊授权和本机历史均无需迁移。
+
+[查看 v0.26.13...v0.26.14 的完整变更](https://github.com/GnaixEuy/threadferry/compare/v0.26.13...v0.26.14)
+
 ## 0.26.13
 
 管理台增加手动检查更新，并修复 Pi 偶发连接失败时的恢复与错误提示。
