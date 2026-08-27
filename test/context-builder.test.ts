@@ -37,8 +37,8 @@ test("context contains recent history as untrusted data and preserves the curren
   assert.match(prompt, /trace\.log/);
   assert.match(prompt, /"action":"wecom-cli"/);
   assert.match(prompt, /"command":\["meeting","create","--json"/);
-  assert.match(prompt, /官方 wecomcli-\* Skill/);
-  assert.match(prompt, /"skill":"wecomcli-meeting"/);
+  assert.match(prompt, /官方 wecom-unified Skill/);
+  assert.match(prompt, /"skill":"wecom-unified"/);
   assert.match(prompt, /"user_intent":"explicit"/);
   assert.match(prompt, /否定、询问、假设、能力咨询、信息不足或含糊表达一律填 confirm/);
   assert.match(prompt, /不要提议 auth、identity、任意 shell、输出路径、凭据或本地文件路径/);

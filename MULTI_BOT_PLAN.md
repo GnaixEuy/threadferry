@@ -22,7 +22,7 @@
 | P3 | 会后跟进与文档评论触发 | ⛔ 会后改为显式提醒；文档评论事件受平台阻塞 |
 | P4 | 统一动作策略、资源审计与 Activity 可观测性 | ✅ 完成 |
 
-状态图例：⬜ 未开始 / 🟡 进行中 / ✅ 完成 / ⛔ 阻塞　　当前测试：**158/158 通过，另 1 项 Windows 专用测试跳过**
+状态图例：⬜ 未开始 / 🟡 进行中 / ✅ 完成 / ⛔ 阻塞　　当前测试：**175/175 通过，另 1 项 Windows 专用测试跳过**
 
 ---
 
@@ -57,20 +57,29 @@ agent 之间完全独立。多条连接并发跑在一个 ThreadFerry 进程里�
 
 ## 设计修正记录
 
+**2026-08-27：升级到 `wecom-cli 1.2.0` 与官方统一 Agent Skill。**
+
+- [x] 安装器和 `doctor` 使用 `wecom-cli 1.2.0` 基线；远程自描述、service 别名和上传 token 刷新重放由
+  官方 CLI 提供，Broker 仍只接受规范 service 名。
+- [x] 14 个拆分 `wecomcli-*` Skills 退出运行契约，安装源切换为 `WecomTeam/wecom-unified`；Runtime
+  只读统一 Skill 及当前业务 reference，Host 继续负责凭据、授权、确认和执行。
+- [x] 按目标 Agent 的真实 schema 核对 13 个业务 service；新增命令继续复用通用读写与破坏性分类，
+  不增加宿主业务特例。
+
 **2026-08-23：企业微信业务能力归还官方 Skill，ThreadFerry 收敛为通用 Broker。**
 
 - [x] 删除宿主内 42 个会议、日程、待办、邮件、文档、微盘和表格 `ActionSpec`，以及参与人转换、
   参数拼装和结果格式化；官方 Skill 负责业务路由、澄清、前置查询、精确命令与最终表达。
 - [x] 统一为一个 `wecom-cli` 提议：Agent 输出 `skill`、`user_intent`、完整 `command` 和 `summary`；
-  Broker 只做 service/Skill 匹配、命令形状、读写/破坏性分类、Owner/会话确认、dry-run 和审计。
+  Broker 只做官方 Skill 来源、service 白名单、命令形状、读写/破坏性分类、Owner/会话确认、dry-run 和审计。
 - [x] Broker 支持通过 `--help` / `--doc` / `--schema` 把当前 CLI 契约回传 Agent，拒绝 `auth`、
   `identity`、任意 shell/选项、凭据字段和 Agent 提供的本地路径；所有调用继续使用所属 Agent 的
   `WECOM_CLI_CONFIG_DIR`。
 - [x] 查询与写入结果都回到同一 Agent；写入完成后禁止同轮第二次动作。需 Owner 确认的动作在确认后
   恢复原 Session 整理结果，并把群请求的回执发回原群。
-- [x] `onboard` 安装官方 14 个 Skills，`threadferry skills install` 可补齐/更新，`doctor` 检查完整性；
-  安装锁还会核验来源必须为 WeComTeam/wecom-cli。Codex/Grok 使用标准 Skills 目录；Pi 逐项加载 14 个
-  官方目录，Claude 在 Safe Mode 下通过可信只读路径仅开放同一组目录。
+- [x] `onboard` 安装官方 `wecom-unified` Skill，`threadferry skills install` 可补齐/更新，`doctor` 检查
+  目录、元数据和安装锁来源必须为 `WecomTeam/wecom-unified`。Codex/Grok 使用标准 Skills 目录；Pi
+  加载该 Skill，Claude 在 Safe Mode 下通过可信只读路径仅开放同一目录。
 - [x] 删除“创建会议后宿主自动创建转写提醒”的隐藏业务副作用；会后跟进改由 Agent 按 Skill 与用户
   意图显式创建 ThreadFerry reminder。
 
@@ -116,7 +125,7 @@ agent 之间完全独立。多条连接并发跑在一个 ThreadFerry 进程里�
 - [x] 所有动作走统一策略；群内个人数据读取直接拒绝，高风险动作始终二次确认，命令摘要哈希后审计。
   管理台与 `threadferry status` 展示提醒、协作任务和 Activity。
 - [ ] 文档评论触发：当前 `@wecom/aibot-node-sdk 1.0.7` 只暴露进入会话、模板卡片和反馈事件，
-  `wecom-cli 1.1.0` 也没有文档评论查询/事件命令。没有可验证的事件源前不做伪轮询。
+  `wecom-cli 1.2.0` 也没有文档评论查询/事件命令。没有可验证的事件源前不做伪轮询。
 
 **2026-08-19（四）：恢复中文/空格 Agent 名 —— 目录安全不等于 ASCII。**
 

@@ -156,6 +156,13 @@ export interface RuntimeResult {
   sessionId?: string;
 }
 
+export interface AgentConnectionHealth {
+  state: "connecting" | "connected" | "reconnecting" | "disconnected";
+  changedAt: string;
+  reconnectAttempt?: number;
+  lastEventAt?: string;
+}
+
 // Runtime 只需要 workspace / runtime / model；Owner 与凭据目录跟它无关，所以继承
 // AgentDefinition 而不是 AgentConfig，避免把身份信息带进 Runtime 边界。
 export interface RuntimeRequest extends Omit<AgentDefinition, "configDir"> {

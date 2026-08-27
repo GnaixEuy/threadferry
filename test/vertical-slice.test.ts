@@ -5,11 +5,11 @@ import { join } from "node:path";
 import test from "node:test";
 import { createApp } from "../src/app.js";
 import { cleanupAttachmentResources, createAttachmentRoot } from "../src/attachments.js";
-import { createWecomMessageDispatcher, listWecomGroups, runWecomAction, searchWecomUsers, sendWecomReply, standardizeAuthChange, standardizeMessage, wecomFailureReason } from "../src/channels/wecom.js";
+import { createWecomMessageDispatcher, listWecomGroups, runWecomAction, searchWecomUsers, sendWecomReply, standardizeAuthChange, standardizeMessage, WecomActionUnknownError, wecomFailureReason } from "../src/channels/wecom.js";
 import { addAgent, agentView, ensureGroupAccess, loadConfig, onboardingDefaults, pairConfig, refreshAgentView, resolveWorkspace, saveConfig, setupConfig } from "../src/config.js";
 import { fetchWecomHistory, WecomHistory } from "../src/history/wecom-cli.js";
 import { LocalWecomHistory } from "../src/history/local.js";
-import { CommandExecutionError, runCommand } from "../src/process.js";
+import { CommandExecutionError, CommandTimeoutError, runCommand } from "../src/process.js";
 import { runClaude } from "../src/runtimes/claude.js";
 import { runCodex } from "../src/runtimes/codex.js";
 import { runGrok } from "../src/runtimes/grok.js";
@@ -456,7 +456,7 @@ test("a write request is proposed, waits for the owner, and only then executes",
   const app = createApp(config, {
     history: async () => [],
     runtime: async () => ({ text: runtimeCall++ === 0
-      ? wecomProposal(command, "wecomcli-calendar", "创建日程“回归测试复盘”，时间为 10:00 至 11:00", "好的，我建议这样安排。")
+      ? wecomProposal(command, "wecom-unified", "创建日程“回归测试复盘”，时间为 10:00 至 11:00", "好的，我建议这样安排。")
       : "日程已创建：回归测试复盘，时间为 10:00 至 11:00。" }),
     runAction: async (action) => { executed.push(action); return { schedule_id: "schedule-1" }; },
     notifyGroup: async (groupId, content) => { groupNotices.push({ groupId, content }); },
@@ -507,27 +507,61 @@ test("a write request is proposed, waits for the owner, and only then executes",
   assert.equal(executed.length, 1);
 });
 
-test("a failed group receipt is reported truthfully", async () => {
+test("a failed confirmed group receipt is persisted for retry", async () => {
   const config = testConfig("/workspace", "owner");
   config.groups.group!.allowUsers.push("requester");
   const replies: string[] = [];
   let runtimeCall = 0;
+  const state = new ThreadFerryState();
+  let activeDuringSend: true | undefined;
   const app = createApp(config, {
     history: async () => [],
     runtime: async () => ({ text: runtimeCall++ === 0
-      ? wecomProposal(["calendar", "schedules", "create", "--json", "{}"], "wecomcli-calendar", "创建日程")
+      ? wecomProposal(["calendar", "schedules", "create", "--json", "{}"], "wecom-unified", "创建日程")
       : "日程已创建。" }),
     runAction: async () => ({ schedule_id: "schedule-1" }),
-    notifyGroup: async () => { throw new Error("网络不可用"); },
-  });
+    notifyGroup: async () => {
+      activeDuringSend = (await state.snapshot()).outbox[0]?.proactive;
+      throw new Error("网络不可用");
+    },
+  }, state);
   await app.handle({
     msgId: "receipt-group", groupId: "group", senderId: "requester", time: new Date(), text: "创建日程", mentioned: true,
   }, async (content, finish = true) => { if (finish) replies.push(content); });
   const code = /threadferry confirm ([0-9A-F]{6})/.exec(replies.at(-1) ?? "")![1]!;
   await app.handleDirect({ msgId: "receipt-confirm", senderId: "owner", time: new Date(), text: `threadferry confirm ${code}` },
     async (content) => { replies.push(content); });
-  assert.match(replies.at(-1) ?? "", /回执原群失败/);
+  assert.match(replies.at(-1) ?? "", /已加入原群补发队列/);
   assert.doesNotMatch(replies.at(-1) ?? "", /结果已回执原群/);
+  const [delivery] = (await state.snapshot()).outbox;
+  assert.equal(delivery?.groupId, "group");
+  assert.equal(delivery?.agent, "default");
+  assert.equal(delivery?.proactive, true);
+  assert.match(delivery?.content ?? "", /日程已创建/);
+  assert.equal(delivery?.attempts, 1);
+  assert.equal(activeDuringSend, undefined);
+});
+
+test("a timed-out write is reported as unknown and never retried", async () => {
+  const state = new ThreadFerryState();
+  const replies: string[] = [];
+  const command = ["meeting", "create", "--json", "{}"];
+  let executions = 0;
+  const app = createApp(testConfig("/workspace", "owner"), {
+    history: async () => [],
+    runtime: async () => ({ text: wecomProposal(command, "wecom-unified", "创建会议") }),
+    runAction: async () => {
+      executions += 1;
+      throw new WecomActionUnknownError("meeting.create");
+    },
+  }, state);
+  assert.equal(await app.handleDirect({ msgId: "unknown-write", senderId: "owner", time: new Date(), text: "创建会议" },
+    async (content) => { replies.push(content); }), "handled");
+  assert.equal(executions, 1);
+  assert.match(replies.at(-1) ?? "", /最终状态未知/);
+  assert.match(replies.at(-1) ?? "", /不会自动重试/);
+  const unknown = (await state.recentActivities()).find((item) => item.type === "action.unknown");
+  assert.equal(unknown?.outcome, "info");
 });
 
 test("a confirmed group action waits for the active group turn", async () => {
@@ -545,7 +579,7 @@ test("a confirmed group action waits for the active group turn", async () => {
     history: async () => [],
     runtime: async (request) => {
       runtimeCall += 1;
-      if (runtimeCall === 1) return { text: wecomProposal(["calendar", "schedules", "create", "--json", "{}"], "wecomcli-calendar", "创建日程"), sessionId: "session-1" };
+      if (runtimeCall === 1) return { text: wecomProposal(["calendar", "schedules", "create", "--json", "{}"], "wecom-unified", "创建日程"), sessionId: "session-1" };
       if (runtimeCall === 2) {
         markTurnStarted();
         await turnBlocked;
@@ -587,7 +621,7 @@ test("an owner meeting request executes the Skill-built command and returns the 
   const app = createApp(testConfig("/workspace", "owner"), {
     history: async () => [],
     runtime: async () => ({ text: runtimeCall++ === 0
-      ? wecomProposal(command, "wecomcli-meeting", "创建在线会议“刚才的测试复盘”，邀请平平无奇小天才", "我来安排。")
+      ? wecomProposal(command, "wecom-unified", "创建在线会议“刚才的测试复盘”，邀请平平无奇小天才", "我来安排。")
       : "#会议号: 123-456-789\n\n会议已创建，入会链接：https://meeting.example/join" }),
     runAction: async (action) => {
       executed.push(action);
@@ -616,7 +650,7 @@ test("owner direct chat can query enterprise data and gets formatted results", a
   const app = createApp(testConfig("/workspace", "owner"), {
     history: async () => [],
     runtime: async () => ({ text: runtimeCall++ === 0
-      ? wecomProposal(command, "wecomcli-meeting", "搜索主题包含“测试复盘”的会议", "正在查询。")
+      ? wecomProposal(command, "wecom-unified", "搜索主题包含“测试复盘”的会议", "正在查询。")
       : "测试复盘：2026-08-21 10:00:00 至 10:30:00，共 3 人参加。" }),
     runAction: async (command, write) => {
       calls.push({ command, write });
@@ -649,10 +683,10 @@ test("owner direct chat can chain reads and create a meeting from their results"
   const replies: string[] = [];
   let turn = 0;
   const runtimeReplies = [
-    wecomProposal(["doc", "search", "--json", '{"keywords":["季度复盘"]}'], "wecomcli-doc-manage", "搜索季度复盘文档"),
-    wecomProposal(["doc", "contents", "get", "--json", '{"docid":"doc-1","content_type":"markdown"}'], "wecomcli-doc", "读取季度复盘文档"),
-    wecomProposal(["contact", "users", "search", "--json", '{"keywords":["张三"],"search_mode":"list"}'], "wecomcli-contact", "查询责任人张三的通讯录身份"),
-    wecomProposal(["meeting", "create", "--json", '{"subject":"季度未完成事项复盘","begin_time":"2026-08-21 10:00:00","end_time":"2026-08-21 10:30:00","attendees":[{"userid":"zhangsan-id"}]}'], "wecomcli-meeting", "创建季度未完成事项复盘会议并邀请张三", "已找到未完成事项。"),
+    wecomProposal(["doc", "search", "--json", '{"keywords":["季度复盘"]}'], "wecom-unified", "搜索季度复盘文档"),
+    wecomProposal(["doc", "contents", "get", "--json", '{"docid":"doc-1","content_type":"markdown"}'], "wecom-unified", "读取季度复盘文档"),
+    wecomProposal(["contact", "users", "search", "--json", '{"keywords":["张三"],"search_mode":"list"}'], "wecom-unified", "查询责任人张三的通讯录身份"),
+    wecomProposal(["meeting", "create", "--json", '{"subject":"季度未完成事项复盘","begin_time":"2026-08-21 10:00:00","end_time":"2026-08-21 10:30:00","attendees":[{"userid":"zhangsan-id"}]}'], "wecom-unified", "创建季度未完成事项复盘会议并邀请张三", "已找到未完成事项。"),
     "#会议号: 123-456-789\n\n已创建“季度未完成事项复盘”会议，并邀请张三。",
   ];
   const app = createApp(testConfig("/workspace", "owner"), {
@@ -753,7 +787,7 @@ test("enterprise data queries never run or disclose results in a group", async (
   const app = createApp(testConfig("/workspace", "owner"), {
     history: async () => [],
     runtime: async () => ({ text: wecomProposal(
-      ["todo", "list", "--json", '{"status_filter":["proceed"]}'], "wecomcli-todo", "查询进行中的待办",
+      ["todo", "list", "--json", '{"status_filter":["proceed"]}'], "wecom-unified", "查询进行中的待办",
     ) }),
     runAction: async () => { executions += 1; },
   }, state);
@@ -777,7 +811,7 @@ test("private mail operations never stage or run in a group", async () => {
     history: async () => [],
     runtime: async () => ({ text: wecomProposal(
       ["mail", "send", "--json", '{"to":{"userids":["user-id"]},"subject":"通知","content":"正文"}'],
-      "wecomcli-email", "给张三发送主题为“通知”的邮件",
+      "wecom-unified", "给张三发送主题为“通知”的邮件",
     ) }),
     runAction: async () => { executions += 1; },
   });
@@ -797,7 +831,7 @@ test("destructive actions always require a fresh owner confirmation", async () =
   const app = createApp(testConfig("/workspace", "owner"), {
     history: async () => [],
     runtime: async () => ({ text: wecomProposal(
-      ["meeting", "cancel", "--json", '{"meeting_id":"meeting-id"}'], "wecomcli-meeting", "取消会议 meeting-id",
+      ["meeting", "cancel", "--json", '{"meeting_id":"meeting-id"}'], "wecom-unified", "取消会议 meeting-id",
     ) }),
     runAction: async (command) => { executed.push(command); return {}; },
   });
@@ -818,7 +852,7 @@ test("destructive actions always require a fresh owner confirmation", async () =
   assert.deepEqual(executed[0]!.slice(0, 3), ["meeting", "cancel", "--json"]);
 });
 
-test("a command proposed under the wrong Skill is rejected instead of staged", async () => {
+test("a command proposed under a legacy Skill is rejected instead of staged", async () => {
   const executed: string[][] = [];
   const replies: string[] = [];
   const app = createApp(testConfig("/workspace", "owner"), {
@@ -836,7 +870,7 @@ test("a command proposed under the wrong Skill is rejected instead of staged", a
   }, async (content, finish = true) => { if (finish) replies.push(content); });
 
   assert.deepEqual(executed, []);
-  assert.match(replies.at(-1) ?? "", /必须由 wecomcli-meeting Skill 提议/);
+  assert.match(replies.at(-1) ?? "", /必须由 wecom-unified Skill 提议/);
   assert.doesNotMatch(replies.at(-1) ?? "", /threadferry confirm/);
 });
 
@@ -864,6 +898,16 @@ test("wecom actions pass dry-run before the real write", async () => {
     return { stdout: "current schema", stderr: "" };
   }, false), { documentation: "current schema" });
   assert.deepEqual(calls, [["meeting", "create", "--schema"]]);
+});
+
+test("a timeout after a write dry-run becomes an unknown action result", async () => {
+  let calls = 0;
+  await assert.rejects(runWecomAction(["meeting", "create", "--json", "{}"], async () => {
+    calls += 1;
+    if (calls === 1) return { stdout: JSON.stringify({ errcode: 0 }), stderr: "" };
+    throw new CommandTimeoutError("wecom-cli");
+  }), WecomActionUnknownError);
+  assert.equal(calls, 2);
 });
 
 test("wecom actions and replies reject structured CLI errors", async () => {
@@ -900,7 +944,7 @@ test("an unexecutable proposal explains itself instead of silently dropping", as
   const app = createApp(config, {
     history: async () => [],
     runtime: async () => ({ text: wecomProposal(
-      ["calendar", "schedules", "create", "--json", "not-json"], "wecomcli-calendar", "创建日程", "准备安排。",
+      ["calendar", "schedules", "create", "--json", "not-json"], "wecom-unified", "创建日程", "准备安排。",
     ) }),
     runAction: async () => { throw new Error("不该被调用"); },
   });
@@ -1893,8 +1937,8 @@ test("Pi uses only guarded read tools and parses its machine-readable result", a
     assert.ok(received?.args.includes(flag));
   }
   const piSkillPaths = received?.args.flatMap((arg, index, args) => args[index - 1] === "--skill" ? [arg] : []) ?? [];
-  assert.equal(piSkillPaths.length, 14);
-  assert.ok(piSkillPaths.every((path) => /\.agents\/skills\/wecomcli-[^/]+$/.test(path)));
+  assert.equal(piSkillPaths.length, 1);
+  assert.match(piSkillPaths[0] ?? "", /\.agents\/skills\/wecom-unified$/);
   assert.equal(received?.args[received.args.indexOf("--model") + 1], "provider/model");
 });
 
@@ -1949,14 +1993,14 @@ test("Claude Code runs headlessly with only read tools and resumes its session",
   assert.equal(received?.command, "claude");
   assert.equal(received?.cwd, workspace);
   assert.match(received?.input ?? "", /^分析/);
-  assert.match(received?.input ?? "", /TRUSTED_WECOM_SKILL_DIRECTORIES[\s\S]*\.agents\/skills\/wecomcli-meeting/);
+  assert.match(received?.input ?? "", /TRUSTED_WECOM_SKILL_DIRECTORIES[\s\S]*\.agents\/skills\/wecom-unified/);
   assert.equal(received?.secret, undefined);
   for (const flag of ["--safe-mode", "--permission-mode", "--allowedTools", "--disallowedTools", "--resume"]) {
     assert.ok(received?.args.includes(flag));
   }
   const claudeSkillPaths = received?.args.flatMap((arg, index, args) => args[index - 1] === "--add-dir" ? [arg] : []) ?? [];
-  assert.equal(claudeSkillPaths.length, 14);
-  assert.ok(claudeSkillPaths.every((path) => /\.agents\/skills\/wecomcli-[^/]+$/.test(path)));
+  assert.equal(claudeSkillPaths.length, 1);
+  assert.match(claudeSkillPaths[0] ?? "", /\.agents\/skills\/wecom-unified$/);
   assert.equal(received?.args[received.args.indexOf("--model") + 1], "sonnet");
 
   const loggedOut: CommandRunner = async () => {

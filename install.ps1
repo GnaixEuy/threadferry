@@ -126,17 +126,17 @@ function Ensure-WecomCli {
   $wecomCli = Resolve-NativeCommand "wecom-cli"
   $installed = if ($null -ne $wecomCli) { Invoke-Captured $wecomCli @("--version") } else { "" }
   $version = Get-SemanticVersion $installed
-  if ($null -ne $version -and $version -ge [version] "1.1.0") {
+  if ($null -ne $version -and $version -ge [version] "1.2.0") {
     Write-Host "Found $installed."
     return $wecomCli
   }
 
   if ($installed) {
-    Write-Host "Updating official wecom-cli to 1.1.0+; current version is $installed."
+    Write-Host "Updating official wecom-cli to 1.2.0+; current version is $installed."
   } else {
-    Write-Host "Installing official wecom-cli 1.1.0+..."
+    Write-Host "Installing official wecom-cli 1.2.0+..."
   }
-  Invoke-Mutation $Npm @("install", "--global", "@wecom/cli")
+  Invoke-Mutation $Npm @("install", "--global", "@wecom/cli@1.2.0")
   if ($DryRun) { return $null }
 
   $wecomCli = Resolve-NativeCommand "wecom-cli"
@@ -145,8 +145,8 @@ function Ensure-WecomCli {
   }
   $installed = Invoke-Captured $wecomCli @("--version")
   $version = Get-SemanticVersion $installed
-  if ($null -eq $version -or $version -lt [version] "1.1.0") {
-    throw "wecom-cli 1.1.0+ is required; installed version is $installed."
+  if ($null -eq $version -or $version -lt [version] "1.2.0") {
+    throw "wecom-cli 1.2.0+ is required; installed version is $installed."
   }
   return $wecomCli
 }

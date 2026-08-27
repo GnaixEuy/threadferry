@@ -9,7 +9,7 @@ import {
   MAX_ATTACHMENT_TOTAL_BYTES,
   saveAttachmentResource,
 } from "../attachments.js";
-import { CommandExecutionError, runCommand } from "../process.js";
+import { CommandExecutionError, CommandTimeoutError, runCommand } from "../process.js";
 import type { AttachmentResource, AttachmentSource, AttachmentType, CommandRunner, DirectoryUser, IncomingDirectMessage, IncomingMention, IncomingWecomEvent, QuoteMetadata, Reply } from "../types.js";
 
 function quoteMetadata(quote: QuoteContent | undefined): QuoteMetadata | undefined {
@@ -528,11 +528,23 @@ export async function runWecomAction(
   try {
     const actual = [...command];
     if (outputDirectory) actual.splice(jsonIndex, 0, "--output-dir", outputDirectory);
-    const { stdout } = await runner("wecom-cli", actual, { timeoutMs: 30_000 });
-    const data = envelopeData(stdout, command.slice(0, jsonIndex).join("."));
-    return outputDirectory ? await hydrateActionFiles(data, outputDirectory) as Record<string, unknown> : data;
+    try {
+      const { stdout } = await runner("wecom-cli", actual, { timeoutMs: 30_000 });
+      const data = envelopeData(stdout, command.slice(0, jsonIndex).join("."));
+      return outputDirectory ? await hydrateActionFiles(data, outputDirectory) as Record<string, unknown> : data;
+    } catch (error) {
+      if (write && error instanceof CommandTimeoutError) throw new WecomActionUnknownError(action);
+      throw error;
+    }
   } finally {
     if (outputDirectory) await rm(outputDirectory, { recursive: true, force: true });
+  }
+}
+
+export class WecomActionUnknownError extends Error {
+  constructor(readonly action: string) {
+    super(`${action} 已提交但执行超时，企业微信中的最终结果未知`);
+    this.name = "WecomActionUnknownError";
   }
 }
 
@@ -577,14 +589,21 @@ export async function sendWecomReply(groupId: string, content: string, runner: C
 export function startWecomChannel(
   credentials: { botId: string; secret: string },
   handle: (event: IncomingWecomEvent, reply: Reply) => Promise<void>,
+  onConnectionEvent?: (event: "connected" | "authenticated" | "disconnected" | "reconnecting" | "activity", attempt?: number) => void,
 ): WSClient {
   const client = new WSClient({
     botId: credentials.botId,
     secret: credentials.secret,
+    maxReconnectAttempts: -1,
     logger: { debug() {}, info() {}, warn() {}, error() {} },
   });
   const dispatch = createWecomMessageDispatcher(handle);
+  client.on("connected", () => onConnectionEvent?.("connected"));
+  client.on("authenticated", () => onConnectionEvent?.("authenticated"));
+  client.on("disconnected", () => onConnectionEvent?.("disconnected"));
+  client.on("reconnecting", (attempt) => onConnectionEvent?.("reconnecting", attempt));
   client.on("message", (frame) => {
+    onConnectionEvent?.("activity");
     const streamId = generateReqId("threadferry");
     const reply: Reply = (content, finish = true) => client.replyStream(frame, streamId, content, finish).then(() => undefined);
     const body = frame.body;
@@ -596,6 +615,7 @@ export function startWecomChannel(
     });
   });
   client.on("event", (frame) => {
+    onConnectionEvent?.("activity");
     const event = standardizeAuthChange(frame);
     if (!event) return;
     const reply: Reply = (content) => pushWecomMessage(client, event.message.senderId, content);

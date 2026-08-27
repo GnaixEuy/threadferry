@@ -560,7 +560,7 @@ export class ThreadFerryState {
     });
   }
 
-  async queueDelivery(identity: string, chatId: string, content: string, agent: string): Promise<string> {
+  async queueDelivery(identity: string, chatId: string, content: string, agent: string, active = true): Promise<string> {
     return this.exclusive(async () => {
       if (!validString(identity, 512) || !validString(chatId, 512) || !validString(agent, 128)
         || !validString(content, MAX_MESSAGE_CHARS) || Buffer.byteLength(content) > MAX_REPLY_BYTES) {
@@ -571,13 +571,13 @@ export class ThreadFerryState {
       if (this.data.outbox.some((delivery) => delivery.id === id)) return id;
       if (this.data.outbox.length >= MAX_PENDING) throw new Error("ThreadFerry 待发送队列已满");
       const now = new Date().toISOString();
-      this.data.outbox.push({ id, groupId: chatId, content, agent, proactive: true, attempts: 0, createdAt: now, updatedAt: now });
+      this.data.outbox.push({ id, groupId: chatId, content, agent, ...(active ? { proactive: true as const } : {}), attempts: 0, createdAt: now, updatedAt: now });
       await this.save();
       return id;
     });
   }
 
-  async deliveryFailed(id: string, errorId: string): Promise<void> {
+  async deliveryFailed(id: string, errorId: string, activate = false): Promise<void> {
     await this.exclusive(async () => {
       if (!DIGEST.test(id) || !ERROR_ID.test(errorId)) throw new Error("投递状态标识无效");
       await this.load();
@@ -586,6 +586,7 @@ export class ThreadFerryState {
       delivery.attempts += 1;
       delivery.updatedAt = new Date().toISOString();
       delivery.errorId = errorId;
+      if (activate) delivery.proactive = true;
       await this.save();
     });
   }

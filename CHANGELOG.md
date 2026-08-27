@@ -4,6 +4,49 @@ ThreadFerry 的每个 GitHub Release 都使用这里对应版本的内容，不�
 
 ## Unreleased
 
+## 0.28.0
+
+升级企业微信官方 CLI 与 Agent Skill 契约，使用最新统一 Skill，并让已有安装自动跨过旧版本门槛。
+
+### 主要变化
+
+- ThreadFerry 要求并安装 `@wecom/cli 1.2.0`，获得远程命令文档、服务别名解析和 multipart 上传在 token
+  刷新后的安全重放能力；Broker 继续只接受规范 service 名，保持审计结果唯一。
+- 官方 Agent Skill 安装源从 14 个 `WeComTeam/wecom-cli` 分散 Skill 切换到
+  `WecomTeam/wecom-unified`；Runtime、动作提议、doctor 和安装锁校验统一使用 `wecom-unified`。
+- 接入统一 Skill 中更新的会议室、邮件、智能文档和智能表格流程，包括会议室查询、描述性 SQL 查询、
+  表格样式及官方模板路由；宿主原有凭据隔离、Owner 确认和本地路径拒绝边界保持不变。
+
+### 安装与升级
+
+升级后运行 `threadferry skills install`，把旧的分散 Skills 替换为官方 `wecom-unified`。安装器会把
+低于 1.2.0 的 `wecom-cli` 升级到 1.2.0；现有机器人凭据无需重新授权。
+
+```sh
+threadferry skills install
+threadferry doctor
+```
+
+[查看 v0.26.14...v0.28.0 的完整变更](https://github.com/GnaixEuy/threadferry/compare/v0.26.14...v0.28.0)
+
+## 0.27.0
+
+增强企业微信写操作、确认回执和机器人长连接的可靠性，避免超时后重复写入，并让断线状态可以直接观察。
+
+### 主要变化
+
+- 写操作通过 dry-run 后，若真实调用超时，会明确标记为“最终状态未知”，记录 `action.unknown` Activity，且不会自动重试；用户需先查询或回读目标数据。
+- Owner 确认执行后的群回执会先进入持久 Outbox；即时投递失败时保留结果并自动补发，重启后也可恢复。
+- 企业微信长连接使用官方 SDK 的原生无限网络重连；认证失败仍保留有限重试，避免错误凭据持续请求。
+- 管理台显示各 Agent 的长连接状态、重连次数、状态更新时间和最后回调时间，概览显示当前在线连接数量。
+
+### 安装与升级
+
+升级并重新启动 ThreadFerry 即可；现有配置、机器人凭据、Workspace、Runtime Session、群聊授权、
+提醒、协作任务和本机历史均无需迁移。
+
+[查看 v0.26.14...v0.27.0 的完整变更](https://github.com/GnaixEuy/threadferry/compare/v0.26.14...v0.27.0)
+
 ## 0.26.14
 
 修复企业微信动作错误误报成功、历史附件异常时遗留临时文件，以及群回执失败后的错误提示。

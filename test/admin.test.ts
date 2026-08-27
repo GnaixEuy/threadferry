@@ -69,7 +69,7 @@ test("localhost admin manages agents, groups, and users with CSRF protection", a
       ? [{ id: "group", name: "AI Coding", hasBotSession: true }, { id: "new-group", name: "新群" }]
       : [],
     botStatus: async (agentId) => agentId === "default"
-      ? { authorized: true, botId: "aib-default", botName: "默认助手", ownerName: "苏粤翔", org: "月相工作室" }
+      ? { authorized: true, botId: "aib-default", botName: "默认助手", ownerName: "苏粤翔", org: "月相工作室", connection: { state: "connected", changedAt: now, lastEventAt: now } }
       : { authorized: false, hint: `请执行 threadferry agent login ${agentId}` },
     authorizeBot: async (agentId, authorization) => {
       authCalls.push({ agentId, ...authorization });
@@ -123,6 +123,7 @@ test("localhost admin manages agents, groups, and users with CSRF protection", a
   assert.match(overview, /等待首次 @/);
   assert.match(overview, /新群/);
   assert.match(overview, /排队 \/ 运行中/);
+  assert.match(overview, /长连接在线/);
   assert.match(overview, /近 7 天处理趋势/);
   assert.match(overview, /任务状态分布/);
   assert.match(overview, /class="chart-bar failed"/);
@@ -140,6 +141,7 @@ test("localhost admin manages agents, groups, and users with CSRF protection", a
   assert.match(agentsPage, /AI Coding/);
   assert.match(agentsPage, /Claude Code/);
   assert.match(agentsPage, /Grok Build/);
+  assert.match(agentsPage, /长连接[\s\S]*在线[\s\S]*最后回调/);
   // 添加表单只在对话框里，页面上只留一个按钮；默认关着。
   assert.match(agentsPage, /data-dialog="add-agent"/);
   assert.match(agentsPage, /<dialog id="add-agent" class="modal"/);

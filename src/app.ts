@@ -5,6 +5,7 @@ import { decideAction } from "./action-policy.js";
 import { authorize } from "./authorization.js";
 import { buildContext } from "./context-builder.js";
 import { resolveDirectoryUser } from "./directory.js";
+import { WecomActionUnknownError } from "./channels/wecom.js";
 import { newErrorId, sessionScope, ThreadFerryState, type FailurePhase } from "./state.js";
 import { extractAction, prepareAction, type PreparedAction } from "./actions.js";
 import type { AgentView, AttachmentResource, DirectoryUser, GroupMessage, HistoryChatType, HistoryQuery, IncomingDirectMessage, IncomingMention, Reply, RuntimeRequest, RuntimeResult } from "./types.js";
@@ -166,6 +167,29 @@ export function createApp(config: AgentView, dependencies: AppDependencies, stat
   let accessTail = Promise.resolve();
   let shuttingDown = false;
 
+  async function deliverGroupReceipt(identity: string, groupId: string, content: string): Promise<{ status: "sent" | "queued" | "failed"; errorId?: string }> {
+    const agent = selfAgent() ?? "unknown";
+    let deliveryId: string | undefined;
+    try {
+      // 先持久化以覆盖进程崩溃，但即时发送期间不让周期调度器并发抢发；失败后再激活自动补发。
+      deliveryId = await state.queueDelivery(identity, groupId, limitUtf8(content), agent, false);
+    } catch {
+      // 队列不可用时仍尝试即时投递，避免状态存储故障扩大成必然丢消息。
+    }
+    try {
+      if (!dependencies.notifyGroup) throw new Error("当前启动方式不支持群回执");
+      await dependencies.notifyGroup(groupId, content);
+      if (deliveryId) await state.completeDelivery(deliveryId);
+      return { status: "sent" };
+    } catch (error) {
+      const errorId = newErrorId();
+      if (deliveryId) await state.deliveryFailed(deliveryId, errorId, true).catch(() => undefined);
+      const reason = failureReason(error);
+      dependencies.onError?.({ errorId, phase: "reply", ...(reason ? { reason } : {}) });
+      return { status: deliveryId ? "queued" : "failed", errorId };
+    }
+  }
+
   function internalRequest(prepared: PreparedAction): Record<string, unknown> {
     const jsonIndex = prepared.command.indexOf("--json");
     if (jsonIndex < 0 || !prepared.command[jsonIndex + 1]) throw new Error("内部动作参数无效");
@@ -256,7 +280,12 @@ export function createApp(config: AgentView, dependencies: AppDependencies, stat
       await state.recordActivity({ agent: agentId, type: `action.${prepared.mode}`, outcome: "success", resource: prepared.resource }).catch(() => undefined);
       return result;
     } catch (error) {
-      await state.recordActivity({ agent: agentId, type: `action.${prepared.mode}`, outcome: "failure", resource: prepared.resource }).catch(() => undefined);
+      await state.recordActivity({
+        agent: agentId,
+        type: error instanceof WecomActionUnknownError ? "action.unknown" : `action.${prepared.mode}`,
+        outcome: error instanceof WecomActionUnknownError ? "info" : "failure",
+        resource: prepared.resource,
+      }).catch(() => undefined);
       throw error;
     }
   }
@@ -369,6 +398,11 @@ export function createApp(config: AgentView, dependencies: AppDependencies, stat
         const errorId = newErrorId();
         const reason = failureReason(error);
         dependencies.onError?.({ errorId, phase: "host", ...(reason ? { reason } : {}) });
+        if (error instanceof WecomActionUnknownError) {
+          const warning = `操作请求已提交，但等待企业微信结果时超时，最终状态未知（错误编号 ${errorId}）。ThreadFerry 不会自动重试，请先查询或回读目标数据，避免重复创建或发送。`;
+          const text = `${extracted.reply ? `${extracted.reply}\n\n` : ""}${warning}`;
+          return { text, ...(sessionId ? { sessionId } : {}) };
+        }
         const failure = prepared.mode === "read"
           ? withReason("查询失败。", reason, "direct")
           : groupId
@@ -572,6 +606,19 @@ export function createApp(config: AgentView, dependencies: AppDependencies, stat
           result = await executePreparedAction(pending.prepared, true, message.senderId, pending.groupId);
         } catch (error) {
           const reason = failureReason(error);
+          if (error instanceof WecomActionUnknownError) {
+            const errorId = newErrorId();
+            dependencies.onError?.({ errorId, phase: "host", ...(reason ? { reason } : {}) });
+            const content = `操作请求已提交，但等待企业微信结果时超时，最终状态未知（错误编号 ${errorId}）。ThreadFerry 不会自动重试，请先查询或回读目标数据，避免重复创建或发送。`;
+            if (!pending.groupId) return respond(reply, content);
+            const receipt = await deliverGroupReceipt(`confirmation:${selfAgent() ?? "unknown"}:${code}:${pending.prepared.resource}`, pending.groupId, content);
+            const delivery = receipt.status === "sent"
+              ? "该状态已回执原群。"
+              : receipt.status === "queued"
+                ? `原群回执已加入补发队列（错误编号 ${receipt.errorId}）。`
+                : `原群回执失败且未能加入补发队列（错误编号 ${receipt.errorId}）。`;
+            return respond(reply, `${content}\n\n${delivery}`);
+          }
           return respond(reply, withReason("动作执行失败。", reason, "direct"));
         }
         let content = `已执行：\n${pending.prepared.summary}`;
@@ -594,16 +641,10 @@ export function createApp(config: AgentView, dependencies: AppDependencies, stat
           }
         }
         if (!pending.groupId) return respond(reply, content);
-        try {
-          if (!dependencies.notifyGroup) throw new Error("当前启动方式不支持群回执");
-          await dependencies.notifyGroup(pending.groupId, content);
-          return respond(reply, `已确认执行，结果已回执原群。\n\n${content}`);
-        } catch (error) {
-          const errorId = newErrorId();
-          const reason = failureReason(error);
-          dependencies.onError?.({ errorId, phase: "reply", ...(reason ? { reason } : {}) });
-          return respond(reply, `已确认执行，但结果回执原群失败（错误编号 ${errorId}）。\n\n${content}`);
-        }
+        const receipt = await deliverGroupReceipt(`confirmation:${selfAgent() ?? "unknown"}:${code}:${pending.prepared.resource}`, pending.groupId, content);
+        if (receipt.status === "sent") return respond(reply, `已确认执行，结果已回执原群。\n\n${content}`);
+        if (receipt.status === "queued") return respond(reply, `已确认执行，结果已加入原群补发队列（错误编号 ${receipt.errorId}）。\n\n${content}`);
+        return respond(reply, `已确认执行，但结果回执原群失败且未能加入补发队列（错误编号 ${receipt.errorId}）。\n\n${content}`);
       });
     }
     if (command.name === "agents") {

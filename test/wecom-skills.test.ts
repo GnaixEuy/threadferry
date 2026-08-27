@@ -15,6 +15,11 @@ async function writeSkills(root: string, source = OFFICIAL_WECOM_SKILLS_SOURCE):
   await Promise.all(OFFICIAL_WECOM_SKILLS.map(async (name) => {
     const directory = join(root, name);
     await mkdir(directory, { recursive: true });
+    const references = join(directory, "references");
+    await mkdir(references, { recursive: true });
+    for (const domain of ["calendar", "contact", "disk", "doc-manage", "doc", "email", "media", "meeting", "message", "sheet", "smartpage", "smartsheet", "todo"]) {
+      await writeFile(join(references, `wecomcli-${domain}.md`), `# ${domain}\n`, "utf8");
+    }
     await writeFile(join(directory, "SKILL.md"), `---\nname: ${name}\ndescription: official ${name}\n---\n`, "utf8");
   }));
   await writeFile(join(dirname(root), ".skill-lock.json"), JSON.stringify({
@@ -35,6 +40,8 @@ test("official WeCom Skills require every canonical Skill and official provenanc
   assert.equal(await officialWecomSkillsInstalled(root), false);
   await writeSkills(root);
   assert.equal(await officialWecomSkillsInstalled(root), true);
+  await rm(join(root, "wecom-unified", "references", "wecomcli-todo.md"));
+  assert.equal(await officialWecomSkillsInstalled(root), false);
 });
 
 test("Skill installer uses the official package and verifies the result", async (t) => {
