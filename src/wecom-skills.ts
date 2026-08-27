@@ -1,15 +1,16 @@
-import { readFile } from "node:fs/promises";
+import { readFile, readdir } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { runCommand } from "./process.js";
 import type { CommandRunner } from "./types.js";
 
-export const OFFICIAL_WECOM_SKILLS_SOURCE = "WeComTeam/wecom-cli";
-export const OFFICIAL_WECOM_SKILLS = [
-  "wecomcli-shared", "wecomcli-contact", "wecomcli-calendar", "wecomcli-meeting",
-  "wecomcli-todo", "wecomcli-email", "wecomcli-disk", "wecomcli-media",
-  "wecomcli-message", "wecomcli-doc-manage", "wecomcli-doc", "wecomcli-sheet",
-  "wecomcli-smartsheet", "wecomcli-smartpage",
+export const OFFICIAL_WECOM_SKILLS_SOURCE = "WecomTeam/wecom-unified";
+export const OFFICIAL_WECOM_SKILLS = ["wecom-unified"] as const;
+const OFFICIAL_WECOM_REFERENCES = [
+  "wecomcli-calendar.md", "wecomcli-contact.md", "wecomcli-disk.md", "wecomcli-doc-manage.md",
+  "wecomcli-doc.md", "wecomcli-email.md", "wecomcli-media.md", "wecomcli-meeting.md",
+  "wecomcli-message.md", "wecomcli-sheet.md", "wecomcli-smartpage.md", "wecomcli-smartsheet.md",
+  "wecomcli-todo.md",
 ] as const;
 
 export function officialWecomSkillsRoot(): string {
@@ -37,6 +38,8 @@ export async function officialWecomSkillsInstalled(root = officialWecomSkillsRoo
       || !/^[a-f0-9]{40}$/.test(entry.skillFolderHash)) return false;
     try {
       const skill = await readFile(join(root, name, "SKILL.md"), "utf8");
+      const references = new Set(await readdir(join(root, name, "references")));
+      if (!OFFICIAL_WECOM_REFERENCES.every((reference) => references.has(reference))) return false;
       return new RegExp(`^name:\\s*${name}\\s*$`, "m").test(skill) && /^description:\s*\S/m.test(skill);
     } catch {
       return false;
@@ -50,5 +53,5 @@ export async function installOfficialWecomSkills(
   root = officialWecomSkillsRoot(),
 ): Promise<void> {
   await runner("npx", ["--yes", "skills", "add", OFFICIAL_WECOM_SKILLS_SOURCE, "-y", "-g"], { timeoutMs: 5 * 60_000 });
-  if (!await officialWecomSkillsInstalled(root)) throw new Error("官方企业微信 Skills 安装不完整，请重新运行 threadferry skills install");
+  if (!await officialWecomSkillsInstalled(root)) throw new Error("官方企业微信 Skill 安装不完整，请重新运行 threadferry skills install");
 }

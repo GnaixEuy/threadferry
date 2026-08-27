@@ -9,7 +9,7 @@ import { addAgent, ensureGroupAccess, resolveWorkspace } from "./config.js";
 import { resolveDirectoryUser } from "./directory.js";
 import { sessionScope, type StateSnapshot } from "./state.js";
 import { isRuntimeName } from "./types.js";
-import type { DirectoryUser, GroupAccess, GroupBinding, RuntimeName, ThreadFerryConfig } from "./types.js";
+import type { AgentConnectionHealth, DirectoryUser, GroupAccess, GroupBinding, RuntimeName, ThreadFerryConfig } from "./types.js";
 
 export type ConfigUpdater = (change: (latest: ThreadFerryConfig) => void | Promise<void>) => Promise<void>;
 
@@ -27,6 +27,7 @@ export interface AgentBotStatus {
   ownerName?: string;
   /** Owner 的顶层部门。企业微信不提供「机器人属于哪个企业」的查询，这是最接近的可得信息。 */
   org?: string;
+  connection?: AgentConnectionHealth;
 }
 
 export interface AdminDependencies {
@@ -566,6 +567,7 @@ async function overviewPage(config: ThreadFerryConfig, dependencies: AdminDepend
   const workItems = (snapshot?.workItems ?? []).filter((item) => item.status !== "completed" && item.status !== "failed");
   const activities = (snapshot?.activities ?? []).slice(-20).reverse();
   const authorized = [...botStatuses.values()].filter((status) => status.authorized).length;
+  const connected = [...botStatuses.values()].filter((status) => status.connection?.state === "connected").length;
   const directSession = snapshot?.sessions.some((session) => Object.entries(config.agents).some(([agentId, agent]) =>
     session.group === createHash("sha256").update(`direct:${agent.ownerUser}`).digest("hex")
       && session.workspace === createHash("sha256").update(sessionScope(agentId, agent)).digest("hex"))) ?? false;
@@ -580,6 +582,7 @@ async function overviewPage(config: ThreadFerryConfig, dependencies: AdminDepend
   </details>`;
   const stats: Array<[string, string, string]> = [
     [String(Object.keys(config.agents).length), "机器人", "/agents"],
+    [String(connected), "长连接在线", "/agents"],
     [String(activeGroups), "可用群", "/groups"],
     [String(disabledGroups), "已停用群", "/groups"],
     [String(waiting.length), "等待首次 @", "/groups"],
@@ -753,6 +756,10 @@ async function agentsPage(config: ThreadFerryConfig, dependencies: AdminDependen
       : bot.authorized
         ? `<p>机器人 ${bot.botName && bot.botName !== id ? `<b>${html(bot.botName)}</b> ` : ""}<span class="badge ok">已授权</span> <code>${html(bot.botId ?? "")}</code></p>`
         : `<p>机器人 <span class="badge warning">未授权</span></p><p class="muted">${html(bot.hint ?? `在终端执行 threadferry agent login ${id}`)}</p>`;
+    const connection = bot?.connection;
+    const connectionLine = connection
+      ? `<p>长连接 <span class="badge ${connection.state === "connected" ? "ok" : "warning"}">${html(connection.state === "connected" ? "在线" : connection.state === "connecting" ? "连接中" : connection.state === "reconnecting" ? `重连中${connection.reconnectAttempt ? ` · 第 ${connection.reconnectAttempt} 次` : ""}` : "已断开")}</span> <small class="muted">状态更新 ${html(connection.changedAt)}${connection.lastEventAt ? ` · 最后回调 ${html(connection.lastEventAt)}` : ""}</small></p>`
+      : "";
     const dialogId = `auth-bot-${index}`;
     const authOpen = openAuth === id;
     authDialogs.push(botAuthDialog(token, dialogId, id, authOpen, authOpen ? error : undefined));
@@ -761,6 +768,7 @@ async function agentsPage(config: ThreadFerryConfig, dependencies: AdminDependen
       <div class="row"><h3>${html(id)}</h3><span>${bot?.org ? `<span class="badge org">${html(bot.org)}</span> ` : ""}<span class="badge">${html(agent.runtime)}</span></span></div>
       <p>${html(agent.model ?? "默认模型")}</p><code>${html(agent.workspace)}</code>
       ${botLine}
+      ${connectionLine}
       <p>Owner ${bot?.ownerName ? `<b>${html(bot.ownerName)}</b> ` : ""}<code>${html(agent.ownerUser)}</code></p>
       <h4>接入群</h4>
       ${bound.length

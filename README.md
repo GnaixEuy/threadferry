@@ -26,10 +26,11 @@ authorized members can invoke the bot by mentioning it in configured groups.
 - Analyze direct messages and controlled group context without granting the runtime file writes or
   arbitrary shell access.
 - Read images and UTF-8 text attachments, including quoted and recent chat resources.
-- Use official `wecomcli-*` Skills for calendars, meetings, todos, mail, documents, storage, sheets,
-  and smart sheets through a validated `wecom-cli` broker.
+- Use the official `wecom-unified` Skill for contacts, calendars, meetings and rooms, todos, mail,
+  messages, documents, storage, sheets, smart sheets, and smart pages through a validated `wecom-cli` broker.
 - Create reminders and hand work to another agent owned by the same person.
 - Recover sessions, queued work, and undelivered replies after restart.
+- Keep WeCom connections reconnecting and show each agent's connection and last-callback status in the local console.
 
 ## Install
 
@@ -39,7 +40,7 @@ Requirements:
 - Node.js 22+
 - A WeCom AI bot
 - One runtime: Codex CLI `0.138.0+`, Pi CLI `0.84.2+`, Claude Code `2.1.233+`, or Grok Build `1.0.5+`
-- Official `wecom-cli 1.1.0+` (the installer adds it when needed)
+- Official `wecom-cli 1.2.0+` (the installer adds the tested 1.2.0 release when needed)
 
 macOS or Linux:
 
@@ -52,6 +53,16 @@ Windows PowerShell:
 ```powershell
 irm https://raw.githubusercontent.com/GnaixEuy/threadferry/main/install.ps1 | iex
 ```
+
+After upgrading an existing installation, run:
+
+```sh
+threadferry skills install
+threadferry doctor
+```
+
+This replaces the legacy split `wecomcli-*` Skills with the official `WecomTeam/wecom-unified` Skill
+and verifies `wecom-cli 1.2.0+`. Existing per-agent bot credentials do not need reauthorization.
 
 After installing the CLI and completing first-time setup, download the desktop app for everyday use
 from [GitHub Releases](https://github.com/GnaixEuy/threadferry/releases/latest): the arm64 DMG for
@@ -67,7 +78,7 @@ Run the onboarding wizard in an interactive terminal:
 threadferry onboard
 ```
 
-The wizard installs the official WeCom Skills, authorizes the bot, identifies its Owner, selects a
+The wizard installs the official WeCom Skill, authorizes the bot, identifies its Owner, selects a
 runtime and workspace, runs diagnostics, and starts ThreadFerry.
 
 After that, open the ThreadFerry desktop app. It starts configured agents automatically. Its menu-bar
@@ -119,14 +130,19 @@ Create a 30-minute review meeting tomorrow at 10:00.
 Append these rows to the project smart sheet.
 ```
 
-The agent follows the matching official WeCom Skill to select the capability, clarify missing input,
-build the current CLI command, and interpret the result. ThreadFerry validates the Skill-to-command
-mapping, command shape, identity, conversation boundary, requested effect, and confirmation policy,
-then runs the command with that agent's own `wecom-cli` credentials. Results return to the same agent.
+The agent follows the official `wecom-unified` Skill and its business-domain references to select the
+capability, clarify missing input, build the current CLI command, and interpret the result. ThreadFerry
+validates the Skill source, command shape, identity, conversation boundary, requested effect, and
+confirmation policy, then runs the command with that agent's own `wecom-cli` credentials. Results return
+to the same agent.
 
 Queries run only in Owner direct chat. Every write receives a local `--dry-run` validation first.
 Destructive operations, overwrites, completing todos, sending messages, and sending mail require a
 fresh Owner confirmation code.
+
+If a submitted write times out while waiting for its result, ThreadFerry reports the final state as unknown and never retries
+automatically. Query the target data before deciding whether to run it again. Group receipts from confirmed actions are stored
+in the durable delivery queue, so a failed immediate delivery can be retried after reconnect or restart.
 
 ### Images and files
 

@@ -1,6 +1,6 @@
 # ThreadFerry 企业微信能力指南
 
-兼容基线：`@wecom/cli 1.1.0+`
+兼容基线：`@wecom/cli 1.2.0+`、`WecomTeam/wecom-unified`
 
 适用范围：ThreadFerry 的企业微信 Skill、CLI 调用、权限控制、凭据隔离、开发与故障排查。
 
@@ -8,41 +8,49 @@
 
 企业微信能力使用以下契约：
 
-1. 官方 `wecomcli-*` Skills 定义业务路由、信息补齐、交互和确认规则。
+1. 官方 `wecom-unified` Skill 及其 `references/` 定义业务路由、信息补齐、交互和确认规则。
 2. 目标 Agent 凭据目录下的 `wecom-cli --doc`、`--schema` 和 `--help` 定义可执行命令。
 3. ThreadFerry Broker 定义允许的服务、参数、会话和操作影响。
 
 官方来源：
 
 - [WeComTeam/wecom-cli](https://github.com/WecomTeam/wecom-cli)
+- [WecomTeam/wecom-unified](https://github.com/WecomTeam/wecom-unified)
 - [@wecom/cli](https://www.npmjs.com/package/@wecom/cli)
 
-安装或更新官方 Skills：
+安装或更新官方 Skill：
 
 ```sh
 threadferry skills install
 ```
 
-安装源固定为 `WeComTeam/wecom-cli`。`~/.agents/skills` 中应包含：
+ThreadFerry 内部使用官方推荐的 Agent Skill 安装方式：
 
-```text
-wecomcli-shared
-wecomcli-contact
-wecomcli-calendar
-wecomcli-meeting
-wecomcli-todo
-wecomcli-email
-wecomcli-disk
-wecomcli-media
-wecomcli-message
-wecomcli-doc-manage
-wecomcli-doc
-wecomcli-sheet
-wecomcli-smartsheet
-wecomcli-smartpage
+```sh
+npx skills add WecomTeam/wecom-unified -y -g
 ```
 
-`threadferry doctor` 会校验 14 个目录、`SKILL.md` 元数据和 `.agents/.skill-lock.json` 中的官方来源。
+已有安装升级到当前基线后执行：
+
+```sh
+npm install --global @wecom/cli@1.2.0
+threadferry skills install
+threadferry doctor
+```
+
+升级 CLI 和 Skill 不会改写各 Agent 的 `WECOM_CLI_CONFIG_DIR`，无需重新授权机器人。
+
+安装源固定为 `WecomTeam/wecom-unified`。`~/.agents/skills` 中应包含：
+
+```text
+wecom-unified/
+  SKILL.md
+  references/
+  scripts/
+```
+
+`threadferry doctor` 会校验该目录、`SKILL.md` 元数据和 `.agents/.skill-lock.json` 中的官方来源。
+旧 `wecomcli-*` 目录不再属于 ThreadFerry 的运行契约；可由用户自行清理，不影响新 Skill 的安装校验。
 
 ## 2. Agent 与凭据隔离
 
@@ -78,22 +86,24 @@ WECOM_CLI_CONFIG_DIR="$AGENT_CONFIG_DIR" wecom-cli identity whoami --json '{}'
 
 ## 3. Skill 与服务映射
 
-| Skill | CLI 服务 | 主要能力 |
+所有业务动作的 `skill` 都固定为 `wecom-unified`。Skill 主文件先选择业务域，再要求 Runtime 完整读取
+对应 reference；Broker 继续按 CLI service 白名单和命令形状校验，不把 reference 名当成执行权限。
+
+| 业务 reference | CLI 服务 | 主要能力 |
 | --- | --- | --- |
-| `wecomcli-shared` | 公共规则 | 身份、时间、分页、确认和错误处理 |
-| `wecomcli-contact` | `contact` | 搜索当前身份可见的通讯录成员 |
-| `wecomcli-calendar` | `calendar` | 日程查询、创建、更新、取消和空闲时间 |
-| `wecomcli-meeting` | `meeting` | 会议、会议室和会议转写原文 |
-| `wecomcli-todo` | `todo` | 待办查询、创建、更新、完成和删除 |
-| `wecomcli-email` | `mail` | 邮件读取、搜索、发送、回复和转发 |
-| `wecomcli-disk` | `disk` | 微盘文件和文件夹管理 |
-| `wecomcli-media` | `media` | 媒体上传和下载 |
-| `wecomcli-message` | `chat`、`message` | 会话、消息、机器人会话和消息附件 |
-| `wecomcli-doc-manage` | `doc` 与文档路由 | 文档类型识别、搜索、成员、标题和加入规则 |
-| `wecomcli-doc` | `doc` | 在线文档创建、导入和内容读写 |
-| `wecomcli-sheet` | `sheet` | 在线表格、范围、行和子表管理 |
-| `wecomcli-smartsheet` | `smartsheet` | 智能表格结构、字段、记录、视图和图表 |
-| `wecomcli-smartpage` | `smartpage` | 智能文档页面、Block、数据表和附件 |
+| `wecomcli-contact.md` | `contact` | 搜索当前身份可见的通讯录成员 |
+| `wecomcli-calendar.md` | `calendar` | 日程和共同空闲时间 |
+| `wecomcli-meeting.md` | `meeting` | 在线会议、办公楼、会议室、纪要和转写原文 |
+| `wecomcli-todo.md` | `todo` | 待办查询、创建、更新、完成和删除 |
+| `wecomcli-email.md` | `mail` | 邮件读取、搜索、发送、回复和转发 |
+| `wecomcli-disk.md` | `disk` | 微盘文件和文件夹管理 |
+| `wecomcli-media.md` | `media` | 媒体上传和下载 |
+| `wecomcli-message.md` | `chat`、`message` | 会话、消息、机器人会话和消息附件 |
+| `wecomcli-doc-manage.md` | `doc` | 文档搜索、成员、标题和加入规则 |
+| `wecomcli-doc.md` | `doc` | 在线文档创建、导入和内容读写 |
+| `wecomcli-sheet.md` | `sheet` | 在线表格、范围、行和子表管理 |
+| `wecomcli-smartsheet.md` | `smartsheet` | 智能表格结构、记录、SQL、样式、视图、图表和模板 |
+| `wecomcli-smartpage.md` | `smartpage` | 智能文档页面、Block、表单、数据看板和附件 |
 
 `auth` 和 `identity` 由 ThreadFerry 的授权与诊断流程使用，不属于 Runtime 可提议的业务服务。
 
@@ -137,7 +147,7 @@ Agent 完整读取对应官方 Skill 及其为当前操作指定的 reference，
 ```threadferry-action
 {
   "action": "wecom-cli",
-  "skill": "wecomcli-meeting",
+  "skill": "wecom-unified",
   "user_intent": "explicit",
   "command": [
     "meeting",
@@ -152,7 +162,7 @@ Agent 完整读取对应官方 Skill 及其为当前操作指定的 reference，
 字段规则：
 
 - `action` 固定为 `wecom-cli`。
-- `skill` 必须与 `command` 的 service 和资源路径对应。
+- `skill` 固定为 `wecom-unified`。
 - `user_intent` 仅在当前用户消息明确要求执行时使用 `explicit`；信息不完整时使用 `confirm`。
 - `command` 是不含 `wecom-cli` 可执行文件名的参数数组。
 - `summary` 必须包含目标、时间、对象和影响，便于用户核对。
@@ -167,6 +177,8 @@ Broker 校验并执行以下步骤：
 6. 将结果作为不可信业务数据返回同一 Agent，由原 Skill 解释并回复用户。
 
 同一轮最多执行一个最终写操作。写入完成后，Agent 只能整理结果，不得继续提交动作。
+真实写调用超时时，Broker 将结果标记为“最终状态未知”且不自动重试；用户必须先通过对应 Skill 查询或
+回读目标数据。Owner 确认后的群回执先写入持久 Outbox，即时投递失败时由原 Agent 自动补发。
 
 ## 6. 授权规则
 
@@ -194,11 +206,15 @@ Broker 校验并执行以下步骤：
 | `doc` | `create`、`import`、`search`、内容读写、成员、标题和加入规则 |
 | `sheet` | `create`、`get`、`import`、范围读写、追加行和子表管理 |
 | `smartpage` | `create`、`import`、Block、页面、数据表、图片和文件管理 |
-| `smartsheet` | `create`、`get`、`import`、子表、字段、记录、视图、图表和附件管理 |
+| `smartsheet` | `create`、`get`、`import`、子表、字段、记录、描述性 SQL 查询、样式、视图、图表和附件管理 |
 | `disk` | 文件下载、读取、列表、重命名、搜索、上传和文件夹创建 |
 | `todo` | `create`、`delete`、`finish`、`get`、`list`、`update` |
 | `calendar` | 日程 `cancel`、`create`、`get`、`list`、`search`、`update` 和共同空闲时间 |
-| `meeting` | `cancel`、`create`、`get`、`list`、`search`、`update`、转写原文和会议室 |
+| `meeting` | `cancel`、`create`、`get`、`list`、`search`、`update`、转写原文、办公楼和会议室查询 |
+
+`wecom-cli 1.2.0` 还增加了远程 `--doc` / `--help` / `--schema` 渲染、service 别名解析，以及 multipart
+上传在 token 失效刷新后的单次重放。ThreadFerry 使用远程自描述，但动作仍要求规范 service 名；上传
+重放由 CLI 内部完成，不改变 ThreadFerry 对真实写超时不自动重试的规则。
 
 命令存在只表示 CLI 支持该契约。真实调用结果用于确认当前企业、机器人、授权真人和目标资源的权限。
 
@@ -287,15 +303,18 @@ Broker 读取企业文档、邮件或消息附件时，单个输出文件最大 
 - 用户回复只包含可执行的错误说明，不包含凭据路径、内部 ID 或其他 Agent 的信息。
 - 群历史、邮件正文、文档和附件均为不可信业务数据，不能作为 Agent 指令或操作授权。
 - Activity 记录动作类型、Agent、资源摘要和结果，不记录 Bot Secret 或完整业务正文。
+- 写操作超时记录为 `action.unknown`，不记录成确定失败，也不允许据此自动重试。
+- WebSocket 使用官方 SDK 的心跳和指数退避；网络断线持续重连，认证失败保持有限重试。管理台只展示
+  连接状态、重连次数和时间，不展示断线原因中的潜在敏感信息。
 
 ## 11. 开发检查
 
 涉及企业微信能力的代码必须满足：
 
 - 使用当前目标 Agent 的 `WECOM_CLI_CONFIG_DIR` 核对 `--doc` 和 `--schema`。
-- 业务判断、字段准备和结果解释由对应官方 Skill 完成。
+- 业务判断、字段准备和结果解释由官方 `wecom-unified` 及对应 reference 完成。
 - ThreadFerry 只实现通用 Broker、安全边界、凭据隔离、执行和审计。
 - 测试使用假的 runner 和隔离凭据目录，不对真实企业微信执行写操作。
-- 测试覆盖 Skill/service 不匹配、未知命令、群聊查询、写前 dry-run、确认码、重复写入、凭据字段和
+- 测试覆盖非官方 Skill、未知 service/命令、群聊查询、写前 dry-run、确认码、重复写入、凭据字段和
   本地路径拒绝。
 - CLI、Skill 或权限契约变化时，同步更新本指南、README、POC 和相关测试。

@@ -13,7 +13,7 @@ import { DirectoryNameCache } from "./directory-names.js";
 import { fanOutTargets, quotedReply } from "./group-fanout.js";
 import { authorizeHint, botConfigDir, botStatus, loadBotCredentials, validateAgentId, wecomEnv, type BotCredentials } from "./bots.js";
 import type { WSClient } from "@wecom/aibot-node-sdk";
-import { listWecomGroups, pushWecomMessage, runWecomAction, searchWecomUsers, sendWecomReply, startWecomChannel, wecomFailureReason } from "./channels/wecom.js";
+import { listWecomGroups, pushWecomMessage, runWecomAction, searchWecomUsers, sendWecomReply, startWecomChannel, WecomActionUnknownError, wecomFailureReason } from "./channels/wecom.js";
 import {
   addAgent,
   adoptOwner,
@@ -46,12 +46,12 @@ import {
   type SetupPlan,
 } from "./setup-wizard.js";
 import { isRuntimeName, RUNTIME_NAMES } from "./types.js";
-import type { AgentView, CommandRunner, GroupMessage, IncomingMention, RuntimeName, RuntimeRequest, RuntimeResult, ThreadFerryConfig } from "./types.js";
+import type { AgentConnectionHealth, AgentView, CommandRunner, GroupMessage, IncomingMention, RuntimeName, RuntimeRequest, RuntimeResult, ThreadFerryConfig } from "./types.js";
 import { findUpdate, installUpdate } from "./update.js";
 import { installOfficialWecomSkills, officialWecomSkillsInstalled } from "./wecom-skills.js";
 import { runWorkflowTick } from "./workflow.js";
 
-const VERSION = "0.26.14";
+const VERSION = "0.28.0";
 const UPDATE_INTERVAL_MS = 6 * 60 * 60 * 1_000;
 const WORKFLOW_INTERVAL_MS = 30_000;
 interface DesktopParentPort {
@@ -244,9 +244,9 @@ async function preflightDependencies(runtimes: Set<RuntimeName>): Promise<void> 
   try {
     wecomVersion = (await runCommand("wecom-cli", ["--version"], { timeoutMs: 10_000 })).stdout;
   } catch {
-    throw new Error("找不到企业微信官方 wecom-cli 1.1.0+；请安装并加入 PATH");
+    throw new Error("找不到企业微信官方 wecom-cli 1.2.0+；请安装并加入 PATH");
   }
-  if (!atLeast(wecomVersion, [1, 1, 0])) throw new Error("ThreadFerry 要求 wecom-cli 1.1.0+");
+  if (!atLeast(wecomVersion, [1, 2, 0])) throw new Error("ThreadFerry 要求 wecom-cli 1.2.0+");
   try {
     await runCommand("wecom-cli", ["identity", "whoami", "--json", "{}"], { timeoutMs: 30_000 });
   } catch {
@@ -583,9 +583,9 @@ async function onboard(configOption?: string, timeoutMs?: number): Promise<void>
     temporaryDirs.clear();
   }
 
-  console.log("\n[4/6] 安装企业微信官方 Skills");
+  console.log("\n[4/6] 安装企业微信官方 Skill");
   await installOfficialWecomSkills();
-  console.log("官方企业微信 Skills 已安装或更新到 ~/.agents/skills。");
+  console.log("官方企业微信 Skill 已安装或更新到 ~/.agents/skills。");
 
   console.log("\n[5/6] 运行环境诊断");
   if (!(await doctor(configPath))) {
@@ -634,7 +634,7 @@ async function doctor(configPath?: string): Promise<boolean> {
   const skillsInstalled = await officialWecomSkillsInstalled();
   checks.push({
     ok: skillsInstalled,
-    message: skillsInstalled ? "企业微信官方 Skills 已安装且来源已验证" : "企业微信官方 Skills 未完整安装或来源无法验证；请执行 threadferry skills install",
+    message: skillsInstalled ? "企业微信官方 Skill 已安装且来源已验证" : "企业微信官方 Skill 未完整安装或来源无法验证；请执行 threadferry skills install",
   });
 
   const chosenConfig = resolve(configPath ?? defaultConfigPath());
@@ -682,8 +682,8 @@ async function doctor(configPath?: string): Promise<boolean> {
   let wecomAuthorized = false;
   try {
     const { stdout } = await runCommand("wecom-cli", ["--version"], { timeoutMs: 10_000 });
-    const supported = atLeast(stdout, [1, 1, 0]);
-    checks.push({ ok: supported, message: supported ? stdout.trim() : `${stdout.trim()}；ThreadFerry 要求 1.1.0+` });
+    const supported = atLeast(stdout, [1, 2, 0]);
+    checks.push({ ok: supported, message: supported ? stdout.trim() : `${stdout.trim()}；ThreadFerry 要求 1.2.0+` });
     if (probeRunner && probeAgent) {
       try {
         await probeRunner("wecom-cli", ["identity", "whoami", "--json", "{}"], { timeoutMs: 30_000 });
@@ -694,7 +694,7 @@ async function doctor(configPath?: string): Promise<boolean> {
       }
     }
   } catch {
-    checks.push({ ok: false, message: "找不到 wecom-cli；请安装企业微信官方 wecom-cli 1.1.0+ 并加入 PATH" });
+    checks.push({ ok: false, message: "找不到 wecom-cli；请安装企业微信官方 wecom-cli 1.2.0+ 并加入 PATH" });
   }
 
   const probeGroup = probeAgent
@@ -977,6 +977,10 @@ async function start(
     // 各 Agent 的连接索引。连接在下面才建立，但 app 的依赖里要先捕获这个 Map：
     // 转交回复和动作回执都优先走机器人自己的 WS 连接。
     const clients = new Map<string, WSClient>();
+    const connectionHealth = new Map<string, AgentConnectionHealth>(startup.map(({ agentId }) => [agentId, {
+      state: "connecting",
+      changedAt: new Date().toISOString(),
+    }]));
     // 每个 Agent 一套：配置视图 + 绑定自己凭据目录的 runner + 独立 app 实例 + 独立连接。
     const hosts = await Promise.all(startup.map(async ({ agentId, botId, secret, configDir }) => {
       const view = agentView(config, agentId);
@@ -1017,6 +1021,7 @@ async function start(
         try {
           return await runWecomAction(command, runner, write);
         } catch (error) {
+          if (error instanceof WecomActionUnknownError) throw error;
           throw new Error(wecomFailureReason(error));
         }
       },
@@ -1082,6 +1087,7 @@ async function start(
           authorized: status.authorized,
           ...(status.botId ? { botId: status.botId } : {}),
           ...origin,
+          ...(connectionHealth.get(agentId) ? { connection: connectionHealth.get(agentId) } : {}),
           ...(status.authorized ? {} : { hint: authorizeHint(agentId, config.agents[agentId]?.configDir) }),
         };
       },
@@ -1142,6 +1148,28 @@ async function start(
           }
         }));
       };
+      const observeConnection = (agentId: string, event: "connected" | "authenticated" | "disconnected" | "reconnecting" | "activity", attempt?: number) => {
+        const now = new Date().toISOString();
+        const current = connectionHealth.get(agentId) ?? { state: "connecting", changedAt: now };
+        if (event === "activity") {
+          connectionHealth.set(agentId, { ...current, state: "connected", lastEventAt: now });
+          return;
+        }
+        const connectionState = event === "authenticated" ? "connected" : event === "reconnecting" ? "reconnecting" : event === "disconnected" ? "disconnected" : "connecting";
+        connectionHealth.set(agentId, {
+          ...current,
+          state: connectionState,
+          changedAt: now,
+          ...(event === "reconnecting" && attempt ? { reconnectAttempt: attempt } : { reconnectAttempt: undefined }),
+        });
+        if (event === "authenticated") {
+          console.log(`[wecom] Agent ${agentId} 长连接已认证`);
+          void state.recordActivity({ agent: agentId, type: "connection.connected", outcome: "success" }).catch(() => undefined);
+        } else if (event === "disconnected") {
+          console.error(`[wecom] Agent ${agentId} 长连接已断开，SDK 将自动重连`);
+          void state.recordActivity({ agent: agentId, type: "connection.disconnected", outcome: "info" }).catch(() => undefined);
+        }
+      };
       const connections = hosts.map(({ agentId, app, credentials }) => startWecomChannel(credentials, async (event, reply) => {
         if (event.chatType === "group" && !config.groups[event.message.groupId]?.agents[agentId]) {
           await updateConfig((latest) => { ensureGroupAccess(latest, event.message.groupId, agentId); });
@@ -1154,10 +1182,10 @@ async function start(
           ...(event.chatType === "group" ? [fanOut(agentId, event.message)] : []),
         ]);
         console.log(`[wecom] Agent ${agentId} 收到${event.chatType === "single" ? "单聊" : "群内 @"}消息，处理状态: ${status}`);
-      }));
+      }, (event, attempt) => observeConnection(agentId, event, attempt)));
       hosts.forEach((host, index) => clients.set(host.agentId, connections[index]!));
       for (const { agentId, view } of hosts) {
-        console.log(`[bot] Agent ${agentId} 已连接，监听 ${Object.values(view.groups).filter((group) => group.enabled !== false).length} 个可用群`);
+        console.log(`[bot] Agent ${agentId} 已启动连接，监听 ${Object.values(view.groups).filter((group) => group.enabled !== false).length} 个可用群`);
       }
       console.log(`ThreadFerry 已启动，${hosts.length} 个 Agent 各自一条企业微信机器人连接。`);
 
@@ -1302,7 +1330,7 @@ async function main(): Promise<void> {
   if (command === "skills") {
     if (args[0] !== "install") throw new Error("threadferry skills 仅支持 install");
     await installOfficialWecomSkills();
-    console.log("企业微信官方 Skills 已安装或更新到 ~/.agents/skills。");
+    console.log("企业微信官方 Skill 已安装或更新到 ~/.agents/skills。");
     return;
   }
   if (command === "status") {

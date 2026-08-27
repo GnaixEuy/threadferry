@@ -14,6 +14,13 @@ export class CommandExecutionError extends Error {
   }
 }
 
+export class CommandTimeoutError extends Error {
+  constructor(command: string) {
+    super(`${command} 执行超时`);
+    this.name = "CommandTimeoutError";
+  }
+}
+
 export const runCommand: CommandRunner = (command, args, options = {}) =>
   new Promise((resolve, reject) => {
     if (options.signal?.aborted) {
@@ -80,7 +87,7 @@ export const runCommand: CommandRunner = (command, args, options = {}) =>
         error.name = "AbortError";
         reject(error);
       } else if (timedOut) {
-        reject(new Error(`${command} 执行超时`));
+        reject(new CommandTimeoutError(command));
       } else if (outputBytes > MAX_OUTPUT_BYTES) {
         reject(new Error(`${command} 输出超过安全上限`));
       } else if (code !== 0) {

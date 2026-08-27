@@ -25,10 +25,11 @@ ThreadFerry 把企业微信连接到相互隔离的本地 AI Agent。一个 Agen
 - 在固定本地 Workspace 中运行 Codex、Pi、Claude Code 或 Grok Build。
 - 分析私聊和受控群聊上下文，不向 Runtime 开放文件写入或任意 shell。
 - 读取图片、UTF-8 文本附件、引用资源和近期会话资源。
-- 由企业微信官方 `wecomcli-*` Skill 驱动日程、会议、待办、邮件、文档、微盘、表格和智能表格，
-  通过受控 `wecom-cli` Broker 执行。
+- 由企业微信官方 `wecom-unified` Skill 驱动通讯录、日程、会议与会议室、待办、邮件、消息、文档、
+  微盘、普通表格、智能表格和智能文档，通过受控 `wecom-cli` Broker 执行。
 - 创建提醒，并在同一 Owner 的 Agent 之间交接工作。
 - 重启后恢复 Session、排队任务和未投递回复。
+- 持续重连企业微信长连接，并在管理台显示每个 Agent 的在线、重连和最后回调状态。
 
 ## 安装
 
@@ -38,7 +39,7 @@ ThreadFerry 把企业微信连接到相互隔离的本地 AI Agent。一个 Agen
 - Node.js 22+
 - 一个企业微信智能机器人
 - 任一 Runtime：Codex CLI `0.138.0+`、Pi CLI `0.84.2+`、Claude Code `2.1.233+` 或 Grok Build `1.0.5+`
-- 企业微信官方 `wecom-cli 1.1.0+`（安装器会在需要时补装）
+- 企业微信官方 `wecom-cli 1.2.0+`（安装器会在需要时补装已验证的 1.2.0）
 
 macOS 或 Linux：
 
@@ -51,6 +52,16 @@ Windows PowerShell：
 ```powershell
 irm https://raw.githubusercontent.com/GnaixEuy/threadferry/main/install.ps1 | iex
 ```
+
+从旧版本升级后执行：
+
+```sh
+threadferry skills install
+threadferry doctor
+```
+
+这会把旧的分散 `wecomcli-*` Skills 替换为官方 `WecomTeam/wecom-unified`，并确认本机
+`wecom-cli` 不低于 `1.2.0`。已有 Agent 的机器人凭据无需重新授权。
 
 完成 CLI 安装和首次设置后，日常使用推荐从
 [GitHub Releases](https://github.com/GnaixEuy/threadferry/releases/latest) 下载桌面版：Apple Silicon Mac
@@ -65,7 +76,7 @@ irm https://raw.githubusercontent.com/GnaixEuy/threadferry/main/install.ps1 | ie
 threadferry onboard
 ```
 
-向导会安装企业微信官方 Skills、授权机器人、确认 Owner、选择 Runtime 和 Workspace、执行诊断并启动
+向导会安装企业微信官方 Skill、授权机器人、确认 Owner、选择 Runtime 和 Workspace、执行诊断并启动
 ThreadFerry。
 
 以后直接打开 ThreadFerry 桌面应用即可。它会自动启动已配置 Agent；点击菜单栏或任务栏通知区域中的
@@ -112,12 +123,16 @@ Owner 可以直接私聊机器人：
 把这些数据追加到项目智能表格。
 ```
 
-Agent 按对应的企业微信官方 Skill 选择能力、补齐必要信息、生成当前 CLI 命令并解释结果。
-ThreadFerry 校验 Skill 与命令路径的对应关系、命令结构、身份、会话边界、操作影响和确认规则，再使用该
-Agent 自己的 `wecom-cli` 凭据执行，并把结果交还同一 Agent。
+Agent 按企业微信官方 `wecom-unified` Skill 及其业务域 reference 选择能力、补齐必要信息、生成当前 CLI
+命令并解释结果。ThreadFerry 校验 Skill 来源、命令结构、身份、会话边界、操作影响和确认规则，再使用
+该 Agent 自己的 `wecom-cli` 凭据执行，并把结果交还同一 Agent。
 
 查询只允许在 Owner 私聊中执行。每次写操作都会先进行本地 `--dry-run` 校验。删除、取消、覆盖、
 完成待办、发送消息和发送邮件需要 Owner 输入新的确认码。
+
+写操作提交后若等待结果超时，ThreadFerry 会把状态标记为“最终状态未知”，且不会自动重试。请先查询或
+回读目标数据，确认没有成功后再决定是否重新执行。Owner 确认后的群回执会进入持久补发队列，即时投递
+失败或进程重启后仍会继续补发。
 
 ### 图片和文件
 

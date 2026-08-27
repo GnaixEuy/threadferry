@@ -60,7 +60,7 @@ test("Windows installer uses native PowerShell without WSL", () => {
   const script = readFileSync(fileURLToPath(new URL("../../install.ps1", import.meta.url)), "utf8");
   assert.match(script, /param\([\s\S]*\[switch\] \$NoOnboard[\s\S]*\[switch\] \$DryRun/);
   assert.match(script, /releases\/latest\/download\/threadferry\.tgz/);
-  assert.match(script, /@wecom\/cli/);
+  assert.match(script, /@wecom\/cli@1\.2\.0/);
   assert.match(script, /"--global", "--ignore-scripts", \$ReleasePackageUrl/);
   assert.match(script, /"\$Name\.cmd"/);
   assert.match(script, /ThreadFerry will ask whether to reuse its saved credentials/);
@@ -95,7 +95,7 @@ fi
 
     assert.equal(result.status, 0, result.stderr);
     assert.match(result.stdout, /Installing official wecom-cli/);
-    assert.match(result.stdout, /npm install --global @wecom\/cli/);
+    assert.match(result.stdout, /npm install --global @wecom\/cli@1\.2\.0/);
     assert.ok(result.stdout.indexOf("@wecom/cli") < result.stdout.indexOf("threadferry.tgz"));
   } finally {
     rmSync(temporary, { force: true, recursive: true });
@@ -117,7 +117,7 @@ fi
 `);
     writeFileSync(join(commandDirectory, "wecom-cli"), `#!/usr/bin/env bash
 if [[ "$1" == "--version" ]]; then
-  printf 'wecom-cli 1.1.0\\n'
+  printf 'wecom-cli 1.2.0\\n'
 elif [[ "$*" == "auth show --status" ]]; then
   printf 'authorized\\n'
 fi

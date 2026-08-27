@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 
 /**
  * Runtime 只提议动作，ThreadFerry 负责授权和执行。企业微信业务流程、能力选择、参数组装与
- * 结果表达属于官方 wecomcli-* Skill；这里仅保留 CLI 信任边界和 ThreadFerry 自身动作。
+ * 结果表达属于官方 wecom-unified Skill；这里仅保留 CLI 信任边界和 ThreadFerry 自身动作。
  */
 
 export type ActionMode = "read" | "write" | "destructive";
@@ -35,21 +35,10 @@ const PRIVATE_SERVICES = new Set(["chat", "contact", "disk", "doc", "mail", "med
 const LOCAL_PATH_FIELDS = new Set(["content_path", "file_path", "image_path", "local_path", "output_dir"]);
 const CREDENTIAL_FIELDS = new Set(["access_token", "authorization", "bot_secret", "credential", "credentials", "secret"]);
 
-const SERVICE_SKILLS: Record<string, string> = {
-  calendar: "wecomcli-calendar",
-  chat: "wecomcli-message",
-  contact: "wecomcli-contact",
-  disk: "wecomcli-disk",
-  doc: "wecomcli-doc",
-  mail: "wecomcli-email",
-  media: "wecomcli-media",
-  meeting: "wecomcli-meeting",
-  message: "wecomcli-message",
-  sheet: "wecomcli-sheet",
-  smartpage: "wecomcli-smartpage",
-  smartsheet: "wecomcli-smartsheet",
-  todo: "wecomcli-todo",
-};
+const WECOM_SERVICES = new Set([
+  "calendar", "chat", "contact", "disk", "doc", "mail", "media",
+  "meeting", "message", "sheet", "smartpage", "smartsheet", "todo",
+]);
 
 function text(value: unknown, field: string, max: number, required = false): string | undefined {
   if (value === undefined || value === null || value === "") {
@@ -186,13 +175,6 @@ const INTERNAL_ACTIONS: Record<string, InternalSpec> = {
   },
 };
 
-function skillForCommand(path: string[]): string | undefined {
-  if (path[0] === "doc" && (path[1] === "search" || ["members", "names", "rules"].includes(path[1] ?? ""))) {
-    return "wecomcli-doc-manage";
-  }
-  return SERVICE_SKILLS[path[0] ?? ""];
-}
-
 function hasUnsafePayload(value: unknown): string | undefined {
   if (Array.isArray(value)) {
     for (const item of value) {
@@ -246,9 +228,8 @@ function commandPath(command: unknown): { command: string[]; path: string[]; req
 
 function prepareWecomAction(action: ProposedAction): PreparedAction {
   const { command, path, request } = commandPath(action.arguments.command);
-  const skill = skillForCommand(path);
-  if (!skill) throw new Error(`不允许通过 Broker 调用服务：${path[0]}`);
-  if (action.skill !== skill) throw new Error(`该命令必须由 ${skill} Skill 提议`);
+  if (!WECOM_SERVICES.has(path[0] ?? "")) throw new Error(`不允许通过 Broker 调用服务：${path[0]}`);
+  if (action.skill !== "wecom-unified") throw new Error("该命令必须由 wecom-unified Skill 提议");
   const summary = text(action.arguments.summary, "动作摘要", 2_000, true)!;
   const method = path.at(-1)!;
   const inspection = request === undefined;
@@ -272,7 +253,7 @@ function prepareWecomAction(action: ProposedAction): PreparedAction {
 
 export function actionCatalog(): string {
   return [
-    "- wecom-cli [Skill: 与 service 对应的官方 wecomcli-* Skill]：执行一个受控企业微信 CLI 命令；参数：command（完整参数数组）、summary（给用户看的具体操作摘要）",
+    "- wecom-cli [Skill: 官方 wecom-unified]：执行一个受控企业微信 CLI 命令；参数：command（完整参数数组）、summary（给用户看的具体操作摘要）",
     ...Object.entries(INTERNAL_ACTIONS).map(([name, spec]) => `- ${name} [Skill: threadferry]：${spec.guide}`),
   ].join("\n");
 }

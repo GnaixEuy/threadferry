@@ -34,7 +34,7 @@ wecom_cli_supported() {
   [[ "$output" =~ ([0-9]+)\.([0-9]+)\.([0-9]+) ]] || return 1
   local major="${BASH_REMATCH[1]}"
   local minor="${BASH_REMATCH[2]}"
-  (( 10#$major > 1 || (10#$major == 1 && 10#$minor >= 1) ))
+  (( 10#$major > 1 || (10#$major == 1 && 10#$minor >= 2) ))
 }
 
 ensure_wecom_cli() {
@@ -45,13 +45,13 @@ ensure_wecom_cli() {
       printf 'Found %s.\n' "$installed"
       return
     fi
-    printf 'Updating official wecom-cli to 1.1.0+; current version is %s.\n' "${installed:-unknown}"
+    printf 'Updating official wecom-cli to 1.2.0+; current version is %s.\n' "${installed:-unknown}"
   else
-    printf 'Installing official wecom-cli 1.1.0+...\n'
+    printf 'Installing official wecom-cli 1.2.0+...\n'
   fi
 
-  if ! run npm install --global @wecom/cli; then
-    printf 'Could not install official wecom-cli. Check network access and npm global permissions, then run: npm install --global @wecom/cli\n' >&2
+  if ! run npm install --global @wecom/cli@1.2.0; then
+    printf 'Could not install official wecom-cli. Check network access and npm global permissions, then run: npm install --global @wecom/cli@1.2.0\n' >&2
     exit 1
   fi
   if [[ "$DRY_RUN" == "1" ]]; then return; fi
@@ -61,7 +61,7 @@ ensure_wecom_cli() {
   fi
   installed="$(wecom-cli --version 2>/dev/null || true)"
   if ! wecom_cli_supported "$installed"; then
-    printf 'wecom-cli 1.1.0+ is required; installed version is %s. Reinstall it with: npm install --global @wecom/cli\n' "${installed:-unknown}" >&2
+    printf 'wecom-cli 1.2.0+ is required; installed version is %s. Reinstall it with: npm install --global @wecom/cli@1.2.0\n' "${installed:-unknown}" >&2
     exit 1
   fi
 }

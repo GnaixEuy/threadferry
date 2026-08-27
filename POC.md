@@ -73,10 +73,12 @@ node dist/src/cli.js start --config ./threadferry.yaml --mock
 ## 4. 安装、授权与启动
 
 - [ ] 在一台未安装 ThreadFerry 的测试机运行对应安装脚本，确认 `threadferry --version` 可用。
-- [ ] 运行 `threadferry onboard`，完成官方 Skills 安装、机器人授权、Owner 确认、Runtime 与 Workspace
+- [ ] 在仅安装 `wecom-cli 1.1.0` 的测试环境运行安装脚本，确认升级到 `1.2.0`，且已有 Agent 凭据仍可
+      通过 `identity whoami` 验证，无需重新授权。
+- [ ] 运行 `threadferry onboard`，完成官方 Skill 安装、机器人授权、Owner 确认、Runtime 与 Workspace
       选择和环境诊断。
 - [ ] 确认授权过程由目标 Agent 的 `wecom-cli` 凭据目录完成，配置和终端输出中没有 Bot Secret。
-- [ ] 运行 `threadferry doctor`，确认配置、14 个官方 Skills、机器人身份、Runtime 和 Workspace 全部通过。
+- [ ] 运行 `threadferry doctor`，确认配置、官方 `wecom-unified` Skill、机器人身份、Runtime 和 Workspace 全部通过。
 - [ ] 运行 `threadferry start`，确认每个已授权 Agent 建立一条机器人连接；未授权 Agent 会显示明确的
       `threadferry agent login <name>` 提示。
 - [ ] 再启动一个 ThreadFerry 进程，确认它因实例锁退出，不创建第二个 WebSocket 消费者。
@@ -115,14 +117,21 @@ node dist/src/cli.js start --config ./threadferry.yaml --mock
 
 ## 6. 官方 Skill 与企业能力
 
-- [ ] 运行 `threadferry skills install`，再运行 `threadferry doctor`，确认 14 个 Skill 的目录、锁文件和
-      来源均为 `WeComTeam/wecom-cli`。
-- [ ] Owner 私聊查询会议或日程，确认 Agent 使用对应官方 Skill，结果来自该 Agent 的企业微信身份。
+- [ ] 运行 `threadferry skills install`，再运行 `threadferry doctor`，确认 `wecom-unified` 目录、锁文件和
+      来源均为 `WecomTeam/wecom-unified`。
+- [ ] 仅保留旧 `wecomcli-*` 目录时运行 `threadferry doctor`，确认不会把旧拆分 Skills 误判为当前官方
+      Skill；重新安装后确认统一 Skill 的 13 个主业务 reference 完整。
+- [ ] 使用目标 Agent 的 `WECOM_CLI_CONFIG_DIR` 检查 `meeting rooms buildings list --schema` 和
+      `smartsheet records query --schema`，确认新命令树可读取且未使用其他 Agent 的身份。
+- [ ] Owner 私聊查询会议或日程，确认 Agent 使用官方 `wecom-unified` Skill 对应的 reference，结果来自
+      该 Agent 的企业微信身份。
 - [ ] 在群中请求查询企业数据，确认查询被拒绝并提示改用 Owner 私聊。
 - [ ] 使用信息完整的自然语言请求创建测试会议，确认请求先通过 `--dry-run`，真实创建只发生一次，随后
       可通过查询回读。
 - [ ] 使用缺少时间或参与人的创建请求，确认 Agent 先澄清信息，不提交动作。
 - [ ] 请求取消刚创建的会议，确认未输入新确认码时不执行；输入有效确认码后执行一次，并可回读结果。
+- [ ] 模拟真实写调用在 dry-run 成功后超时，确认回复显示“最终状态未知”、Activity 记录
+      `action.unknown`，且 ThreadFerry 不自动重试；查询回读后再决定是否重新执行。
 - [ ] 请求发送企业微信消息或邮件，确认每次真实发送都要求新的 Owner 确认码。
 - [ ] 请求读写普通表格和智能表格，确认 Agent 先读取文档类型、子表与字段结构，再按实际字段执行。
 - [ ] 确认业务结果返回发起请求的同一 Agent；一次写入完成后，本轮不再执行第二个动作。
@@ -168,6 +177,10 @@ threadferry start --agents reviewer
 - [ ] Runtime 工作期间产生更新的群消息，确认旧结果被标记为过期，不覆盖新上下文。
 - [ ] Runtime 工作期间强制结束 ThreadFerry，再启动，确认待处理任务恢复并回复原会话。
 - [ ] 模拟回复投递失败并重启，确认 Outbox 补发成功，随后 `threadferry status` 显示 `outbox=0`。
+- [ ] 模拟 Owner 确认动作后的原群回执失败，确认 Owner 看到“已加入补发队列”，恢复连接或重启后由原
+      Agent 的机器人补发，且不会换机器人身份。
+- [ ] 断开网络后确认管理台显示对应 Agent 正在重连和重连次数；恢复网络后无需重启进程即可恢复在线，
+      收到下一条回调后更新“最后回调”时间。
 - [ ] 使用 `Ctrl+C` 结束进程，确认 Runtime 子进程被取消，任务进入明确的终态。
 - [ ] 执行 `threadferry session reset --group <群ID>`，确认只清理目标群的 Session。
 
