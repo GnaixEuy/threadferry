@@ -53,6 +53,8 @@ export interface AdminDependencies {
   checkUpdate?: () => Promise<{ version: string } | undefined>;
   /** 按「群 + Agent」重置：同一个群里每台机器人各有自己的 Session。 */
   resetSession?: (groupId: string, agentId: string) => Promise<boolean>;
+  /** 移除该 Agent 的 ThreadFerry 群绑定并清理 Session；不代表企业微信机器人主动退群。 */
+  removeGroup?: (groupId: string, agentId: string) => Promise<void>;
 }
 
 const GROUP_ID = /^[^\s\u0000-\u001f]{1,512}$/;
@@ -132,6 +134,13 @@ function required(input: URLSearchParams, name: string): string {
   const value = input.get(name)?.trim();
   if (!value) throw new Error(`${name} 不能为空`);
   return value;
+}
+
+function activeGroupAccess(config: ThreadFerryConfig, groupId: string, agentId: string): GroupAccess {
+  const access = config.groups[groupId]?.agents[agentId];
+  if (!access) throw new Error("该群没有这个机器人记录");
+  if (access.removed) throw new Error("机器人已从该群移除；重新接入后才能修改群配置");
+  return access;
 }
 
 function botAuthorization(input: URLSearchParams): BotAuthorization | undefined {
@@ -584,7 +593,7 @@ async function overviewPage(config: ThreadFerryConfig, dependencies: AdminDepend
     [String(Object.keys(config.agents).length), "机器人", "/agents"],
     [String(connected), "长连接在线", "/agents"],
     [String(activeGroups), "可用群", "/groups"],
-    [String(disabledGroups), "已停用群", "/groups"],
+    [String(disabledGroups), "停用 / 已移除群", "/groups"],
     [String(waiting.length), "等待首次 @", "/groups"],
   ];
   if (snapshot) {
@@ -820,9 +829,20 @@ function agentSection(
   dialogId: string,
   userName: ((userId: string) => string | undefined) | undefined,
   canReset: boolean,
+  canRemove: boolean,
   confirmed: boolean,
 ): string {
   const enabled = access.enabled !== false;
+  const removed = access.removed === true;
+  const hidden = `${field(token)}<input type="hidden" name="groupId" value="${html(groupId)}"><input type="hidden" name="agentId" value="${html(agentId)}">`;
+  if (removed) return `
+      <section class="agent-block">
+        <div class="row">
+          <h4>${html(agentId)}${runtime ? ` <span class="badge">${html(runtime)}</span>` : ""} <span class="badge warning">已移除</span></h4>
+          <form method="post" action="/groups/enabled">${hidden}<input type="hidden" name="enabled" value="on"><button class="ghost">重新接入</button></form>
+        </div>
+        <p class="muted">ThreadFerry 不再响应这个群，原授权和 Session 已清理。企业微信暂不支持机器人主动退群；如需从群成员中移除，请由群管理员在企业微信中操作。</p>
+      </section>`;
   // 有名字就把名字放主位、加密 id 退成次要信息；没有名字（没权限或这人没露过面）就只显示 id。
   const users = access.allowUsers.map((userId) => {
     const name = userName?.(userId);
@@ -833,7 +853,6 @@ function agentSection(
     <li>${label}${userId === owner ? "<span class=owner>Owner</span>" : ""}${userId === owner ? "" : `
       <form method="post" action="/groups/users/remove">${field(token)}<input type="hidden" name="groupId" value="${html(groupId)}"><input type="hidden" name="agentId" value="${html(agentId)}"><input type="hidden" name="userId" value="${html(userId)}"><button class="danger">移除</button></form>`}</li>`;
   }).join("");
-  const hidden = `${field(token)}<input type="hidden" name="groupId" value="${html(groupId)}"><input type="hidden" name="agentId" value="${html(agentId)}">`;
   return `
       <section class="agent-block">
         <div class="row">
@@ -852,18 +871,21 @@ function agentSection(
         <div class="actions">
           <a class="button ghost" href="${html(groupUserAnchor(groupId, agentId))}" data-dialog="${html(dialogId)}">＋ 添加可使用用户</a>
           ${canReset ? `<form method="post" action="/groups/session/reset">${hidden}<button class="ghost">重置 Session</button></form>` : ""}
+          ${canRemove ? `<form method="post" action="/groups/remove" data-confirm="确定移除 ${html(agentId)} 在这个群的 ThreadFerry 绑定吗？授权和 Session 会被清理。"><input type="hidden" name="csrf" value="${html(token)}"><input type="hidden" name="groupId" value="${html(groupId)}"><input type="hidden" name="agentId" value="${html(agentId)}"><button class="danger">移除机器人</button></form>` : ""}
         </div>
+        ${canRemove ? `<p class="muted">“移除机器人”只移除 ThreadFerry 绑定；从企业微信群成员中移除仍需群管理员操作。</p>` : ""}
       </section>`;
 }
 
 function groupListItem(id: string, label: string, group: GroupBinding | undefined): string {
   const agents = Object.keys(group?.agents ?? {});
   const enabled = agents.filter((agentId) => group?.agents[agentId]?.enabled !== false);
-  const state = agents.length === 0 ? "等待首次 @" : enabled.length > 0 ? `${enabled.length} 台可用` : "已停用";
+  const attached = agents.filter((agentId) => !group?.agents[agentId]?.removed);
+  const state = agents.length === 0 ? "等待首次 @" : attached.length === 0 ? "已移除" : enabled.length > 0 ? `${enabled.length} 台可用` : "已停用";
   return `<a class="group-row" href="${html(groupAnchor(id))}">
     <span class="group-main"><span class="group-avatar" aria-hidden="true">群</span><span><b>${html(label)}</b><code>${html(id)}</code></span></span>
     <span class="group-agents">${agents.length
-      ? agents.map((agentId) => `<span class="badge${group?.agents[agentId]?.enabled !== false ? " ok" : " warning"}">${html(agentId)}${group?.agents[agentId]?.enabled === false ? " · 停用" : ""}</span>`).join("")
+      ? agents.map((agentId) => `<span class="badge${group?.agents[agentId]?.enabled !== false ? " ok" : " warning"}">${html(agentId)}${group?.agents[agentId]?.removed ? " · 已移除" : group?.agents[agentId]?.enabled === false ? " · 停用" : ""}</span>`).join("")
       : `<span class="muted">收到机器人首次群 @ 后自动启用</span>`}</span>
     <span class="group-state"><span class="badge ${enabled.length > 0 ? "ok" : "warning"}">${state}</span><span class="row-arrow" aria-hidden="true">›</span></span>
   </a>`;
@@ -876,7 +898,7 @@ async function groupsPage(config: ThreadFerryConfig, dependencies: AdminDependen
   const groups = groupIds.map((id) => groupListItem(id, byId.get(id)?.name ?? "未获取群名", config.groups[id]));
   return shell("groups", config, url, `
     ${failures.length > 0 ? `<h2>群查询失败</h2><div class="grid">${failureCard(failures)}</div>` : ""}
-    <div class="section-head"><div><h2>群聊</h2><p class="sub">把机器人拉入群后，第一次 @它 即自动启用；群详情只管理是否可用和哪些成员可用。</p></div><a class="button ghost" href="/groups">↻ 刷新群列表</a></div>
+    <div class="section-head"><div><h2>群聊</h2><p class="sub">把机器人拉入群后，第一次 @它 即自动启用；群详情可停用、重新接入、移除 ThreadFerry 绑定和管理成员。</p></div><a class="button ghost" href="/groups">↻ 刷新群列表</a></div>
     <div class="list-panel">${groups.join("") || `<p class="empty-state">还没发现任何群。${DISCOVERY_HINT}</p>`}</div>`);
 }
 
@@ -904,11 +926,12 @@ async function groupDetailPage(config: ThreadFerryConfig, dependencies: AdminDep
       if (openHere && error !== undefined) openedInDialog = true;
       dialogs.push(addUserDialog(token, dialogId, id, agentId, label, openHere, openHere ? error : undefined));
       return agentSection(token, id, agentId, access, config.agents[agentId]?.ownerUser,
-        config.agents[agentId]?.runtime, dialogId, dependencies.userName, Boolean(dependencies.resetSession), confirmed.has(agentId));
+        config.agents[agentId]?.runtime, dialogId, dependencies.userName, Boolean(dependencies.resetSession), Boolean(dependencies.removeGroup), confirmed.has(agentId));
     }).join("");
     const spare = [...visible].filter((agentId) => config.agents[agentId] && !group.agents[agentId]);
     const enabled = Object.values(group.agents).filter((access) => access.enabled !== false).length;
-    body = `<article class="card group-detail"><div class="row"><div><h3>${html(label)}</h3><code>${html(id)}</code></div><span class="badge${enabled > 0 ? " ok" : " warning"}">${enabled > 0 ? `${enabled} 台机器人可用` : "机器人已停用"}</span></div>
+    const attached = Object.values(group.agents).filter((access) => !access.removed).length;
+    body = `<article class="card group-detail"><div class="row"><div><h3>${html(label)}</h3><code>${html(id)}</code></div><span class="badge${enabled > 0 ? " ok" : " warning"}">${enabled > 0 ? `${enabled} 台机器人可用` : attached === 0 ? "机器人已移除" : "机器人已停用"}</span></div>
       <p class="muted">群里 @ 哪台机器人，就由它用自己的 Workspace 回答；名单、开关和 Session 各自独立。</p>${sections}
       ${spare.length > 0 ? `<p class="muted">要让其他机器人也接入本群，直接在群里分别 @它们一次；收到后会自动启用。</p>` : ""}</article>`;
   }
@@ -1043,19 +1066,28 @@ export async function startAdminServer(
         await dependencies.updateConfig((latest) => {
           const access = latest.groups[groupId]?.agents[agentId];
           if (!access) throw new Error("该群没有这个机器人记录");
-          if (enabled === "on") delete access.enabled;
+          if (enabled === "on") {
+            delete access.enabled;
+            delete access.removed;
+          }
           else access.enabled = false;
         });
         target = groupAnchor(groupId);
         message = enabled === "on" ? `${agentId} 已启用` : `${agentId} 已停用，群内 @ 不会启动 Agent`;
+      } else if (url.pathname === "/groups/remove") {
+        const groupId = required(input, "groupId");
+        const agentId = required(input, "agentId");
+        if (!dependencies.removeGroup) throw new Error("当前启动方式不支持移除群机器人绑定");
+        await dependencies.removeGroup(groupId, agentId);
+        target = groupAnchor(groupId);
+        message = `${agentId} 的 ThreadFerry 群绑定已移除；从企业微信群成员中移除仍需群管理员操作`;
       } else if (url.pathname === "/groups/access") {
         const groupId = required(input, "groupId");
         const agentId = required(input, "agentId");
         const allowAll = required(input, "allowAll");
         if (allowAll !== "on" && allowAll !== "off") throw new Error("访问开关取值无效");
         await dependencies.updateConfig((latest) => {
-          const access = latest.groups[groupId]?.agents[agentId];
-          if (!access) throw new Error("该群没有这个机器人记录");
+          const access = activeGroupAccess(latest, groupId, agentId);
           if (allowAll === "on") access.allowAll = true;
           else delete access.allowAll;
         });
@@ -1071,8 +1103,7 @@ export async function startAdminServer(
         const user = await resolveDirectoryUser(required(input, "user"), (keywords) => dependencies.searchUsers(agentId, keywords));
         if (!USER_ID.test(user.id)) throw new Error("通讯录返回的 userid 无效");
         await dependencies.updateConfig((latest) => {
-          const access = latest.groups[groupId]?.agents[agentId];
-          if (!access) throw new Error("该群没有这个机器人记录");
+          const access = activeGroupAccess(latest, groupId, agentId);
           access.allowUsers = [...new Set([...access.allowUsers, user.id])];
           if (access.allowUsers.length > 256) throw new Error("可使用用户已达到 256 人上限");
         });
@@ -1084,8 +1115,7 @@ export async function startAdminServer(
         const agentId = required(input, "agentId");
         const userId = required(input, "userId");
         await dependencies.updateConfig((latest) => {
-          const access = latest.groups[groupId]?.agents[agentId];
-          if (!access) throw new Error("该群没有这个机器人记录");
+          const access = activeGroupAccess(latest, groupId, agentId);
           if (userId === latest.agents[agentId]?.ownerUser) throw new Error(`不能移除 Agent ${agentId} 的 Owner`);
           access.allowUsers = access.allowUsers.filter((id) => id !== userId);
         });
@@ -1095,6 +1125,7 @@ export async function startAdminServer(
         const groupId = required(input, "groupId");
         const agentId = required(input, "agentId");
         if (!dependencies.resetSession) throw new Error("当前启动方式不支持重置 Session");
+        activeGroupAccess(config, groupId, agentId);
         const removed = await dependencies.resetSession(groupId, agentId);
         target = groupAnchor(groupId);
         message = removed ? `${agentId} 在该群的 Runtime Session 已重置` : `${agentId} 在该群没有已保存的 Runtime Session`;

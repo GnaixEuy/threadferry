@@ -60,6 +60,7 @@ test("localhost admin manages agents, groups, and users with CSRF protection", a
   const remembered = new Map([["owner", "苏粤翔"]]);
   const now = new Date().toISOString();
   const resetCalls: string[] = [];
+  const removeCalls: string[] = [];
   const authCalls: Array<{ agentId: string; mode: string; botId?: string; secret?: string }> = [];
   const directoryAgents: string[] = [];
   let updateChecks = 0;
@@ -99,6 +100,15 @@ test("localhost admin manages agents, groups, and users with CSRF protection", a
     }),
     checkUpdate: async () => { updateChecks += 1; return { version: "9.9.9" }; },
     resetSession: async (groupId, agentId) => { resetCalls.push(`${groupId}:${agentId}`); return true; },
+    removeGroup: async (groupId, agentId) => {
+      const access = config.groups[groupId]?.agents[agentId];
+      if (!access) throw new Error("该群没有这个机器人记录");
+      removeCalls.push(`${groupId}:${agentId}`);
+      access.allowUsers = [config.agents[agentId]!.ownerUser];
+      delete access.allowAll;
+      access.enabled = false;
+      access.removed = true;
+    },
   }, 0);
   t.after(() => admin.close());
 
@@ -348,6 +358,24 @@ test("localhost admin manages agents, groups, and users with CSRF protection", a
   assert.equal(config.groups.group?.agents.default?.enabled, undefined);
   const badEnabled = await post("/groups/enabled", { groupId: "group", agentId: "default", enabled: "yes" });
   assert.match(badEnabled.headers.get("location") ?? "", /error=/);
+
+  const removablePage = await (await fetch(`${admin.url}/groups/detail?id=group`)).text();
+  assert.match(removablePage, /data-confirm="确定移除 default[\s\S]*移除机器人/);
+  const removedBinding = await post("/groups/remove", { groupId: "group", agentId: "default" });
+  assert.match(removedBinding.headers.get("location") ?? "", /^\/groups\/detail\?id=group&ok=/);
+  assert.deepEqual(removeCalls, ["group:default"]);
+  assert.equal(config.groups.group?.agents.default?.removed, true);
+  assert.equal(config.groups.group?.agents.default?.enabled, false);
+  const removedPage = await (await fetch(`${admin.url}/groups/detail?id=group`)).text();
+  assert.match(removedPage, /已移除[\s\S]*重新接入[\s\S]*群管理员/);
+  const removedAccess = await post("/groups/access", { groupId: "group", agentId: "default", allowAll: "on" });
+  assert.match(removedAccess.headers.get("location") ?? "", /error=/);
+  assert.equal(config.groups.group?.agents.default?.allowAll, undefined);
+  const removedUser = await post("/groups/users/add", { groupId: "group", agentId: "default", user: "张三" });
+  assert.match(removedUser.headers.get("location") ?? "", /error=/);
+  assert.deepEqual(config.groups.group?.agents.default?.allowUsers, ["owner"]);
+  await post("/groups/enabled", { groupId: "group", agentId: "default", enabled: "on" });
+  assert.equal(config.groups.group?.agents.default?.removed, undefined);
 
   // 模拟 Host 收到 new-group 的首次机器人回调后写入默认授权。
   config.groups["new-group"] = {

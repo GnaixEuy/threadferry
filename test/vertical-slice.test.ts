@@ -40,7 +40,7 @@ function fullConfig(workspace = "/workspace", ownerUser = "user", groupId = "gro
   };
 }
 
-test("confirmed group sessions are enabled once while an explicit stop is preserved", () => {
+test("confirmed group sessions are enabled once while explicit stop and removal are preserved", () => {
   const config = fullConfig();
   config.groups = {};
   assert.equal(ensureGroupAccess(config, "joined-group", "default"), true);
@@ -48,6 +48,9 @@ test("confirmed group sessions are enabled once while an explicit stop is preser
   config.groups["joined-group"]!.agents.default!.enabled = false;
   assert.equal(ensureGroupAccess(config, "joined-group", "default"), false);
   assert.equal(agentView(config, "default").groups["joined-group"]?.enabled, false);
+  config.groups["joined-group"]!.agents.default!.removed = true;
+  assert.equal(ensureGroupAccess(config, "joined-group", "default"), false);
+  assert.equal(agentView(config, "default").groups["joined-group"]?.removed, true);
 });
 
 function wecomProposal(command: string[], skill: string, summary: string, reply = "", userIntent: "explicit" | "confirm" = "explicit"): string {
@@ -226,6 +229,7 @@ test("robot owner manages per-group users in direct chat", async () => {
   const runtimePrompts: string[] = [];
   let searchCalls = 0;
   let runtimeCalls = 0;
+  const removedGroups: string[] = [];
   const app = createApp(config, {
     history: async () => [],
     runtime: async (request) => {
@@ -236,6 +240,21 @@ test("robot owner manages per-group users in direct chat", async () => {
       return { text: "分析结果", sessionId: `${request.agentId}-session` };
     },
     updateAllowUsers: async (groupId, users) => { persisted.push({ groupId, users: [...users] }); },
+    updateGroupEnabled: async (groupId, enabled) => {
+      const access = config.groups[groupId]!;
+      if (enabled) {
+        delete access.enabled;
+        delete access.removed;
+      } else access.enabled = false;
+    },
+    removeGroup: async (groupId) => {
+      const access = config.groups[groupId]!;
+      removedGroups.push(groupId);
+      access.allowUsers = ["owner"];
+      delete access.allowAll;
+      access.enabled = false;
+      access.removed = true;
+    },
     listGroups: async () => [
       { id: "group", name: "AI Coding" },
       { id: "group-unconfigured", name: "未配置群" },
@@ -285,6 +304,16 @@ test("robot owner manages per-group users in direct chat", async () => {
   assert.equal(await direct("owner", "threadferry groups"), "command");
   assert.match(replies.at(-1) ?? "", /AI Coding/);
   assert.match(replies.at(-1) ?? "", /\[default\].*\[等待首次 @ 自动启用\]/s);
+  assert.equal(await group("owner", "@机器人 机器人我想移除"), "command");
+  assert.match(replies.at(-1) ?? "", /threadferry unbind group.*主动退群/s);
+  assert.equal(runtimeCalls, 0);
+  assert.equal(await direct("owner", "机器人我想移除"), "command");
+  assert.match(replies.at(-1) ?? "", /threadferry unbind group.*群管理员/s);
+  assert.equal(await direct("owner", "threadferry disable AI Coding"), "command");
+  assert.equal(config.groups.group?.enabled, false);
+  assert.match(replies.at(-1) ?? "", /已停用.*Session 已保留/s);
+  assert.equal(await direct("owner", "threadferry enable AI Coding"), "command");
+  assert.equal(config.groups.group?.enabled, undefined);
   assert.equal(await direct("owner", "threadferry agents"), "command");
   assert.match(replies.at(-1) ?? "", /reviewer.*pi.*provider\/reviewer/s);
   // 非 Owner 的私聊被拒绝时，回调 userid 会映射到目录 ID 以判断是否 Owner（缓存后不再搜索）。
@@ -336,10 +365,36 @@ test("robot owner manages per-group users in direct chat", async () => {
   assert.match(runtimePrompts[3] ?? "", /UNTRUSTED_DIRECT_HISTORY.*企业微信私聊/s);
   assert.equal(await direct("owner", "继续分析私聊问题"), "handled");
   assert.equal(runtimeSessions[4], "default-session");
+  assert.equal(await direct("owner", "请分析机器人移除功能的代码"), "handled");
+  assert.equal(runtimeCalls, 6);
   assert.equal(searchCalls, beforeDirectSearch);
   assert.equal(await direct("owner", "threadferry groups", "duplicate-direct"), "command");
   assert.equal(await direct("owner", "threadferry groups", "duplicate-direct"), "duplicate");
-  assert.equal(runtimeCalls, 5);
+  assert.equal(runtimeCalls, 6);
+  assert.equal(await direct("owner", "threadferry invite AI Coding"), "command");
+  const staleCode = replies.at(-1)?.match(/邀请码：`([A-F0-9]{12})`/)?.[1];
+  assert.ok(staleCode);
+  const persistedBeforeRemoval = persisted.length;
+  config.groups.group!.allowUsers = ["owner"];
+  config.groups.group!.enabled = false;
+  config.groups.group!.removed = true;
+  assert.equal(await direct("new-user", `threadferry join ${staleCode}`), "command");
+  assert.match(replies.at(-1) ?? "", /邀请码已失效.*移除/s);
+  assert.equal(persisted.length, persistedBeforeRemoval);
+  assert.deepEqual(config.groups.group?.allowUsers, ["owner"]);
+  assert.equal(await direct("owner", "threadferry enable AI Coding"), "command");
+  assert.equal(await direct("owner", "threadferry unbind AI Coding"), "command");
+  assert.deepEqual(removedGroups, ["group"]);
+  assert.equal(config.groups.group?.removed, true);
+  assert.deepEqual(config.groups.group?.allowUsers, ["owner"]);
+  assert.match(replies.at(-1) ?? "", /已移除.*Runtime Session.*群管理员/s);
+  assert.equal(await direct("owner", "threadferry open AI Coding"), "command");
+  assert.match(replies.at(-1) ?? "", /已从群.*移除.*只支持.*enable/s);
+  assert.equal(config.groups.group?.allowAll, undefined);
+  assert.equal(await group("owner", "@机器人 再分析"), "unauthorized_group");
+  assert.equal(await direct("owner", "threadferry enable AI Coding"), "command");
+  assert.equal(config.groups.group?.removed, undefined);
+  assert.match(replies.at(-1) ?? "", /已重新接入/);
 });
 
 test("owner is recognized when the callback uses a different userid namespace than the config", async () => {
@@ -1162,6 +1217,10 @@ test("workspace paths cannot be relative or escape through a symlink", async (t)
   await saveConfig(compactPath, compact);
   assert.equal((await loadConfig(compactPath)).groups.group?.agents.default?.enabled, false);
   assert.match(await readFile(compactPath, "utf8"), /enabled: false/);
+  compact.groups.group!.agents.default!.removed = true;
+  await saveConfig(compactPath, compact);
+  assert.equal((await loadConfig(compactPath)).groups.group?.agents.default?.removed, true);
+  assert.match(await readFile(compactPath, "utf8"), /removed: true/);
 });
 
 test("one group can run two bots at once, each with its own allowlist and switch", async (t) => {
@@ -1365,6 +1424,10 @@ test("legacy and extra configuration fields are rejected", async (t) => {
   const badEnabledPath = join(root, "bad-enabled.yaml");
   await writeFile(badEnabledPath, `version: 6\nagents:\n  default:\n    runtime: codex\n    workspace: ${JSON.stringify(await realpath(root))}\n    owner_user: user\n    groups:\n      group:\n        allow_users: [user]\n        enabled: no\n`);
   await assert.rejects(loadConfig(badEnabledPath), /enabled 必须是布尔值/);
+
+  const badRemovedPath = join(root, "bad-removed.yaml");
+  await writeFile(badRemovedPath, `version: 6\nagents:\n  default:\n    runtime: codex\n    workspace: ${JSON.stringify(await realpath(root))}\n    owner_user: user\n    groups:\n      group:\n        allow_users: [user]\n        removed: true\n`);
+  await assert.rejects(loadConfig(badRemovedPath), /已移除时 enabled 必须为 false/);
 });
 
 test("a newer group message makes the completed analysis stale", async () => {

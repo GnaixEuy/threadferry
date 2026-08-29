@@ -28,6 +28,8 @@ export interface AppDependencies {
   runtime: (request: RuntimeRequest) => Promise<RuntimeResult>;
   updateAllowUsers?: (groupId: string, users: string[]) => Promise<void>;
   updateGroupAccess?: (groupId: string, allowAll: boolean) => Promise<void>;
+  updateGroupEnabled?: (groupId: string, enabled: boolean) => Promise<void>;
+  removeGroup?: (groupId: string) => Promise<void>;
   listGroups?: () => Promise<Array<{ id: string; name?: string }>>;
   searchUsers?: (keywords: string[]) => Promise<DirectoryUser[]>;
   /** 全量配置中的 Agent 名，只用于校验显式任务交接目标；不共享它们的 Session 或凭据。 */
@@ -43,13 +45,25 @@ export interface AppDependencies {
 
 const DIRECT_CONTEXT = { lookbackHours: 7 * 24, maxMessages: 80 };
 
-type ManagementCommand = "help" | "whoami" | "groups" | "agents" | "users" | "invite" | "join" | "add" | "remove" | "bind" | "open" | "close" | "confirm";
+type ManagementCommand = "help" | "whoami" | "groups" | "agents" | "users" | "invite" | "join" | "add" | "remove" | "bind" | "open" | "close" | "enable" | "disable" | "unbind" | "confirm";
 const USER_ID = /^[A-Za-z0-9_@.-]{1,512}$/;
 
 function managementCommand(text: string): { name: ManagementCommand; arguments: string[] } | undefined {
-  const match = text.match(/(?:^|[\s@])threadferry\s+(help|whoami|groups|agents|users|invite|join|add|remove|bind|open|close|confirm)(?:\s+(.+?))?\s*$/i);
+  const match = text.match(/(?:^|[\s@])threadferry\s+(help|whoami|groups|agents|users|invite|join|add|remove|bind|open|close|enable|disable|unbind|confirm)(?:\s+(.+?))?\s*$/i);
   if (!match) return undefined;
   return { name: match[1]!.toLowerCase() as ManagementCommand, arguments: match[2]?.trim().split(/\s+/) ?? [] };
+}
+
+function robotRemovalRequest(text: string): boolean {
+  const normalized = text.replace(/\s+/g, "");
+  const request = "(?:我想|我要|想要|请帮我|帮我|麻烦帮我)";
+  const bot = "(?:这个|当前|该)?(?:机器人|threadferry)";
+  const remove = "(?:移除|删除|解绑|退出)";
+  return new RegExp(`${request}(?:把|将)?${bot}(?:从(?:这个|当前|该)?群(?:聊)?里?)?${remove}`, "i").test(normalized)
+    || new RegExp(`${bot}${request}(?:从(?:这个|当前|该)?群(?:聊)?里?)?${remove}`, "i").test(normalized)
+    || new RegExp(`${request}(?:把|将)?${remove}${bot}`, "i").test(normalized)
+    || new RegExp(`^(?:请)?(?:把|将)?${bot}(?:从(?:这个|当前|该)?群(?:聊)?里?)?${remove}[。！!]?$`, "i").test(normalized)
+    || new RegExp(`^(?:请)?${remove}${bot}[。！!]?$`, "i").test(normalized);
 }
 
 // 仅用于本机控制台日志：Runtime 与 wecom-cli 的 Error.message 都是固定诊断文案，
@@ -294,6 +308,7 @@ export function createApp(config: AgentView, dependencies: AppDependencies, stat
     const operation = accessTail.then(async () => {
       const group = config.groups[groupId];
       if (!group || !dependencies.updateAllowUsers) throw new Error("当前启动方式不支持用户管理");
+      if (group.removed) throw new Error("机器人已从该群移除；重新接入后才能管理用户");
       const users = [...new Set(change(group.allowUsers))];
       if (!users.every((user) => USER_ID.test(user))) throw new Error("userid 无效");
       if (!users.includes(config.ownerUser)) throw new Error("不能移除 ThreadFerry Owner");
@@ -310,6 +325,7 @@ export function createApp(config: AgentView, dependencies: AppDependencies, stat
     const operation = accessTail.then(async () => {
       const group = config.groups[groupId];
       if (!group || !dependencies.updateGroupAccess) throw new Error("当前启动方式不支持访问开关管理");
+      if (group.removed) throw new Error("机器人已从该群移除；重新接入后才能修改访问开关");
       await dependencies.updateGroupAccess(groupId, allowAll);
       group.allowAll = allowAll;
     });
@@ -556,6 +572,7 @@ export function createApp(config: AgentView, dependencies: AppDependencies, stat
       return respond(reply, "邀请码无效、已过期或不属于当前群，请联系机器人 Owner 重新生成。");
     }
     invites.delete(code);
+    if (config.groups[invite.groupId]?.removed) return respond(reply, "邀请码已失效：机器人已从该群移除，请重新接入后由 Owner 生成新邀请码。");
     try {
       const directoryId = await authoritativeId(senderId);
       await updateUsers(invite.groupId, (users) => [...users, directoryId]);
@@ -573,6 +590,11 @@ export function createApp(config: AgentView, dependencies: AppDependencies, stat
     const command = managementCommand(message.text);
     if (!command) {
       if (!(await isOwner(message.senderId))) return respond(reply, ownerOnly("私聊 Agent", await authoritativeId(message.senderId)));
+      if (robotRemovalRequest(message.text)) {
+        const activeGroups = Object.entries(config.groups).filter(([, group]) => !group.removed);
+        const target = activeGroups.length === 1 ? ` ${activeGroups[0]![0]}` : " <群名或ID>";
+        return respond(reply, `可以移除这台机器人在 ThreadFerry 中的群绑定。为避免误操作，请明确发送 \`threadferry unbind${target}\` 确认；有多个群时先发送 \`threadferry groups\`。\n\n这会停止响应、重置授权并清理该群 Session，但企业微信当前没有机器人主动退群接口；如需把机器人从群成员中移除，仍需群管理员在企业微信中操作。`);
+      }
       const scope = `direct:${message.senderId}`;
       const queued = groupTails.has(scope);
       try {
@@ -588,7 +610,7 @@ export function createApp(config: AgentView, dependencies: AppDependencies, stat
     if (command.name === "help") {
       const [selfId, self] = Object.entries(config.agents)[0] ?? [];
       const selfLine = selfId ? `你正在和 Agent \`${selfId}\` 对话，Workspace 是 ${self!.workspace}。\n\n` : "";
-      return respond(reply, `${selfLine}直接发送普通消息即可让我在这个 Workspace 里分析。\n\n接入群聊：\n1. 请企业管理员批准机器人的数据访问权限，并把我加入目标内部群\n2. 在群里 @我 发送第一条消息；收到后自动启用，不需要再绑定\n3. 私聊发送 \`threadferry groups\` 查看状态并管理成员权限\n\n其他管理命令：\n- \`threadferry users <群名>\` 查看可使用用户\n- \`threadferry invite <群名>\` 生成一次性邀请码\n- \`threadferry add <群名> <姓名>\` 直接授权\n- \`threadferry remove <群名> <姓名>\` 移除授权\n- \`threadferry open <群名>\` 允许群内所有成员使用\n- \`threadferry close <群名>\` 恢复仅授权成员可用\n- \`threadferry whoami\` 查看自己的 userid\n\n每个 Agent 对应一个机器人：想用别的 Workspace，就去和那个机器人私聊。\n群或成员重名时，按我返回的 ID 重新发送即可。`);
+      return respond(reply, `${selfLine}直接发送普通消息即可让我在这个 Workspace 里分析。\n\n接入群聊：\n1. 请企业管理员批准机器人的数据访问权限，并把我加入目标内部群\n2. 在群里 @我 发送第一条消息；收到后自动启用，不需要再绑定\n3. 私聊发送 \`threadferry groups\` 查看状态并管理成员权限\n\n其他管理命令：\n- \`threadferry users <群名>\` 查看可使用用户\n- \`threadferry invite <群名>\` 生成一次性邀请码\n- \`threadferry add <群名> <姓名>\` 直接授权\n- \`threadferry remove <群名> <姓名>\` 移除授权\n- \`threadferry open <群名>\` 允许群内所有成员使用\n- \`threadferry close <群名>\` 恢复仅授权成员可用\n- \`threadferry disable <群名>\` 停用并保留名单和 Session\n- \`threadferry enable <群名>\` 启用或重新接入\n- \`threadferry unbind <群名>\` 移除 ThreadFerry 绑定并清理 Session\n- \`threadferry whoami\` 查看自己的 userid\n\n每个 Agent 对应一个机器人：想用别的 Workspace，就去和那个机器人私聊。\n群或成员重名时，按我返回的 ID 重新发送即可。`);
     }
     if (command.name === "bind") return respond(reply, "现在不需要手动绑定。把机器人拉进群并 @我 发送第一条消息，ThreadFerry 收到后会自动启用。");
     if (command.name === "confirm") {
@@ -597,6 +619,10 @@ export function createApp(config: AgentView, dependencies: AppDependencies, stat
       if (!pending || pending.expiresAt < Date.now()) {
         pendingActions.delete(code);
         return respond(reply, "确认码无效或已过期。请重新提出需求，我会给一个新的确认码。");
+      }
+      if (pending.groupId && config.groups[pending.groupId]?.removed) {
+        pendingActions.delete(code);
+        return respond(reply, "该群的机器人绑定已移除，原操作确认已取消。");
       }
       if (!dependencies.runAction && pending.prepared.command[0] !== "internal") return respond(reply, "当前启动方式不支持代为执行企业微信动作。");
       pendingActions.delete(code);
@@ -665,7 +691,7 @@ export function createApp(config: AgentView, dependencies: AppDependencies, stat
         const configured = Boolean(config.groups[id]);
         const agent = config.groups[id]?.agent;
         const openTag = config.groups[id]?.allowAll ? " 全员可用" : "";
-        const enabledTag = config.groups[id]?.enabled === false ? " 已停用" : "";
+        const enabledTag = config.groups[id]?.removed ? " 已移除" : config.groups[id]?.enabled === false ? " 已停用" : "";
         return `- ${configured ? `[${agent}]` : "[等待首次 @ 自动启用]"}${enabledTag}${openTag} ${session?.name ?? "未获取群名"}\n  \`${id}\``;
       });
       return respond(reply, `机器人最近群会话：\n${lines.length ? lines.join("\n") : "暂无可见群会话"}`);
@@ -685,6 +711,32 @@ export function createApp(config: AgentView, dependencies: AppDependencies, stat
     }
     const groupLabel = group.name ?? group.id;
     const configured = config.groups[group.id]!;
+    if (command.name === "enable" || command.name === "disable") {
+      if (!dependencies.updateGroupEnabled) return respond(reply, "当前启动方式不支持修改机器人可用状态。");
+      const enabled = command.name === "enable";
+      const wasRemoved = configured.removed === true;
+      if (!enabled && configured.removed) return respond(reply, `机器人已从群“${groupLabel}”的 ThreadFerry 配置中移除。重新接入请发送 \`threadferry enable <群名>\`。`);
+      try {
+        await dependencies.updateGroupEnabled(group.id, enabled);
+        return respond(reply, enabled
+          ? `已${wasRemoved ? "重新接入" : "启用"}群“${groupLabel}”的机器人。`
+          : `已停用群“${groupLabel}”的机器人；授权名单和 Session 已保留。`);
+      } catch (error) {
+        return respond(reply, error instanceof Error ? error.message : "机器人状态更新失败。");
+      }
+    }
+    if (command.name === "unbind") {
+      if (!dependencies.removeGroup) return respond(reply, "当前启动方式不支持移除群机器人绑定。");
+      try {
+        await dependencies.removeGroup(group.id);
+        for (const [code, item] of invites) if (item.groupId === group.id) invites.delete(code);
+        for (const [code, item] of pendingActions) if (item.groupId === group.id) pendingActions.delete(code);
+        return respond(reply, `已移除群“${groupLabel}”的 ThreadFerry 机器人绑定，并清理授权和 Runtime Session。\n\n企业微信当前没有机器人主动退群接口；如需从群成员中移除机器人，请由群管理员在企业微信中操作。重新接入可发送 \`threadferry enable <群名>\`。`);
+      } catch (error) {
+        return respond(reply, error instanceof Error ? error.message : "群机器人绑定移除失败。");
+      }
+    }
+    if (configured.removed) return respond(reply, `机器人已从群“${groupLabel}”移除；当前只支持发送 \`threadferry enable <群名>\` 重新接入。`);
     if (command.name === "users") {
       const heading = configured.allowAll
         ? `群“${groupLabel}”已开启全员可用，群内所有成员都可以 @机器人 使用。\n关闭后仍然生效的授权用户：`
@@ -747,6 +799,14 @@ export function createApp(config: AgentView, dependencies: AppDependencies, stat
     if (command.name === "whoami") return respond(reply, `你的 ThreadFerry userid：\`${await authoritativeId(message.senderId)}\``);
     if (command.name === "join") return join(message.senderId, command.arguments[0], reply, message.groupId);
     return respond(reply, "机器人权限管理请私聊 ThreadFerry，并发送 `threadferry help` 查看命令。");
+  }
+
+  async function handleGroupRemovalRequest(message: IncomingMention, reply: Reply): Promise<HandleResult> {
+    const group = config.groups[message.groupId];
+    if (!group || group.enabled === false) return "unauthorized_group";
+    if (!(await state.claimCommand(message.msgId, message.groupId, selfAgent()))) return "duplicate";
+    if (!(await isOwner(message.senderId))) return respond(reply, ownerOnly("移除群机器人", await authoritativeId(message.senderId)));
+    return respond(reply, `可以移除这台机器人在 ThreadFerry 中的群绑定。为避免误操作，请私聊当前机器人发送 \`threadferry unbind ${message.groupId}\` 确认。\n\n企业微信当前没有机器人主动退群接口；如需从群成员中移除机器人，请由群管理员在企业微信中操作。`);
   }
 
   function serial<T>(groupId: string, operation: () => Promise<T>): Promise<T> {
@@ -971,6 +1031,7 @@ export function createApp(config: AgentView, dependencies: AppDependencies, stat
     async handle(message: IncomingMention, reply: Reply): Promise<HandleResult> {
       const command = managementCommand(message.text);
       if (command && message.mentioned) return handleGroupCommand(message, reply, command);
+      if (message.mentioned && robotRemovalRequest(message.text)) return handleGroupRemovalRequest(message, reply);
       const authorization = await authorizeMessage(message);
       if (!authorization.allowed) {
         return authorization.reason === "group"

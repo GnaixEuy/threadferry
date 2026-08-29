@@ -51,7 +51,7 @@ import { findUpdate, installUpdate } from "./update.js";
 import { installOfficialWecomSkills, officialWecomSkillsInstalled } from "./wecom-skills.js";
 import { runWorkflowTick } from "./workflow.js";
 
-const VERSION = "0.28.0";
+const VERSION = "0.29.1";
 const UPDATE_INTERVAL_MS = 6 * 60 * 60 * 1_000;
 const WORKFLOW_INTERVAL_MS = 30_000;
 interface DesktopParentPort {
@@ -973,6 +973,40 @@ async function start(
     };
     const views = new Map<string, AgentView>();
     const state = new ThreadFerryState(defaultStatePath());
+    const updateGroupEnabled = (groupId: string, agentId: string, enabled: boolean) => updateConfig((latest) => {
+      const access = latest.groups[groupId]?.agents[agentId];
+      if (!access) throw new Error("该群没有这个机器人记录");
+      if (enabled) {
+        delete access.enabled;
+        delete access.removed;
+      } else {
+        access.enabled = false;
+      }
+    });
+    const removeGroup = async (groupId: string, agentId: string): Promise<void> => {
+      const agent = config.agents[agentId];
+      if (!config.groups[groupId]?.agents[agentId] || !agent) throw new Error("该群没有这个机器人记录");
+      await state.clearSession(groupId, sessionScope(agentId, agent));
+      await updateConfig((latest) => {
+        const currentAgent = latest.agents[agentId];
+        const access = latest.groups[groupId]?.agents[agentId];
+        if (!access || !currentAgent) throw new Error("该群没有这个机器人记录");
+        access.allowUsers = [currentAgent.ownerUser];
+        delete access.allowAll;
+        access.enabled = false;
+        access.removed = true;
+      });
+      try {
+        const reminders = (await state.listReminders(agentId)).filter((item) => item.chatType === "group" && item.chatId === groupId);
+        const deliveries = (await state.pendingDeliveries()).filter((item) => item.agent === agentId && item.groupId === groupId);
+        await Promise.all([
+          ...reminders.map((item) => state.cancelReminder(item.id)),
+          ...deliveries.map((item) => state.completeDelivery(item.id)),
+        ]);
+      } catch {
+        throw new Error("群绑定已移除，但提醒或待发送消息清理失败；请检查 ThreadFerry 状态");
+      }
+    };
 
     // 各 Agent 的连接索引。连接在下面才建立，但 app 的依赖里要先捕获这个 Map：
     // 转交回复和动作回执都优先走机器人自己的 WS 连接。
@@ -1004,14 +1038,18 @@ async function start(
       updateAllowUsers: (groupId, users) => updateConfig((latest) => {
         const access = latest.groups[groupId]?.agents[agentId];
         if (!access) throw new Error("指定群未绑定给该 Agent");
+        if (access.removed) throw new Error("机器人已从该群移除；重新接入后才能管理用户");
         access.allowUsers = users;
       }),
       updateGroupAccess: (groupId, allowAll) => updateConfig((latest) => {
         const access = latest.groups[groupId]?.agents[agentId];
         if (!access) throw new Error("指定群未绑定给该 Agent");
+        if (access.removed) throw new Error("机器人已从该群移除；重新接入后才能修改访问开关");
         if (allowAll) access.allowAll = true;
         else delete access.allowAll;
       }),
+      updateGroupEnabled: (groupId, enabled) => updateGroupEnabled(groupId, agentId, enabled),
+      removeGroup: (groupId) => removeGroup(groupId, agentId),
       listGroups,
       searchUsers: (keywords) => searchWecomUsers(keywords, runner),
       agentIds: () => Object.keys(config.agents),
@@ -1103,6 +1141,7 @@ async function start(
         if (!config.groups[groupId]?.agents[agentId] || !agent) throw new Error("该群未绑定给这个 Agent");
         return state.clearSession(groupId, sessionScope(agentId, agent));
       },
+      removeGroup,
     }, port);
     console.log(`ThreadFerry 管理台: ${admin.url}`);
     try {
@@ -1193,6 +1232,7 @@ async function start(
         agentId: host.agentId,
         ownerUser: host.view.ownerUser,
         runAutomation: host.app.runAutomation,
+        canNotify: (chatId: string) => config.groups[chatId]?.agents[host.agentId]?.removed !== true,
         notify: async (chatId: string, content: string) => {
           const client = clients.get(host.agentId);
           if (client) {
@@ -1209,8 +1249,12 @@ async function start(
       // 一个群可能挂着多台机器人，所以恢复优先认状态记录里的 Agent；
       // 旧记录没有这个字段时，只有群里恰好只有一个 Agent 才敢兜底，否则宁可不发也不冒名。
       const hostForGroup = (groupId: string, agent?: string) => {
-        if (agent) return hosts.find((host) => host.agentId === agent);
-        const candidates = Object.keys(config.groups[groupId]?.agents ?? {});
+        if (agent) {
+          if (config.groups[groupId]?.agents[agent]?.removed) return undefined;
+          return hosts.find((host) => host.agentId === agent);
+        }
+        const candidates = Object.entries(config.groups[groupId]?.agents ?? {})
+          .filter(([, access]) => access.enabled !== false).map(([agentId]) => agentId);
         return candidates.length === 1 ? hosts.find((host) => host.agentId === candidates[0]) : undefined;
       };
       const recovery = (async () => {
@@ -1218,6 +1262,11 @@ async function start(
           // 必须用该群所属 Agent 的机器人补发；用别的机器人会从错误身份发出去。
           const host = hostForGroup(delivery.groupId, delivery.agent);
           if (!host) {
+            if (delivery.agent && config.groups[delivery.groupId]?.agents[delivery.agent]?.removed) {
+              await state.completeDelivery(delivery.id);
+              console.log(`[state] 已丢弃已移除群中 Agent ${delivery.agent} 的待发送回复`);
+              continue;
+            }
             if (delivery.agent) {
               console.error(`[state] 保留待发送回复：Agent ${delivery.agent} 未启动`);
               continue;

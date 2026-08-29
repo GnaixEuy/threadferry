@@ -109,8 +109,18 @@ node dist/src/cli.js start --config ./threadferry.yaml --mock
 - [ ] 在群中先发送三条普通消息，再由授权成员发送 `@机器人 帮我分析`；确认回复出现在同一群，并引用
       最近 6 小时上下文。
 - [ ] 在群详情停用机器人，确认群内 `@机器人` 不启动 Runtime；重新启用后授权名单和 Session 仍保留。
+- [ ] Owner 在群中发送 `@机器人 机器人我想移除`，确认系统不启动 Runtime，而是要求私聊使用显式
+      `threadferry unbind <群>` 命令确认。
+- [ ] 在群详情执行“移除机器人”或私聊执行 `threadferry unbind <群>`，确认授权和该 Agent 的群 Session
+      被清理、状态显示“已移除”，刷新群列表或再次 `@` 不会自动接回；执行 `threadferry enable <群>`
+      后可重新接入。
+- [ ] 移除前生成邀请码、群提醒和一条待补发消息；移除后确认旧邀请码失效，提醒、协作任务和待发送消息
+      不执行也不投递，`open`、`add` 及管理台旧表单不能修改已移除群。
+- [ ] 确认移除结果明确提示：ThreadFerry 无法通过当前官方接口让机器人主动退群，从企业微信群成员中
+      移除仍需群管理员操作。
 - [ ] 验证未授权成员和没有 `@机器人` 的群消息均不启动 Runtime。
-- [ ] 使用 `threadferry add`、`remove`、`invite`、`join`、`open`、`close` 验证授权变更即时生效。
+- [ ] 使用 `threadferry add`、`remove`、`invite`、`join`、`open`、`close`、`disable`、`enable`、`unbind`
+      验证授权和机器人状态变更即时生效。
 - [ ] 搜索同名成员时，确认系统返回候选部门与 userid，未选择前不修改授权名单。
 - [ ] 在群中发送管理命令，确认系统要求 Owner 改用私聊。
 - [ ] 确认 Owner 不能从授权名单中删除自己。
