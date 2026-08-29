@@ -188,17 +188,26 @@ The Owner manages a bot's groups by sending commands in direct chat with that bo
 | `threadferry remove <group> <name>` | Remove a user |
 | `threadferry open <group>` | Allow every group member to invoke the bot |
 | `threadferry close <group>` | Restore the authorized-user list |
+| `threadferry disable <group>` | Stop the bot while preserving access and session state |
+| `threadferry enable <group>` | Enable or reconnect the bot |
+| `threadferry unbind <group>` | Remove the ThreadFerry binding and clear access and session state |
 | `threadferry whoami` | Show the caller's ThreadFerry userid |
 
 Add the bot to an internal group and mention it once. ThreadFerry enables that bot for the group on
 the first callback, with only its Owner authorized by default. The admin console group detail page
-controls whether the bot is available and which members may use it; no separate binding step is
-required. Group discovery covers groups with messages in the last seven days.
+can stop, reconnect, or remove the ThreadFerry binding and manage who may use it; no separate binding
+step is required. A natural-language request to remove the bot is recognized and asks the Owner to
+confirm with `threadferry unbind`.
+
+Unbinding does not remove the bot from the WeCom group member list because the current official API
+does not expose a bot-initiated leave operation. A group administrator must remove it in WeCom.
+ThreadFerry keeps a removed marker so discovery or another mention cannot silently reconnect it;
+`threadferry enable` reconnects it. Group discovery covers groups with messages in the last seven days.
 
 ## Security
 
 - Direct-agent requests are accepted only from that bot's Owner.
-- Stopped groups, unauthorized users, and messages without a bot mention do not start a runtime.
+- Stopped or removed groups, unauthorized users, and messages without a bot mention do not start a runtime.
 - Agents do not share credentials, Owners, sessions, chat history, or workspace access.
 - Codex runs without network or file writes. Pi exposes path-guarded `read` and `ls`. Claude Code uses
   Safe Mode and read-only tools. Grok Build uses a strict sandbox with web, subagents, and memory disabled.

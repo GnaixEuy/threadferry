@@ -382,6 +382,11 @@ document.addEventListener("DOMContentLoaded", function () {
       button.textContent = "检查中…";
     });
   });
+  each("[data-confirm]", function (form) {
+    form.addEventListener("submit", function (event) {
+      if (!window.confirm(form.getAttribute("data-confirm"))) event.preventDefault();
+    });
+  });
   setupDialogs();
   setupOnboardingTour();
   each("[data-auth-form]", setupAuthMode);

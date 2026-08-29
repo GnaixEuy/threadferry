@@ -91,6 +91,8 @@ export interface GroupAccess {
   allowAll?: boolean;
   /** 缺省可用；显式 false 用于保留名单但停用该机器人，避免群消息把它自动重新启用。 */
   enabled?: false;
+  /** 已从 ThreadFerry 移除；保留墓碑，避免群会话发现或再次 @ 时自动接回。 */
+  removed?: true;
 }
 
 /**
@@ -111,6 +113,7 @@ export interface GroupConfig {
   allowUsers: string[];
   allowAll?: boolean;
   enabled?: false;
+  removed?: true;
   context: {
     lookbackHours: number;
     maxMessages: number;

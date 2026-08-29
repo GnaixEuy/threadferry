@@ -63,6 +63,45 @@ test("a failed proactive delivery retries the outbox without running the reminde
   assert.equal((await state.pendingDeliveries()).length, 0);
 });
 
+test("removed group automation is cancelled without running or delivering", async () => {
+  const state = new ThreadFerryState();
+  const reminder = await state.createReminder({
+    agent: "assistant",
+    chatId: "removed-group",
+    chatType: "group",
+    createdBy: "owner",
+    instruction: "发送群日报",
+    runAt: "2026-08-21T01:00:00.000Z",
+  });
+  const task = await state.createWorkItem({
+    title: "群协作任务",
+    description: "整理群资料",
+    createdBy: "owner",
+    createdAgent: "assistant",
+    assignedAgent: "assistant",
+    sourceChatId: "removed-group",
+    sourceChatType: "group",
+  });
+  await state.queueDelivery("old-group-reply", "removed-group", "旧待发送消息", "assistant");
+  let runs = 0;
+  let sends = 0;
+  const host: WorkflowHost = {
+    agentId: "assistant",
+    ownerUser: "owner",
+    canNotify: (chatId) => chatId !== "removed-group",
+    runAutomation: async () => { runs += 1; return "不应执行"; },
+    notify: async () => { sends += 1; },
+  };
+
+  await runWorkflowTick(state, [host], new Date("2026-08-21T01:00:01.000Z"));
+  assert.equal(runs, 0);
+  assert.equal(sends, 0);
+  assert.equal((await state.listReminders())[0]?.status, "cancelled");
+  assert.equal((await state.getWorkItem(task.id))?.status, "failed");
+  assert.equal((await state.pendingDeliveries()).length, 0);
+  assert.equal((await state.recentActivities()).some((item) => item.type === "reminder.cancelled" && item.resource === reminder.id), true);
+});
+
 test("a work item executes on one agent and is reviewed by another without sharing sessions", async () => {
   const state = new ThreadFerryState();
   const task = await state.createWorkItem({

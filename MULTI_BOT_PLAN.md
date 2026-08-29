@@ -615,6 +615,9 @@ default	codex	default	/Users/gnaixeuy/Desktop/ThreadFerry	aibS5gFrdrjbT-Fluj16Lw
 - [x] 群接入改为自动：机器人第一次收到群内 `@` 回调，或会话列表确认 `hasBotSession` 时，自动写入
       Owner 默认授权；管理台不再要求二次绑定，只保留机器人可用开关和成员权限。显式停用写入
       `enabled: false`，后续群消息不会自动重新启用；删除机器人时一并清理它的已停用群记录
+- [x] 群机器人生命周期补齐（0.29.0）：Owner 私聊和管理台都支持停用、重新接入和移除 ThreadFerry
+      绑定；移除写入 `removed: true` 墓碑并清理授权与 Session，避免群发现或再次 `@` 自动复活。
+      当前官方 CLI 没有机器人主动退群接口，物理移除仍由企业微信群管理员完成
 - [x] 归属信息抽成 `src/agent-origin.ts`：**通讯录权限是可选的，绝不阻塞**——页面只读缓存、
       后台刷新、限时 5 秒、身份先落缓存再查通讯录、失败按 TTL 抑制重试、启动时后台预热
 - [x] 群成员名单显示姓名（`src/directory-names.ts`）：企业微信**不支持按 userid 反查通讯录**

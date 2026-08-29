@@ -177,16 +177,23 @@ Owner 通过私聊目标机器人管理它自己的群：
 | `threadferry remove <群> <姓名>` | 移除用户 |
 | `threadferry open <群>` | 允许群内所有成员使用 |
 | `threadferry close <群>` | 恢复授权名单 |
+| `threadferry disable <群>` | 停用机器人，保留授权和 Session |
+| `threadferry enable <群>` | 启用或重新接入机器人 |
+| `threadferry unbind <群>` | 移除 ThreadFerry 绑定，清理授权和 Session |
 | `threadferry whoami` | 查看当前用户的 ThreadFerry userid |
 
 把机器人拉入内部群后，在群里 @它一次。ThreadFerry 收到第一次回调就会自动启用这台机器人，默认仅
-Owner 可用，不再需要单独绑定。之后在管理台群详情中控制机器人是否可用，以及哪些群成员可以使用。
-群列表可发现最近 7 天有消息的群。
+Owner 可用，不再需要单独绑定。之后可在管理台群详情停用、重新接入、移除 ThreadFerry 绑定和管理成员。
+说“机器人我想移除”时，系统也会识别意图并要求 Owner 用 `threadferry unbind` 明确确认。
+
+`unbind` 和管理台“移除机器人”不会把机器人从企业微信群成员中踢出：当前官方接口没有机器人主动退群
+能力，这一步仍需群管理员在企业微信中操作。ThreadFerry 会保留“已移除”标记，避免群列表刷新或再次
+`@机器人` 时自动接回；`threadferry enable` 可重新接入。群列表可发现最近 7 天有消息的群。
 
 ## 安全边界
 
 - 每台机器人只接受自己 Owner 的私聊 Agent 请求。
-- 已停用群、未授权用户和没有 `@机器人` 的消息不会启动 Runtime。
+- 已停用或已移除的群、未授权用户和没有 `@机器人` 的消息不会启动 Runtime。
 - Agent 之间不共享凭据、Owner、Session、会话历史或 Workspace。
 - Codex 禁用网络和文件写入；Pi 只开放经过路径守卫的 `read` 和 `ls`；Claude Code 使用 Safe Mode
   和只读工具；Grok Build 使用 strict sandbox，并关闭 Web、子 Agent 和 Memory。

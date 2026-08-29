@@ -4,6 +4,7 @@ export interface WorkflowHost {
   agentId: string;
   ownerUser: string;
   runAutomation: (id: string, instruction: string, createdBy: string, untrustedContext?: string) => Promise<string>;
+  canNotify?: (chatId: string) => boolean;
   notify: (chatId: string, content: string) => Promise<void>;
 }
 
@@ -24,6 +25,8 @@ async function notifyDurably(
   chatId: string,
   content: string,
 ): Promise<void> {
+  const host = hosts.find((item) => item.agentId === agent);
+  if (host?.canNotify?.(chatId) === false) return;
   let deliveryId: string;
   try {
     deliveryId = await state.queueDelivery(identity, chatId, notificationContent(content), agent);
@@ -31,7 +34,6 @@ async function notifyDurably(
     await state.recordActivity({ agent, type: "notification.send", outcome: "failure", resource: identity }).catch(() => undefined);
     return;
   }
-  const host = hosts.find((item) => item.agentId === agent);
   if (!host) return;
   try {
     const delivery = (await state.pendingDeliveries()).find((item) => item.id === deliveryId);
@@ -50,6 +52,11 @@ async function flushNotifications(state: ThreadFerryState, hosts: WorkflowHost[]
     && hosts.some((host) => host.agentId === delivery.agent));
   await Promise.all(deliveries.map(async (delivery) => {
     const host = hosts.find((item) => item.agentId === delivery.agent)!;
+    if (host.canNotify?.(delivery.groupId) === false) {
+      await state.completeDelivery(delivery.id);
+      await state.recordActivity({ agent: host.agentId, type: "notification.cancelled", outcome: "info", resource: delivery.id }).catch(() => undefined);
+      return;
+    }
     try {
       await host.notify(delivery.groupId, delivery.content);
       await state.completeDelivery(delivery.id);
@@ -66,6 +73,11 @@ async function runReminder(state: ThreadFerryState, reminder: ReminderRecord, ho
   if (!host) {
     await state.finishReminder(reminder.id, false, now);
     await state.recordActivity({ agent: reminder.agent, type: "reminder.fired", outcome: "failure", resource: reminder.id }).catch(() => undefined);
+    return;
+  }
+  if (reminder.chatType === "group" && host.canNotify?.(reminder.chatId) === false) {
+    await state.cancelReminder(reminder.id);
+    await state.recordActivity({ agent: reminder.agent, type: "reminder.cancelled", outcome: "info", resource: reminder.id }).catch(() => undefined);
     return;
   }
   let content: string;
@@ -108,6 +120,11 @@ async function runTask(state: ThreadFerryState, task: WorkItemRecord, host: Work
     await state.failWorkItem(task.id, "协作任务跨越了 Owner 边界，已拒绝执行。");
     await state.recordActivity({ agent: host.agentId, type: "work.denied", outcome: "failure", resource: task.id }).catch(() => undefined);
     await notifyTask(state, task, hosts).catch(() => undefined);
+    return;
+  }
+  if (task.sourceChatType === "group" && source.canNotify?.(task.sourceChatId) === false) {
+    await state.failWorkItem(task.id, "来源群的机器人绑定已移除，协作任务已取消。");
+    await state.recordActivity({ agent: host.agentId, type: "work.cancelled", outcome: "info", resource: task.id }).catch(() => undefined);
     return;
   }
   const { instruction, context } = taskInstruction(task);

@@ -123,7 +123,7 @@ export function pairConfig(
   }, agentId, userId));
 }
 
-/** 机器人已确认在群时补上默认授权；已存在（包括已停用）的配置保持不变。 */
+/** 机器人已确认在群时补上默认授权；已存在（包括已停用或已移除）的配置保持不变。 */
 export function ensureGroupAccess(config: ThreadFerryConfig, groupId: string, agentId: string): boolean {
   const owner = config.agents[agentId]?.ownerUser;
   if (!owner) throw new Error(`Agent ${agentId} 未配置`);
@@ -173,6 +173,7 @@ export function configText(config: ThreadFerryConfig): string {
         allow_users: access.allowUsers,
         ...(access.allowAll ? { allow_all: true } : {}),
         ...(access.enabled === false ? { enabled: false } : {}),
+        ...(access.removed ? { removed: true } : {}),
       };
       groupsByAgent.set(agentId, bucket);
     }
@@ -225,6 +226,7 @@ function viewGroups(config: ThreadFerryConfig, agentId: string): Record<string, 
       allowUsers: access.allowUsers,
       ...(access.allowAll ? { allowAll: true } : {}),
       ...(access.enabled === false ? { enabled: false as const } : {}),
+      ...(access.removed ? { removed: true as const } : {}),
       context: group.context,
     };
   }
@@ -273,7 +275,7 @@ export async function saveConfig(path: string, config: ThreadFerryConfig): Promi
 // 之后由 loadConfig 做语义校验（workspace 解析、userid 格式、allow_users 不变式）。
 // 内存结构仍是扁平的（顶层 ownerUser + 带 agent 字段的 groups），Phase 1b 才会改。
 interface FlatAgentRaw { runtime: unknown; workspace: unknown; owner_user: unknown; model?: unknown; config_dir?: unknown }
-interface FlatGroupRaw { id: string; agent: string; allow_users: unknown; allow_all?: unknown; enabled?: unknown }
+interface FlatGroupRaw { id: string; agent: string; allow_users: unknown; allow_all?: unknown; enabled?: unknown; removed?: unknown }
 interface FlatDocument { agents: Record<string, FlatAgentRaw>; groups: FlatGroupRaw[] }
 
 function rejectExtraKeys(actual: Record<string, unknown>, allowed: string[], label: string): void {
@@ -301,13 +303,14 @@ function readV6Document(root: Record<string, unknown>): FlatDocument {
     };
     for (const [groupId, groupValue] of Object.entries(object(agent.groups ?? {}, `Agent ${agentId} 的 groups`))) {
       const group = object(groupValue, `群 ${groupId}`);
-      rejectExtraKeys(group, ["allow_users", "allow_all", "enabled"], `群 ${groupId} `);
+      rejectExtraKeys(group, ["allow_users", "allow_all", "enabled", "removed"], `群 ${groupId} `);
       groups.push({
         id: groupId,
         agent: agentId,
         allow_users: group.allow_users,
         ...(group.allow_all !== undefined ? { allow_all: group.allow_all } : {}),
         ...(group.enabled !== undefined ? { enabled: group.enabled } : {}),
+        ...(group.removed !== undefined ? { removed: group.removed } : {}),
       });
     }
   }
@@ -365,6 +368,8 @@ export async function loadConfig(path: string): Promise<ThreadFerryConfig> {
     if (!agents[group.agent]) throw new Error(`群 ${groupId} 引用了不存在的 Agent`);
     if (group.allow_all !== undefined && typeof group.allow_all !== "boolean") throw new Error(`${label} 的 allow_all 必须是布尔值`);
     if (group.enabled !== undefined && typeof group.enabled !== "boolean") throw new Error(`${label} 的 enabled 必须是布尔值`);
+    if (group.removed !== undefined && typeof group.removed !== "boolean") throw new Error(`${label} 的 removed 必须是布尔值`);
+    if (group.removed === true && group.enabled !== false) throw new Error(`${label} 已移除时 enabled 必须为 false`);
     if (!Array.isArray(group.allow_users) || !group.allow_users.every((user) => typeof user === "string" && USER_ID.test(user))) {
       throw new Error(`${label} 的 allow_users 必须是非空字符串数组`);
     }
@@ -377,6 +382,7 @@ export async function loadConfig(path: string): Promise<ThreadFerryConfig> {
       allowUsers: [...new Set(group.allow_users as string[])],
       ...(group.allow_all === true ? { allowAll: true } : {}),
       ...(group.enabled === false ? { enabled: false as const } : {}),
+      ...(group.removed === true ? { removed: true as const } : {}),
     };
     groups[groupId] = binding;
   }
