@@ -192,6 +192,8 @@ test("release workflow publishes directly installable desktop packages", () => {
   for (const secret of ["MAC_CSC_LINK", "MAC_CSC_KEY_PASSWORD", "APPLE_ID", "APPLE_APP_SPECIFIC_PASSWORD", "APPLE_TEAM_ID"]) {
     assert.match(workflow, new RegExp(`secrets\\.${secret}`));
   }
+  assert.match(workflow, /Skipping the macOS package because Developer ID signing is not configured/);
+  assert.match(workflow, /runner\.os != 'macOS' \|\| steps\.macos\.outputs\.build == 'true'/);
   assert.match(workflow, /needs: \[cli, desktop\]/);
   assert.match(workflow, /merge-multiple: true/);
   assert.match(workflow, /sha256sum > SHA256SUMS/);

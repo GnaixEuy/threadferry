@@ -62,6 +62,8 @@ test("localhost admin manages agents, groups, and users with CSRF protection", a
   const resetCalls: string[] = [];
   const removeCalls: string[] = [];
   const authCalls: Array<{ agentId: string; mode: string; botId?: string; secret?: string }> = [];
+  const connectCalls: string[] = [];
+  let failNextAuth = false;
   const directoryAgents: string[] = [];
   let updateChecks = 0;
   const admin = await startAdminServer(config, {
@@ -72,7 +74,12 @@ test("localhost admin manages agents, groups, and users with CSRF protection", a
     botStatus: async (agentId) => agentId === "default"
       ? { authorized: true, botId: "aib-default", botName: "默认助手", ownerName: "苏粤翔", org: "月相工作室", connection: { state: "connected", changedAt: now, lastEventAt: now } }
       : { authorized: false, hint: `请执行 threadferry agent login ${agentId}` },
+    connectBot: async (agentId) => { connectCalls.push(agentId); return true; },
     authorizeBot: async (agentId, authorization) => {
+      if (failNextAuth) {
+        failNextAuth = false;
+        throw new Error("授权初始化失败，请检查机器人配置");
+      }
       authCalls.push({ agentId, ...authorization });
     },
     searchUsers: async (agentId, keywords) => {
@@ -362,12 +369,30 @@ test("localhost admin manages agents, groups, and users with CSRF protection", a
   assert.match(agentCards, /threadferry agent login reviewer/);
   assert.match(agentCards, /Owner[\s\S]*owner/);
   assert.match(agentCards, /授权机器人/);
+  assert.doesNotMatch(agentCards, /重新授权/);
   assert.doesNotMatch(agentCards, /super-secret/);
+
+  const repeatedAuth = await post("/agents/auth", { agentId: "default", authMode: "qr" });
+  const repeatedAuthLocation = new URL(repeatedAuth.headers.get("location") ?? "", admin.url);
+  assert.match(repeatedAuthLocation.searchParams.get("ok") ?? "", /已授权，正在建立连接/);
+  assert.deepEqual(authCalls, [{ agentId: "reviewer", mode: "manual", botId: "aib-reviewer", secret: "super-secret" }]);
+  assert.ok(connectCalls.includes("default"));
+  assert.ok(connectCalls.includes("reviewer"));
 
   const qr = await post("/agents/auth", { agentId: "reviewer", authMode: "qr" });
   assert.equal(qr.status, 303);
   assert.match(qr.headers.get("location") ?? "", /^\/agents\?ok=/);
   assert.deepEqual(authCalls.at(-1), { agentId: "reviewer", mode: "qr" });
+
+  failNextAuth = true;
+  const failedManualAuth = await post("/agents/auth", {
+    agentId: "reviewer", authMode: "manual", botId: "aib-failed", secret: "fake-secret",
+  });
+  const failedManualLocation = new URL(failedManualAuth.headers.get("location") ?? "", admin.url);
+  assert.equal(failedManualLocation.searchParams.get("authMode"), "manual");
+  assert.match(failedManualLocation.searchParams.get("error") ?? "", /授权初始化失败/);
+  assert.doesNotMatch(failedManualAuth.headers.get("location") ?? "", /fake-secret/);
+  assert.match(await (await fetch(failedManualLocation)).text(), /name="authMode" value="manual" checked/);
 
   // 名单是「群 + Agent」的，所以每个写操作都带 agentId。
   await post("/groups/users/add", { groupId: "group", agentId: "default", user: "张三" });

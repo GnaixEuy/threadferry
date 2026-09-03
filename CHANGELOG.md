@@ -4,7 +4,7 @@ ThreadFerry 的每个 GitHub Release 都使用这里对应版本的内容，不�
 
 ## Unreleased
 
-## 0.32.2
+## 0.32.3
 
 这是自 v0.29.1 以来的累计发布：恢复本地 Runtime 的原生自动化能力，补齐桌面应用内自动更新，
 并重新整理管理台的机器人、群聊、身份信息和反馈入口。
@@ -13,26 +13,36 @@ ThreadFerry 的每个 GitHub Release 都使用这里对应版本的内容，不�
 
 - Codex、Pi、Claude Code 和 Grok Build 重新读取各自的原生配置、项目指令、Skills、插件与工具；
   ThreadFerry 继续隔离机器人身份、凭据、Owner、群聊、Workspace 和 Session，并校验企业微信动作。
-- 桌面应用支持检查、下载、安装更新并自动重启；安装前会等待正在执行的任务安全结束。Release 同步提供
-  更新元数据、blockmap 和 macOS ZIP，macOS 安装包要求 Developer ID 签名与 Apple 公证。
+- 桌面应用支持检查、下载、安装更新并自动重启；安装前会等待正在执行的任务安全结束。Release 会提供
+  CLI、Windows 与 Linux 安装包；仅在配置 Developer ID 与 Apple 公证凭据时发布 macOS 安装包，绝不降级发布未签名版本。
 - 管理台改用更清晰的桌面工具层级；Bot、Owner、群和成员 ID 默认隐藏，悬停或键盘聚焦名称时显示，
   未取得姓名的旧成员显示为“未识别用户”。
 - 群详情去除重复标题，机器人启停、全员开关、成员、Session 与危险操作按关系分组，并适配窄屏。
 - 机器人可直接修改 Workspace；删除机器人时会明确列出仍需解除的群聊绑定，不再把“停用”误作“解绑”。
 - 偏好设置新增“问题反馈”，在新标签中直接打开 ThreadFerry 的 GitHub 新建 Issue 页面。
+- 已授权机器人不再显示重复授权入口；新增或刚完成授权的 Agent 会读取独立凭据并直接连接，授权失败时保留具体原因和所选方式。
 
 ### 安装与升级
 
-桌面版用户需要从 GitHub Release 手动安装 0.32.2 一次，之后可由应用自动更新。CLI 用户可执行：
+CLI 用户可直接升级；Windows 与 Linux 桌面用户可从 GitHub Release 安装 0.32.3。macOS 或 Linux：
 
-```bash
-npm install -g threadferry@0.32.2
+```sh
+curl -fsSL https://raw.githubusercontent.com/GnaixEuy/threadferry/main/install.sh | bash
 ```
+
+Windows PowerShell：
+
+```powershell
+irm https://raw.githubusercontent.com/GnaixEuy/threadferry/main/install.ps1 | iex
+```
+
+本次发布未配置 Apple Developer 付费证书，因此不提供 0.32.3 macOS 桌面安装包；macOS 可继续使用
+上述 CLI 安装方式，本地运行不需要 Apple 会员。配置 Developer ID 与公证凭据后才会恢复签名桌面包和自动更新。
 
 升级后重新启动 ThreadFerry；现有配置、凭据、授权关系和 Session 均不受影响。Runtime 将恢复自身原生
 权限，请只向可信用户和群开放机器人，并在各 Runtime 中配置符合需要的权限策略。
 
-[查看 v0.29.1...v0.32.2 的完整变更](https://github.com/GnaixEuy/threadferry/compare/v0.29.1...v0.32.2)
+[查看 v0.29.1...v0.32.3 的完整变更](https://github.com/GnaixEuy/threadferry/compare/v0.29.1...v0.32.3)
 
 ## 0.32.1
 

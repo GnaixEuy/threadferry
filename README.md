@@ -75,11 +75,11 @@ threadferry doctor
 This replaces the legacy split `wecomcli-*` Skills with the official `WecomTeam/wecom-unified` Skill
 and verifies `wecom-cli 1.2.0+`. Existing per-agent bot credentials do not need reauthorization.
 
-After installing the CLI and completing first-time setup, download the desktop app for everyday use
-from [GitHub Releases](https://github.com/GnaixEuy/threadferry/releases/latest): the arm64 DMG for
-Apple Silicon Macs, the x64 DMG for Intel Macs, the NSIS installer on Windows, or AppImage/DEB on
-Linux. The desktop app adds the tray entry; the runtime and official `wecom-cli` continue to use the
-local installation and login above.
+After installing the CLI and completing first-time setup, Windows and Linux users can download the
+NSIS, AppImage, or DEB desktop package from [GitHub Releases](https://github.com/GnaixEuy/threadferry/releases/latest).
+On macOS, use a desktop package only when the release includes a Developer ID-signed and Apple-notarized
+DMG; the CLI installation above works locally when no DMG is published. The desktop app adds the tray
+entry; the runtime and official `wecom-cli` continue to use the local installation and login above.
 
 ## First run
 
