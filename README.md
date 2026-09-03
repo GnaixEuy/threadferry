@@ -7,7 +7,7 @@
 </p>
 
 <p align="center">
-  <a href="#install">Install</a> · <a href="#first-run">First run</a> ·
+  <a href="#architecture">Architecture</a> · <a href="#install">Install</a> · <a href="#first-run">First run</a> ·
   <a href="#chat">Chat</a> · <a href="#security">Security</a> ·
   <a href="#operations">Operations</a> · <a href="./CHANGELOG.md">Changelog</a>
 </p>
@@ -23,14 +23,25 @@ authorized members can invoke the bot by mentioning it in configured groups.
 ## Capabilities
 
 - Run Codex, Pi, Claude Code, or Grok Build against a fixed local workspace.
-- Analyze direct messages and controlled group context without granting the runtime file writes or
-  arbitrary shell access.
+- Honor each runtime's native user configuration and workspace instructions, including its local tools,
+  skills, plugins, and automation capabilities.
 - Read images and UTF-8 text attachments, including quoted and recent chat resources.
 - Use the official `wecom-unified` Skill for contacts, calendars, meetings and rooms, todos, mail,
   messages, documents, storage, sheets, smart sheets, and smart pages through a validated `wecom-cli` broker.
 - Create reminders and hand work to another agent owned by the same person.
 - Recover sessions, queued work, and undelivered replies after restart.
 - Keep WeCom connections reconnecting and show each agent's connection and last-callback status in the local console.
+
+## Architecture
+
+<p align="center">
+  <img src="./docs/assets/threadferry-architecture.png" alt="ThreadFerry architecture: WeCom connects to an isolated local agent, runtime, state, and controlled action broker" width="100%">
+</p>
+
+Each agent owns its bot connection, Owner, credential directory, workspace, runtime, sessions, and
+authorized groups. The runtime handles the task and only proposes enterprise actions; ThreadFerry
+validates and executes them with that agent's credentials. State, chat history, reminders, work items,
+and delivery queues remain partitioned by agent or conversation.
 
 ## Install
 
@@ -90,7 +101,10 @@ launch at login, automatic service startup, opening the console after startup, a
 entry. On first open, the console shows a state-driven getting-started checklist and a three-step interface
 tour. The checklist collapses after bot authorization and the first Owner direct message; group setup remains
 optional, and the tour can be skipped or restarted from Preferences. The overview also visualizes sanitized
-runtime state with a seven-day processing trend and task-status distribution. Desktop preferences stay on the device.
+runtime state with a seven-day processing trend and task-status distribution. The desktop app checks for updates
+after launch and every six hours, downloads and verifies them in the background, waits for active work to drain,
+then installs and restarts automatically. Preferences also offers an immediate check. Desktop preferences stay
+on the device.
 
 For terminal operation, configured agents can still be started with:
 
@@ -209,10 +223,11 @@ ThreadFerry keeps a removed marker so discovery or another mention cannot silent
 - Direct-agent requests are accepted only from that bot's Owner.
 - Stopped or removed groups, unauthorized users, and messages without a bot mention do not start a runtime.
 - Agents do not share credentials, Owners, sessions, chat history, or workspace access.
-- Codex runs without network or file writes. Pi exposes path-guarded `read` and `ls`. Claude Code uses
-  Safe Mode and read-only tools. Grok Build uses a strict sandbox with web, subagents, and memory disabled.
-- Runtimes cannot commit, push, deploy, delete files, invoke arbitrary shell commands, or call
-  `wecom-cli` directly.
+- ThreadFerry does not override the local permission configuration of Codex, Pi, Claude Code, or Grok
+  Build. They load their native user configuration, workspace instructions, skills, plugins, and tools,
+  which may allow commands, file changes, or network access.
+- Grant bot access only to trusted users and groups, and configure approvals or sandboxes in each runtime.
+  WeCom actions should still go through `threadferry-action` for broker validation, confirmation, and audit.
 - Bot credentials remain in each agent's encrypted `wecom-cli` store. ThreadFerry does not persist Bot
   Secrets in configuration, state, logs, URLs, fixtures, or environment variables.
 - Chat history, quoted messages, attachments, and enterprise content are always untrusted input.

@@ -1,18 +1,9 @@
 import { resolveWorkspace } from "../config.js";
 import { prepareRuntimeResources } from "../attachments.js";
 import { CommandExecutionError, runCommand } from "../process.js";
+import { nativeRuntimeEnvironment } from "./environment.js";
 import { runtimeFailure, structuredRuntimeError } from "./runtime-error.js";
 import type { CommandRunner, RuntimeRequest, RuntimeResult } from "../types.js";
-
-function safeEnvironment(): NodeJS.ProcessEnv {
-  const allowed = [
-    "PATH", "HOME", "CODEX_HOME", "TMPDIR", "LANG", "LC_ALL",
-    "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "APPDATA", "LOCALAPPDATA", "TEMP", "TMP",
-    "SystemRoot", "WINDIR", "ComSpec", "PATHEXT",
-    "SSL_CERT_FILE", "NODE_EXTRA_CA_CERTS", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
-  ];
-  return Object.fromEntries(allowed.flatMap((key) => process.env[key] === undefined ? [] : [[key, process.env[key]]]));
-}
 
 function messageText(item: unknown): string | undefined {
   if (!item || typeof item !== "object") return undefined;
@@ -33,28 +24,11 @@ export async function runCodex(
 ): Promise<RuntimeResult> {
   const workspace = await resolveWorkspace(request.workspace);
   const prepared = await prepareRuntimeResources(request.prompt, request.resources);
-  const profile = "threadferry-read-only";
-  const filesystemPolicy = `{":minimal"="read",glob_scan_max_depth=8,":workspace_roots"={"."="read",".env"="deny",".env.*"="deny","**/.env"="deny","**/.env.*"="deny",".npmrc"="deny","**/.npmrc"="deny",".git-credentials"="deny","**/.git-credentials"="deny","*.pem"="deny","**/*.pem"="deny","*.key"="deny","**/*.key"="deny","*.p12"="deny","**/*.p12"="deny","id_rsa*"="deny","**/id_rsa*"="deny","id_ed25519*"="deny","**/id_ed25519*"="deny"}}`;
   const baseArgs = [
-    "-a", "never",
     "-C", workspace,
-    "--strict-config",
-    "-c", `default_permissions=${JSON.stringify(profile)}`,
-    "-c", `permissions.${profile}.description="ThreadFerry workspace-only read access"`,
-    "-c", `permissions.${profile}.filesystem=${filesystemPolicy}`,
-    "-c", `permissions.${profile}.network.enabled=false`,
-    "-c", `projects.${JSON.stringify(workspace)}.trust_level="untrusted"`,
-    "-c", "shell_environment_policy.inherit=none",
-    "--disable", "plugins",
-    "--disable", "apps",
-    "--disable", "browser_use",
-    "--disable", "computer_use",
-    "--disable", "image_generation",
     ...(request.model ? ["--model", request.model] : []),
     "exec",
     "--json",
-    "--ignore-user-config",
-    "--ignore-rules",
     "--skip-git-repo-check",
   ];
 
@@ -64,7 +38,7 @@ export async function runCodex(
     ...(sessionId ? ["resume", ...images, sessionId, "-"] : [...images, "-"]),
   ], {
     cwd: workspace,
-    env: safeEnvironment(),
+    env: nativeRuntimeEnvironment(),
     input: prepared.prompt,
     timeoutMs: 10 * 60_000,
     signal: request.signal,

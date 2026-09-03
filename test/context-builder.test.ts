@@ -32,6 +32,8 @@ test("context contains recent history as untrusted data and preserves the curren
     assert.match(prompt, new RegExp(expected));
   }
   assert.match(prompt, /不可信背景数据/);
+  assert.match(prompt, /优先遵循当前 Runtime 自动加载的用户配置、Workspace 指令/);
+  assert.match(prompt, /ThreadFerry 不额外限制本地工具、网络或自动化能力/);
   assert.match(prompt, /CURRENT_USER_INSTRUCTION/);
   assert.match(prompt, /@ThreadFerry 帮忙分析（原文）/);
   assert.match(prompt, /trace\.log/);

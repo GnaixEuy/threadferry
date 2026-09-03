@@ -2,24 +2,13 @@ import { createHash } from "node:crypto";
 import { lstat, mkdir } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
 import { prepareRuntimeResources } from "../attachments.js";
 import { resolveWorkspace } from "../config.js";
 import { runCommand } from "../process.js";
 import { officialWecomSkillPaths } from "../wecom-skills.js";
+import { nativeRuntimeEnvironment } from "./environment.js";
 import { runtimeFailure, structuredRuntimeError } from "./runtime-error.js";
 import type { CommandRunner, RuntimeRequest, RuntimeResult } from "../types.js";
-
-function safeEnvironment(): NodeJS.ProcessEnv {
-  const allowed = [
-    "PATH", "HOME", "TMPDIR", "LANG", "LC_ALL", "PI_CODING_AGENT_DIR",
-    "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "APPDATA", "LOCALAPPDATA", "TEMP", "TMP",
-    "SystemRoot", "WINDIR", "ComSpec", "PATHEXT",
-    "SSL_CERT_FILE", "NODE_EXTRA_CA_CERTS", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
-    "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GOOGLE_API_KEY", "GEMINI_API_KEY",
-  ];
-  return Object.fromEntries(allowed.flatMap((key) => process.env[key] === undefined ? [] : [[key, process.env[key]]]));
-}
 
 function assistantText(message: unknown): string | undefined {
   if (!message || typeof message !== "object" || (message as { role?: unknown }).role !== "assistant") return undefined;
@@ -48,13 +37,10 @@ export async function runPi(
   const sessionDir = join(sessionRoot, createHash("sha256").update(request.agentId).digest("hex"));
   await mkdir(sessionDir, { recursive: true, mode: 0o700 });
   if ((await lstat(sessionDir)).isSymbolicLink()) throw new Error("Pi Agent Session 目录不能是符号链接");
-  const extension = fileURLToPath(new URL("./pi-readonly-extension.js", import.meta.url));
   const args = [
     "--mode", "json", "--print",
-    "--tools", "read,ls",
-    "--no-extensions", "--extension", extension,
-    "--no-skills", ...officialWecomSkillPaths().flatMap((path) => ["--skill", path]),
-    "--no-prompt-templates", "--no-themes", "--no-context-files", "--no-approve",
+    "--approve",
+    ...officialWecomSkillPaths().flatMap((path) => ["--skill", path]),
     "--session-dir", sessionDir,
     ...(request.model ? ["--model", request.model] : []),
     ...(request.sessionId ? ["--session-id", request.sessionId] : []),
@@ -66,7 +52,7 @@ export async function runPi(
     try {
       ({ stdout } = await runner("pi", args, {
         cwd: workspace,
-        env: safeEnvironment(),
+        env: nativeRuntimeEnvironment(),
         input: prepared.prompt,
         timeoutMs: 10 * 60_000,
         signal: request.signal,

@@ -57,6 +57,13 @@ agent 之间完全独立。多条连接并发跑在一个 ThreadFerry 进程里�
 
 ## 设计修正记录
 
+**2026-09-03：Runtime 权限交回本地 Agent。**
+
+- [x] ThreadFerry 不再覆盖 Codex、Pi、Claude Code 和 Grok Build 的用户配置、Workspace 指令、Skills、
+  插件、工具或沙箱；`AGENTS.md` / `CLAUDE.md` 按各 Runtime 原生顺序加载。
+- [x] Host 继续负责机器人身份、会话与凭据隔离，以及 `threadferry-action` 的来源、参数、确认和审计；
+  本地命令、文件与网络权限由各 Runtime 自己的配置承担。
+
 **2026-08-27：升级到 `wecom-cli 1.2.0` 与官方统一 Agent Skill。**
 
 - [x] 安装器和 `doctor` 使用 `wecom-cli 1.2.0` 基线；远程自描述、service 别名和上传 token 刷新重放由

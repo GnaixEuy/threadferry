@@ -90,6 +90,12 @@ node dist/src/cli.js start --config ./threadferry.yaml --mock
       不显示消息正文。
 - [ ] 打开“偏好设置”，确认主题、日志追踪入口、登录时启动、自动启动服务、启动后打开管理台和 macOS
       Dock 入口按平台正确显示；修改后重启桌面应用，确认选择仍然保留。
+- [ ] 使用落后于 Latest Release 的已签名桌面版本启动应用，确认无需点击即可在后台发现并下载当前系统与
+      架构的更新，通过更新元数据校验后自动安装和重启；偏好设置同步显示检查、进度、等待、安装或失败状态。
+- [ ] 在 Runtime 任务执行期间触发桌面更新，确认停止接收新任务、等待当前任务和持久化工作结束后再安装，
+      更新后的桌面应用与 Host 自动恢复，配置、凭据、Session 和本机历史保持不变。
+- [ ] 使用被篡改的更新元数据或安装包验证更新被拒绝、旧版本继续可用且 Host 自动恢复，不在系统“下载”
+      目录留下安装包。
 - [ ] 点击“打开管理台”，确认复用现有管理台且不会打开外部网页；关闭窗口后托盘和机器人连接继续运行。
 - [ ] 从托盘依次验证重启、停止、再次启动和退出；确认 Runtime、WebSocket 和实例锁均正常收尾，没有遗留
       Host 进程。
@@ -196,6 +202,8 @@ threadferry start --agents reviewer
 
 ## 10. 安全检查
 
+- [ ] 分别用 Codex、Pi、Claude Code 和 Grok Build 验证用户配置、Workspace 指令与原生 Skills/插件会被加载，
+      且 ThreadFerry 没有额外覆盖其本地命令、文件或网络权限。
 - [ ] `~/.threadferry/threadferry.yaml`、状态文件、历史索引、日志和测试证据均不包含 Bot Secret。
 - [ ] 每个 Agent 的凭据只存在自己的 `~/.threadferry/wecom/<Agent>/` 或显式 `config_dir`。
 - [ ] 管理台修改接口拒绝缺少 CSRF Token 的请求。
