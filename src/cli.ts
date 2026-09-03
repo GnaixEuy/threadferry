@@ -51,7 +51,7 @@ import { findUpdate, installUpdate } from "./update.js";
 import { installOfficialWecomSkills, officialWecomSkillsInstalled } from "./wecom-skills.js";
 import { runWorkflowTick } from "./workflow.js";
 
-const VERSION = "0.32.2";
+const VERSION = "0.32.3";
 const UPDATE_INTERVAL_MS = 6 * 60 * 60 * 1_000;
 const WORKFLOW_INTERVAL_MS = 30_000;
 interface DesktopParentPort {
@@ -901,10 +901,14 @@ async function authorizeBotFromAdmin(agentId: string, override: string | undefin
   const configDir = botConfigDir(agentId, override);
   await mkdir(configDir, { recursive: true, mode: 0o700 });
   if (authorization.mode === "manual") {
-    await runCommand("wecom-cli", ["auth", "init", "--manual"], {
-      env: wecomEnv(configDir),
-      input: `${authorization.botId}\n${authorization.secret}\n`,
-    });
+    try {
+      await runCommand("wecom-cli", ["auth", "init", "--manual"], {
+        env: wecomEnv(configDir),
+        input: `${authorization.botId}\n${authorization.secret}\n`,
+      });
+    } catch (error) {
+      throw new Error(wecomFailureReason(error));
+    }
     if (!(await botStatus(agentId, override)).authorized) throw new Error("授权结束但未检测到可用机器人凭据");
     return;
   }
@@ -1011,12 +1015,8 @@ async function start(
     // 各 Agent 的连接索引。连接在下面才建立，但 app 的依赖里要先捕获这个 Map：
     // 转交回复和动作回执都优先走机器人自己的 WS 连接。
     const clients = new Map<string, WSClient>();
-    const connectionHealth = new Map<string, AgentConnectionHealth>(startup.map(({ agentId }) => [agentId, {
-      state: "connecting",
-      changedAt: new Date().toISOString(),
-    }]));
     // 每个 Agent 一套：配置视图 + 绑定自己凭据目录的 runner + 独立 app 实例 + 独立连接。
-    const hosts = await Promise.all(startup.map(async ({ agentId, botId, secret, configDir }) => {
+    const createHost = async ({ agentId, botId, secret, configDir }: StartupAgent) => {
       const view = agentView(config, agentId);
       views.set(agentId, view);
       const runner = wecomRunner(configDir);
@@ -1029,7 +1029,6 @@ async function start(
         }
         return groups;
       };
-      await confirmOwnerIdentity(config, agentId, updateConfig);
       const app = createApp(view, {
       history: (chatId, options) => history.list(chatId, options),
       rememberHistory: (chatType, chatId, message) => history.remember(chatType, chatId, message),
@@ -1077,7 +1076,13 @@ async function start(
       onError: ({ errorId, phase, reason }) => console.error(`[wecom] Agent ${agentId} 处理失败 error=${errorId} phase=${phase}${reason ? ` reason=${reason}` : ""}`),
       }, state);
       return { agentId, view, runner, listGroups, app, credentials: { botId, secret } };
-    }));
+    };
+    const hosts: Array<Awaited<ReturnType<typeof createHost>>> = [];
+    hosts.push(...await Promise.all(startup.map(async (agent) => {
+      await confirmOwnerIdentity(config, agent.agentId, updateConfig);
+      return createHost(agent);
+    })));
+    const connectionHealth = new Map<string, AgentConnectionHealth>();
 
     // 管理台看全量配置，但所有企业微信查询都按 Agent 走它自己的机器人。
     const runnerFor = (agentId: string) => hosts.find((host) => host.agentId === agentId)?.runner;
@@ -1094,6 +1099,108 @@ async function start(
         return access && access.enabled !== false;
       }).map(([groupId]) => groupId);
     for (const host of hosts) void names.refresh(host.agentId, host.runner, groupsOf(host.agentId)).catch(() => undefined);
+
+    const fanOut = async (receivedBy: string, message: IncomingMention) => {
+      const peers = fanOutTargets(
+        message.text,
+        receivedBy,
+        hosts.map((host) => ({ ...host, ...origins.read(host.agentId, host.runner) })),
+        (agentId) => {
+          const access = config.groups[message.groupId]?.agents[agentId];
+          return Boolean(access && access.enabled !== false);
+        },
+      );
+      await Promise.all(peers.map(async (peer) => {
+        try {
+          const status = await peer.app.handle(message, async (content) => {
+            const body = quotedReply(message.text, content);
+            const client = clients.get(peer.agentId);
+            if (!client) return sendWecomReply(message.groupId, body, peer.runner);
+            try {
+              await pushWecomMessage(client, message.groupId, body);
+            } catch {
+              await sendWecomReply(message.groupId, body, peer.runner);
+            }
+          });
+          console.log(status === "duplicate"
+            ? `[wecom] Agent ${peer.agentId} 已自己收到同一条群 @ 消息，${receivedBy} 的转交被去重挡下（说明企业微信投给了所有被 @ 的机器人）`
+            : `[wecom] Agent ${peer.agentId} 接手 ${receivedBy} 转交的同一条群 @ 消息（说明企业微信没给它投这次回调），处理状态: ${status}`);
+        } catch (error) {
+          const errorId = newErrorId();
+          console.error(`[wecom] Agent ${peer.agentId} 接手同一条群 @ 消息失败 error=${errorId} reason=${wecomFailureReason(error)}`);
+        }
+      }));
+    };
+    const observeConnection = (agentId: string, event: "connected" | "authenticated" | "disconnected" | "reconnecting" | "activity", attempt?: number) => {
+      const now = new Date().toISOString();
+      const current = connectionHealth.get(agentId) ?? { state: "connecting", changedAt: now };
+      if (event === "activity") {
+        connectionHealth.set(agentId, { ...current, state: "connected", lastEventAt: now });
+        return;
+      }
+      const connectionState = event === "authenticated" ? "connected" : event === "reconnecting" ? "reconnecting" : event === "disconnected" ? "disconnected" : "connecting";
+      connectionHealth.set(agentId, {
+        ...current,
+        state: connectionState,
+        changedAt: now,
+        ...(event === "reconnecting" && attempt ? { reconnectAttempt: attempt } : { reconnectAttempt: undefined }),
+      });
+      if (event === "authenticated") {
+        console.log(`[wecom] Agent ${agentId} 长连接已认证`);
+        void state.recordActivity({ agent: agentId, type: "connection.connected", outcome: "success" }).catch(() => undefined);
+      } else if (event === "disconnected") {
+        console.error(`[wecom] Agent ${agentId} 长连接已断开，SDK 将自动重连`);
+        void state.recordActivity({ agent: agentId, type: "connection.disconnected", outcome: "info" }).catch(() => undefined);
+      }
+    };
+    const connections = new Map<string, WSClient>();
+    const connectHost = (host: Awaited<ReturnType<typeof createHost>>) => {
+      connectionHealth.set(host.agentId, { state: "connecting", changedAt: new Date().toISOString() });
+      const connection = startWecomChannel(host.credentials, async (event, reply) => {
+        if (event.chatType === "group" && !config.groups[event.message.groupId]?.agents[host.agentId]) {
+          await updateConfig((latest) => { ensureGroupAccess(latest, event.message.groupId, host.agentId); });
+        }
+        const handling = event.chatType === "single"
+          ? host.app.handleDirect(event.message, reply)
+          : host.app.handle(event.message, reply);
+        const [status] = await Promise.all([
+          handling,
+          ...(event.chatType === "group" ? [fanOut(host.agentId, event.message)] : []),
+        ]);
+        console.log(`[wecom] Agent ${host.agentId} 收到${event.chatType === "single" ? "单聊" : "群内 @"}消息，处理状态: ${status}`);
+      }, (event, attempt) => observeConnection(host.agentId, event, attempt));
+      connections.set(host.agentId, connection);
+      clients.set(host.agentId, connection);
+      console.log(`[bot] Agent ${host.agentId} 已启动连接，监听 ${Object.values(host.view.groups).filter((group) => group.enabled !== false).length} 个可用群`);
+    };
+    for (const host of hosts) connectHost(host);
+    console.log(`ThreadFerry 已启动，${hosts.length} 个 Agent 各自一条企业微信机器人连接。`);
+
+    const connectingAgents = new Map<string, Promise<boolean>>();
+    const connectAuthorizedAgent = (agentId: string): Promise<boolean> => {
+      if (hosts.some((host) => host.agentId === agentId)) return Promise.resolve(true);
+      if (only && !only.has(agentId)) return Promise.resolve(false);
+      const pending = connectingAgents.get(agentId);
+      if (pending) return pending;
+      const connecting = (async () => {
+        const agent = config.agents[agentId];
+        if (!agent) throw new Error("机器人不存在");
+        const credentials = await loadBotCredentials(agentId, agent.configDir);
+        if (!credentials) return false;
+        const host = await createHost({ agentId, ...credentials });
+        hosts.push(host);
+        void origins.refresh(agentId, host.runner).catch(() => undefined);
+        void names.refresh(agentId, host.runner, groupsOf(agentId)).catch(() => undefined);
+        connectHost(host);
+        return true;
+      })().catch((error) => {
+        connectionHealth.set(agentId, { state: "disconnected", changedAt: new Date().toISOString() });
+        console.error(`[bot] Agent ${agentId} 动态接入失败 reason=${wecomFailureReason(error)}`);
+        throw error;
+      }).finally(() => connectingAgents.delete(agentId));
+      connectingAgents.set(agentId, connecting);
+      return connecting;
+    };
     const admin = await startAdminServer(config, {
       updateConfig,
       listGroups: async (agentId) => {
@@ -1129,6 +1236,7 @@ async function start(
           ...(status.authorized ? {} : { hint: authorizeHint(agentId, config.agents[agentId]?.configDir) }),
         };
       },
+      connectBot: connectAuthorizedAgent,
       authorizeBot: (agentId, authorization) => {
         const agent = config.agents[agentId];
         if (!agent) throw new Error("机器人不存在");
@@ -1145,90 +1253,7 @@ async function start(
     }, port);
     console.log(`ThreadFerry 管理台: ${admin.url}`);
     try {
-      // 企业微信只把一条群消息投给**第一个被 @ 的机器人**（实测：交换 @ 顺序，回话的机器人跟着换，
-      // 状态里也始终只有一条 turn）。但群里 @ 了两台，用户期望两台都回。两个 Agent 本来就跑在同一个
-      // 进程里，所以这里把同一条消息在进程内转交给「也被 @ 到、也绑了这个群」的其他 Agent，
-      // 各自用自己的机器人凭据回复。
-      // 若企业微信将来改成投给所有被 @ 的机器人，重复的那份会被按 Agent 的 turn 去重挡掉，不会答两遍。
-      const fanOut = async (receivedBy: string, message: IncomingMention) => {
-        const peers = fanOutTargets(
-          message.text,
-          receivedBy,
-          hosts.map((host) => ({ ...host, ...origins.read(host.agentId, host.runner) })),
-          (agentId) => {
-            const access = config.groups[message.groupId]?.agents[agentId];
-            return Boolean(access && access.enabled !== false);
-          },
-        );
-        await Promise.all(peers.map(async (peer) => {
-          try {
-            const status = await peer.app.handle(message, async (content) => {
-              // 转交的机器人发不出「引用」气泡（见 group-fanout.ts），所以把原消息放进正文引用块，
-              // 群里才看得出它在回哪一条。
-              const body = quotedReply(message.text, content);
-              // 优先走这台机器人自己的 WS 连接：身份一样，但不用为每条回复起一个 wecom-cli 进程。
-              const client = clients.get(peer.agentId);
-              if (!client) return sendWecomReply(message.groupId, body, peer.runner);
-              try {
-                await pushWecomMessage(client, message.groupId, body);
-              } catch {
-                // 连接侧发不出去时退回 wecom-cli，别把这条回复丢了。
-                await sendWecomReply(message.groupId, body, peer.runner);
-              }
-            });
-            // duplicate 说明这台机器人自己也收到了同一条回调——那就意味着企业微信其实投给了所有被 @ 的
-            // 机器人，转交是多余的。把这件事直接写进日志，省得靠猜。
-            console.log(status === "duplicate"
-              ? `[wecom] Agent ${peer.agentId} 已自己收到同一条群 @ 消息，${receivedBy} 的转交被去重挡下（说明企业微信投给了所有被 @ 的机器人）`
-              : `[wecom] Agent ${peer.agentId} 接手 ${receivedBy} 转交的同一条群 @ 消息（说明企业微信没给它投这次回调），处理状态: ${status}`);
-          } catch (error) {
-            const errorId = newErrorId();
-            console.error(`[wecom] Agent ${peer.agentId} 接手同一条群 @ 消息失败 error=${errorId} reason=${wecomFailureReason(error)}`);
-          }
-        }));
-      };
-      const observeConnection = (agentId: string, event: "connected" | "authenticated" | "disconnected" | "reconnecting" | "activity", attempt?: number) => {
-        const now = new Date().toISOString();
-        const current = connectionHealth.get(agentId) ?? { state: "connecting", changedAt: now };
-        if (event === "activity") {
-          connectionHealth.set(agentId, { ...current, state: "connected", lastEventAt: now });
-          return;
-        }
-        const connectionState = event === "authenticated" ? "connected" : event === "reconnecting" ? "reconnecting" : event === "disconnected" ? "disconnected" : "connecting";
-        connectionHealth.set(agentId, {
-          ...current,
-          state: connectionState,
-          changedAt: now,
-          ...(event === "reconnecting" && attempt ? { reconnectAttempt: attempt } : { reconnectAttempt: undefined }),
-        });
-        if (event === "authenticated") {
-          console.log(`[wecom] Agent ${agentId} 长连接已认证`);
-          void state.recordActivity({ agent: agentId, type: "connection.connected", outcome: "success" }).catch(() => undefined);
-        } else if (event === "disconnected") {
-          console.error(`[wecom] Agent ${agentId} 长连接已断开，SDK 将自动重连`);
-          void state.recordActivity({ agent: agentId, type: "connection.disconnected", outcome: "info" }).catch(() => undefined);
-        }
-      };
-      const connections = hosts.map(({ agentId, app, credentials }) => startWecomChannel(credentials, async (event, reply) => {
-        if (event.chatType === "group" && !config.groups[event.message.groupId]?.agents[agentId]) {
-          await updateConfig((latest) => { ensureGroupAccess(latest, event.message.groupId, agentId); });
-        }
-        const handling = event.chatType === "single"
-          ? app.handleDirect(event.message, reply)
-          : app.handle(event.message, reply);
-        const [status] = await Promise.all([
-          handling,
-          ...(event.chatType === "group" ? [fanOut(agentId, event.message)] : []),
-        ]);
-        console.log(`[wecom] Agent ${agentId} 收到${event.chatType === "single" ? "单聊" : "群内 @"}消息，处理状态: ${status}`);
-      }, (event, attempt) => observeConnection(agentId, event, attempt)));
-      hosts.forEach((host, index) => clients.set(host.agentId, connections[index]!));
-      for (const { agentId, view } of hosts) {
-        console.log(`[bot] Agent ${agentId} 已启动连接，监听 ${Object.values(view.groups).filter((group) => group.enabled !== false).length} 个可用群`);
-      }
-      console.log(`ThreadFerry 已启动，${hosts.length} 个 Agent 各自一条企业微信机器人连接。`);
-
-      const workflowHosts = hosts.map((host) => ({
+      const workflowHosts = () => hosts.map((host) => ({
         agentId: host.agentId,
         ownerUser: host.view.ownerUser,
         runAutomation: host.app.runAutomation,
@@ -1317,7 +1342,7 @@ async function start(
           desktopPort?.off("message", onParentMessage);
           clearInterval(updateTimer);
           clearInterval(workflowTimer);
-          for (const connection of connections) connection.disconnect();
+          for (const connection of connections.values()) connection.disconnect();
           void admin.close();
           void Promise.all([...hosts.map(({ app }) => app.shutdown(cancel)), recovery, updateCheck, workflowCheck]).finally(done);
         };
@@ -1334,7 +1359,7 @@ async function start(
         updateTimer.unref();
         const runWorkflows = () => {
           if (stopping || workflowCheck) return;
-          workflowCheck = recovery.then(() => runWorkflowTick(state, workflowHosts))
+          workflowCheck = recovery.then(() => runWorkflowTick(state, workflowHosts()))
             .catch((error) => console.error(`[workflow] 调度失败 reason=${wecomFailureReason(error)}`))
             .finally(() => { workflowCheck = undefined; });
         };

@@ -90,7 +90,8 @@ jobs:
       - name: Install development dependencies
         run: npm ci --ignore-scripts
 
-      - name: Verify macOS signing configuration
+      - name: Check macOS signing configuration
+        id: macos
         if: runner.os == 'macOS'
         shell: bash
         env:
@@ -100,14 +101,22 @@ jobs:
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
-          test -n "$CSC_LINK"
-          test -n "$CSC_KEY_PASSWORD"
-          test -n "$APPLE_ID"
-          test -n "$APPLE_APP_SPECIFIC_PASSWORD"
-          test -n "$APPLE_TEAM_ID"
+          configured=0
+          for value in "$CSC_LINK" "$CSC_KEY_PASSWORD" "$APPLE_ID" "$APPLE_APP_SPECIFIC_PASSWORD" "$APPLE_TEAM_ID"; do
+            if test -n "$value"; then configured=$((configured + 1)); fi
+          done
+          if test "$configured" = 0; then
+            echo "build=false" >> "$GITHUB_OUTPUT"
+            echo "Skipping the macOS package because Developer ID signing is not configured."
+          elif test "$configured" != 5; then
+            echo "macOS signing secrets are only partially configured" >&2
+            exit 1
+          else
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Build signed and notarized macOS package
-        if: runner.os == 'macOS'
+        if: runner.os == 'macOS' && steps.macos.outputs.build == 'true'
         env:
           CSC_LINK: ${{ secrets.MAC_CSC_LINK }}
           CSC_KEY_PASSWORD: ${{ secrets.MAC_CSC_KEY_PASSWORD }}
@@ -121,6 +130,7 @@ jobs:
         run: npm run desktop:dist
 
       - name: Upload desktop assets
+        if: runner.os != 'macOS' || steps.macos.outputs.build == 'true'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: desktop-${{ matrix.name }}

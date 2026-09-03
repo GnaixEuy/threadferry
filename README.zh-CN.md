@@ -73,9 +73,10 @@ threadferry doctor
 这会把旧的分散 `wecomcli-*` Skills 替换为官方 `WecomTeam/wecom-unified`，并确认本机
 `wecom-cli` 不低于 `1.2.0`。已有 Agent 的机器人凭据无需重新授权。
 
-完成 CLI 安装和首次设置后，日常使用推荐从
-[GitHub Releases](https://github.com/GnaixEuy/threadferry/releases/latest) 下载桌面版：Apple Silicon Mac
-使用 arm64 DMG，Intel Mac 使用 x64 DMG，Windows 使用 NSIS 安装程序，Linux 使用 AppImage 或 DEB。
+完成 CLI 安装和首次设置后，Windows 和 Linux 用户可从
+[GitHub Releases](https://github.com/GnaixEuy/threadferry/releases/latest) 下载 NSIS、AppImage 或 DEB 桌面版。
+macOS 仅在 Release 明确提供经过 Developer ID 签名与 Apple 公证的 DMG 时使用桌面安装包；没有 DMG
+不影响通过上面的 CLI 安装方式在本机运行。
 桌面版提供常驻托盘菜单；Runtime 和企业微信官方 `wecom-cli` 仍沿用上面的本机安装与登录状态。
 
 ## 首次运行

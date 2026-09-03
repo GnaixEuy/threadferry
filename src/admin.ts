@@ -47,6 +47,8 @@ export interface AdminDependencies {
   /** 按姓名添加成功时把映射记下来，之后就能显示名字。 */
   rememberUser?: (userId: string, name: string) => void;
   botStatus?: (agentId: string) => Promise<AgentBotStatus>;
+  /** 已有凭据时把 Agent 接入当前 Host；重复调用必须安全。 */
+  connectBot?: (agentId: string) => Promise<boolean>;
   /** 凭据只交给该 Agent 的 wecom-cli 加密存储，不写入 ThreadFerry 配置或日志。 */
   authorizeBot?: (agentId: string, authorization: BotAuthorization) => Promise<void>;
   snapshot?: () => Promise<StateSnapshot>;
@@ -366,7 +368,10 @@ async function fetchBotStatuses(config: ThreadFerryConfig, dependencies: AdminDe
   const statuses = new Map<string, AgentBotStatus>();
   await Promise.all(Object.keys(config.agents).map(async (agentId) => {
     try {
-      const status = await dependencies.botStatus?.(agentId);
+      let status = await dependencies.botStatus?.(agentId);
+      if (status?.authorized && await dependencies.connectBot?.(agentId)) {
+        status = await dependencies.botStatus?.(agentId) ?? status;
+      }
       if (status) statuses.set(agentId, status);
     } catch {
       // 单个 Agent 查询失败不影响其他状态和页面。
@@ -706,14 +711,14 @@ function addAgentDialog(
     </dialog>`;
 }
 
-function botAuthDialog(token: string, dialogId: string, agentId: string, open: boolean, error?: string): string {
+function botAuthDialog(token: string, dialogId: string, agentId: string, selected: string, open: boolean, error?: string): string {
   return `
     <dialog id="${html(dialogId)}" class="modal" aria-labelledby="${html(dialogId)}-title"${open ? " open" : ""}>
       <form method="post" action="/agents/auth">${field(token)}<input type="hidden" name="agentId" value="${html(agentId)}">
         <h3 id="${html(dialogId)}-title">授权机器人 ${html(agentId)}</h3>
-        <p class="lede">凭据只写入这台机器人的独立 wecom-cli 配置目录。授权后重启 ThreadFerry，即会建立它自己的企业微信连接。</p>
+        <p class="lede">凭据只写入这台机器人的独立 wecom-cli 配置目录。授权完成后，ThreadFerry 会直接读取凭据并建立它自己的企业微信连接。</p>
         ${error ? errorBar(error) : ""}
-        ${botAuthFields("qr", false)}
+        ${botAuthFields(selected, false)}
         <div class="modal-actions"><a class="button ghost" href="/agents" data-close-dialog>取消</a><button>开始授权</button></div>
       </form>
     </dialog>`;
@@ -846,10 +851,10 @@ async function agentsPage(config: ThreadFerryConfig, dependencies: AdminDependen
     const connection = bot?.connection;
     const connectionLine = connection
       ? `<p>长连接 <span class="badge ${connection.state === "connected" ? "ok" : "warning"}">${html(connection.state === "connected" ? "在线" : connection.state === "connecting" ? "连接中" : connection.state === "reconnecting" ? `重连中${connection.reconnectAttempt ? ` · 第 ${connection.reconnectAttempt} 次` : ""}` : "已断开")}</span> <small class="muted">状态更新 ${html(connection.changedAt)}${connection.lastEventAt ? ` · 最后回调 ${html(connection.lastEventAt)}` : ""}</small></p>`
-      : "";
+      : bot?.authorized ? `<p class="muted">已读取授权凭据，正在建立连接。</p>` : "";
     const dialogId = `auth-bot-${index}`;
     const authOpen = openAuth === id;
-    authDialogs.push(botAuthDialog(token, dialogId, id, authOpen, authOpen ? error : undefined));
+    if (!bot?.authorized) authDialogs.push(botAuthDialog(token, dialogId, id, prefill.authMode, authOpen, authOpen ? error : undefined));
     const workspaceDialogId = `edit-workspace-${index}`;
     const workspaceOpen = openWorkspace === id;
     const workspace = workspaceOpen ? url.searchParams.get("workspace")?.trim() || agent.workspace : agent.workspace;
@@ -871,7 +876,7 @@ async function agentsPage(config: ThreadFerryConfig, dependencies: AdminDependen
         : `<p class="muted">未被任何群使用</p>`}
       <div class="actions">
         <a class="button ghost" href="/agents?editWorkspace=${encodeURIComponent(id)}" data-dialog="${workspaceDialogId}">修改工作区</a>
-        <a class="button ghost" href="/agents?auth=${encodeURIComponent(id)}" data-dialog="${dialogId}">${bot?.authorized ? "重新授权" : "授权机器人"}</a>
+        ${bot?.authorized ? "" : `<a class="button ghost" href="/agents?auth=${encodeURIComponent(id)}" data-dialog="${dialogId}">授权机器人</a>`}
         <a class="button danger" href="/agents?remove=${encodeURIComponent(id)}" data-dialog="${removeDialogId}">删除机器人</a>
       </div>
     </article>`;
@@ -1115,8 +1120,9 @@ export async function startAdminServer(
           if (!dependencies.authorizeBot) throw new Error("当前启动方式不支持机器人授权");
           await dependencies.authorizeBot(agentId, authorization);
           message = authorization.mode === "qr"
-            ? `机器人 ${agentId} 已添加，扫码授权页已打开；完成后刷新本页并重启 ThreadFerry`
-            : `机器人 ${agentId} 已添加并授权；重启 ThreadFerry 后启用`;
+            ? `机器人 ${agentId} 已添加，扫码授权页已打开；完成后刷新本页即可自动连接`
+            : `机器人 ${agentId} 已添加并授权，正在建立连接`;
+          if (authorization.mode === "manual") await dependencies.connectBot?.(agentId);
         }
       } else if (url.pathname === "/agents/auth") {
         target = "/agents";
@@ -1124,12 +1130,19 @@ export async function startAdminServer(
         if (!config.agents[agentId]) throw new Error("机器人不存在");
         const authorization = botAuthorization(input);
         if (!authorization) throw new Error("请选择机器人授权方式");
-        errorTarget = `/agents?auth=${encodeURIComponent(agentId)}`;
+        errorTarget = `/agents?${new URLSearchParams({ auth: agentId, authMode: authorization.mode })}`;
         if (!dependencies.authorizeBot) throw new Error("当前启动方式不支持机器人授权");
-        await dependencies.authorizeBot(agentId, authorization);
-        message = authorization.mode === "qr"
-          ? `机器人 ${agentId} 的扫码授权页已打开；完成后刷新本页并重启 ThreadFerry`
-          : `机器人 ${agentId} 已授权；重启 ThreadFerry 后启用`;
+        const status = await dependencies.botStatus?.(agentId);
+        if (status?.authorized) {
+          await dependencies.connectBot?.(agentId);
+          message = `机器人 ${agentId} 已授权，正在建立连接`;
+        } else {
+          await dependencies.authorizeBot(agentId, authorization);
+          message = authorization.mode === "qr"
+            ? `机器人 ${agentId} 的扫码授权页已打开；完成后刷新本页即可自动连接`
+            : `机器人 ${agentId} 已授权，正在建立连接`;
+          if (authorization.mode === "manual") await dependencies.connectBot?.(agentId);
+        }
       } else if (url.pathname === "/agents/workspace") {
         target = "/agents";
         const agentId = required(input, "agentId");
