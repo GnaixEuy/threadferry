@@ -69,6 +69,11 @@ function html(value: unknown): string {
   })[character]!);
 }
 
+function identity(name: string, id: string, kind: string, focusable = true): string {
+  if (!id) return `<b>${html(name)}</b>`;
+  return `<span class="identity"${focusable ? ` tabindex="0"` : ""} aria-label="${html(`${name}，${kind} ${id}`)}"><b>${html(name)}</b><span class="identity-id" aria-hidden="true">${html(kind)} <code>${html(id)}</code></span></span>`;
+}
+
 function localHost(host: string | undefined): boolean {
   return host === "127.0.0.1" || host?.startsWith("127.0.0.1:") === true
     || host === "localhost" || host?.startsWith("localhost:") === true;
@@ -159,6 +164,24 @@ function botAuthorization(input: URLSearchParams): BotAuthorization | undefined 
 
 function field(token: string): string {
   return `<input type="hidden" name="csrf" value="${token}">`;
+}
+
+const STATUS_LABELS: Record<string, string> = {
+  scheduled: "已计划",
+  queued: "排队中",
+  running: "进行中",
+  review: "待复核",
+  reviewing: "复核中",
+  completed: "已完成",
+  cancelled: "已取消",
+  failed: "失败",
+  success: "成功",
+  failure: "失败",
+  info: "信息",
+};
+
+function statusLabel(status: string): string {
+  return STATUS_LABELS[status] ?? status;
 }
 
 function groupAnchor(groupId: string): string {
@@ -377,7 +400,7 @@ function waitingCard(
 ): string {
   return `
     <article class="card">
-      <div class="row"><div><h3>${html(label)}</h3><code>${html(id)}</code></div><span class="badge warning">等待首次 @</span></div>
+      <div class="row"><h3>${identity(label, id, "群 ID")}</h3><span class="badge warning">等待首次 @</span></div>
       <p class="muted">${visible.size > 0
         ? "在群里 @需要使用的机器人发送第一条消息，ThreadFerry 收到后会自动启用，不需要手动绑定。"
         : "把机器人加入该群并 @它发送第一条消息，ThreadFerry 收到后会自动启用。"}</p>
@@ -393,16 +416,16 @@ function shell(
 ): string {
   const notice = url.searchParams.get("ok");
   const error = options.errorInDialog ? null : url.searchParams.get("error");
-  const tabs: Array<[string, typeof active, string, string]> = [
-    ["/", "overview", "概览", "⌂"],
-    ["/agents", "agents", "机器人管理", "◇"],
-    ["/groups", "groups", "群聊管理", "◎"],
-    ["/logs", "logs", "日志追踪", "⌁"],
-    ["/settings", "settings", "偏好设置", "⚙"],
+  const tabs: Array<[string, typeof active, string]> = [
+    ["/", "overview", "概览"],
+    ["/agents", "agents", "机器人管理"],
+    ["/groups", "groups", "群聊管理"],
+    ["/logs", "logs", "日志追踪"],
+    ["/settings", "settings", "偏好设置"],
   ];
   const current = tabs.find(([, key]) => key === active)!;
-  const nav = tabs.slice(0, 3).map(([href, key, label, icon]) => `<a href="${href}" data-tour-target="${key}"${key === active ? ` class="active" aria-current="page"` : ""}><span class="nav-icon" aria-hidden="true">${icon}</span><span>${label}</span></a>`).join("");
-  const utilities = tabs.slice(3).map(([href, key, label, icon]) => `<a href="${href}"${key === "logs" ? " data-log-nav" : ""}${key === active ? ` class="active" aria-current="page"` : ""}><span class="nav-icon" aria-hidden="true">${icon}</span><span>${label}</span></a>`).join("");
+  const nav = tabs.slice(0, 3).map(([href, key, label]) => `<a href="${href}" data-tour-target="${key}"${key === active ? ` class="active" aria-current="page"` : ""}>${label}</a>`).join("");
+  const utilities = tabs.slice(3).map(([href, key, label]) => `<a href="${href}"${key === "logs" ? " data-log-nav" : ""}${key === active ? ` class="active" aria-current="page"` : ""}>${label}</a>`).join("");
   return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
   <title>ThreadFerry 管理台</title><script src="/admin.js"></script><link rel="stylesheet" href="/admin.css"></head>
   <body><div class="app-shell">
@@ -410,7 +433,7 @@ function shell(
       <nav class="side-nav" aria-label="管理台导航">${nav}</nav>
       <div class="sidebar-bottom"><nav class="side-nav utility-nav" aria-label="工具与设置">${utilities}</nav><div class="sidebar-foot" role="status"><span class="status-dot"></span><span>服务运行中</span></div></div>
     </aside>
-    <main><header class="top"><div><p class="eyebrow">管理台</p><h1>${current[2]}</h1></div><div class="instance"><b>${html(Object.keys(config.agents).length)}</b><span>个机器人</span><small>1 个机器人对应 1 个 Agent</small></div></header>
+    <main><header class="top"><h1>${current[2]}</h1><div class="instance"><b>${html(Object.keys(config.agents).length)}</b><span>个机器人</span><small>1 个机器人对应 1 个 Agent</small></div></header>
       ${notice ? `<div class="notice">${html(notice)}</div>` : ""}${error ? errorBar(error) : ""}
       <div class="page-content">${content}</div>
     </main>
@@ -426,6 +449,7 @@ function settingsPage(config: ThreadFerryConfig, url: URL, token: string): strin
       </label>
       <label class="setting-row"><span><b>显示日志追踪</b><small>在侧栏左下角显示运行记录定位入口。</small></span><input type="checkbox" data-interface-preference="showLogTracking"></label>
       <div class="setting-row"><span><b>开始使用引导</b><small>重新查看机器人、私聊和可选群聊的使用说明。</small></span><a class="button ghost" href="/?tour=1">重新查看</a></div>
+      <div class="setting-row"><span><b>问题反馈</b><small>在 GitHub Issue 中提交问题、建议与复现信息。</small></span><a class="button ghost" href="https://github.com/GnaixEuy/threadferry/issues/new" target="_blank" rel="noreferrer">前往反馈 ↗</a></div>
     </article>
     <article class="card settings-card" data-desktop-settings>
       <div class="section-head"><div><h2>桌面应用</h2><p class="sub">这些选项保存在本机，只控制 ThreadFerry 桌面入口。</p></div><span class="badge" data-desktop-platform>正在识别</span></div>
@@ -438,10 +462,11 @@ function settingsPage(config: ThreadFerryConfig, url: URL, token: string): strin
       <p class="settings-status" data-desktop-status>正在读取桌面偏好…</p>
     </article>
     <article class="card settings-card">
-      <div class="section-head"><div><h2>软件更新</h2><p class="sub">手动检查 GitHub Release 是否有新版本。</p></div></div>
+      <div class="section-head"><div><h2>软件更新</h2><p class="sub">桌面应用会自动下载、安装新版本并重新启动。</p></div></div>
       <form class="setting-list" method="post" action="/settings/update" data-update-check>${field(token)}
-        <div class="setting-row"><span><b>ThreadFerry 更新</b><small>只检查更新，不会自动下载或安装。</small></span><button class="ghost" type="submit">检查更新</button></div>
+        <div class="setting-row"><span><b>ThreadFerry 自动更新</b><small>启动后自动检查；更新完成前会等待正在执行的任务安全结束。</small></span><button class="ghost" type="submit">立即检查更新</button></div>
       </form>
+      <p class="settings-status" data-update-status aria-live="polite">桌面应用会在后台自动检查更新；浏览器模式只检查版本。</p>
     </article>
   </div>`);
 }
@@ -468,12 +493,12 @@ async function logsPage(config: ThreadFerryConfig, dependencies: AdminDependenci
     <button type="submit">定位</button>${query || outcome ? `<a class="ghost clear-filter" href="/logs">清除</a>` : ""}
   </form>`;
   const failureList = failures.length
-    ? `<div class="list-panel trace-list">${failures.map((turn) => `<div class="trace-row"><span><code>${html(turn.errorId ?? "无错误编号")}</code><small>${html(turn.updatedAt)}</small></span><span><b>处理失败</b><small>阶段 ${html(turn.failurePhase ?? "unknown")}</small></span><span class="badge warning">failure</span></div>`).join("")}</div>`
+    ? `<div class="list-panel trace-list">${failures.map((turn) => `<div class="trace-row"><span><code>${html(turn.errorId ?? "无错误编号")}</code><small>${html(turn.updatedAt)}</small></span><span><b>处理失败</b><small>阶段 ${html(turn.failurePhase ?? "unknown")}</small></span><span class="badge warning">失败</span></div>`).join("")}</div>`
     : `<p class="sub">没有匹配的失败记录。</p>`;
   const activityList = activities.length
-    ? `<div class="list-panel trace-list">${activities.map((item) => `<div class="trace-row"><span><code>${html(item.id)}</code><small>${html(item.at)}</small></span><span><b>${html(item.type)}</b><small>Agent ${html(item.agent)}${item.resource ? ` · ${html(item.resource)}` : ""}</small></span><span class="badge ${item.outcome === "success" ? "ok" : item.outcome === "failure" ? "warning" : ""}">${html(item.outcome)}</span></div>`).join("")}</div>`
+    ? `<div class="list-panel trace-list">${activities.map((item) => `<div class="trace-row"><span><code>${html(item.id)}</code><small>${html(item.at)}</small></span><span><b>${html(item.type)}</b><small>Agent ${html(item.agent)}${item.resource ? ` · ${html(item.resource)}` : ""}</small></span><span class="badge ${item.outcome === "success" ? "ok" : item.outcome === "failure" ? "warning" : ""}">${statusLabel(item.outcome)}</span></div>`).join("")}</div>`
     : `<p class="sub">没有匹配的 Activity。</p>`;
-  return shell("logs", config, url, `<div class="toolbar"><div><h2 class="flush">运行记录</h2><p class="sub">按错误编号、Agent、动作或资源定位最近记录；这里只展示脱敏状态，不展示消息正文。</p></div></div>
+  return shell("logs", config, url, `<div class="toolbar"><p class="sub">按错误编号、Agent、动作或资源定位最近记录；这里只展示脱敏状态，不展示消息正文。</p></div>
     ${filters}${snapshot ? "" : `<div class="notice error">运行状态暂不可用，请稍后重试。</div>`}
     <h2>失败记录</h2>${failureList}<h2>Activity</h2>${activityList}`);
 }
@@ -599,7 +624,7 @@ async function overviewPage(config: ThreadFerryConfig, dependencies: AdminDepend
   if (snapshot) {
     stats.push(
       [String(active), "排队 / 运行中", ""],
-      [String(snapshot.sessions.length), "Runtime Session", ""],
+      [String(snapshot.sessions.length), "运行会话", ""],
       [String(snapshot.outbox.length), "待补发回复", ""],
       [String(reminders.length), "主动提醒", ""],
       [String(workItems.length), "协作任务", ""],
@@ -612,11 +637,11 @@ async function overviewPage(config: ThreadFerryConfig, dependencies: AdminDepend
     todos.push(`<article class="card"><h3>最近一次失败</h3><p class="muted">错误编号 <code>${html(lastFailure.errorId ?? "无")}</code> · 阶段 ${html(lastFailure.failurePhase ?? "unknown")} · ${html(lastFailure.updatedAt)}</p><p class="muted">请在终端运行 <code>threadferry status</code> 和 <code>threadferry doctor</code> 排查。</p></article>`);
   }
   const proactive = [
-    ...reminders.map((item) => `<article class="card"><div class="row"><h3>提醒 <code>${html(item.id)}</code></h3><span class="badge ${item.status === "running" ? "warning" : "ok"}">${html(item.status)}</span></div><p class="muted">Agent <code>${html(item.agent)}</code> · 下次运行 ${html(item.nextRunAt)}${item.repeatMinutes ? ` · 每 ${item.repeatMinutes} 分钟` : ""}</p></article>`),
-    ...workItems.map((item) => `<article class="card"><div class="row"><h3>${html(item.title)}</h3><span class="badge warning">${html(item.status)}</span></div><p class="muted">任务 <code>${html(item.id)}</code> · ${html(item.assignedAgent)}${item.reviewerAgent ? ` → ${html(item.reviewerAgent)} 复核` : ""}</p></article>`),
+    ...reminders.map((item) => `<article class="card"><div class="row"><h3>提醒 <code>${html(item.id)}</code></h3><span class="badge ${item.status === "running" ? "warning" : "ok"}">${statusLabel(item.status)}</span></div><p class="muted">Agent <code>${html(item.agent)}</code> · 下次运行 ${html(item.nextRunAt)}${item.repeatMinutes ? ` · 每 ${item.repeatMinutes} 分钟` : ""}</p></article>`),
+    ...workItems.map((item) => `<article class="card"><div class="row"><h3>${html(item.title)}</h3><span class="badge warning">${statusLabel(item.status)}</span></div><p class="muted">任务 <code>${html(item.id)}</code> · ${html(item.assignedAgent)}${item.reviewerAgent ? ` → ${html(item.reviewerAgent)} 复核` : ""}</p></article>`),
   ];
   const activityList = activities.length
-    ? `<article class="card"><ul>${activities.map((item) => `<li><span><code>${html(item.agent)}</code> ${html(item.type)}${item.resource ? ` · ${html(item.resource)}` : ""}</span><span class="badge ${item.outcome === "success" ? "ok" : item.outcome === "failure" ? "warning" : ""}">${html(item.outcome)}</span></li>`).join("")}</ul></article>`
+    ? `<article class="card"><ul>${activities.map((item) => `<li><span><code>${html(item.agent)}</code> ${html(item.type)}${item.resource ? ` · ${html(item.resource)}` : ""}</span><span class="badge ${item.outcome === "success" ? "ok" : item.outcome === "failure" ? "warning" : ""}">${statusLabel(item.outcome)}</span></li>`).join("")}</ul></article>`
     : `<p class="sub">还没有 Activity。</p>`;
   return shell("overview", config, url, `
     ${onboarding}
@@ -694,6 +719,58 @@ function botAuthDialog(token: string, dialogId: string, agentId: string, open: b
     </dialog>`;
 }
 
+function editWorkspaceDialog(
+  token: string,
+  dialogId: string,
+  agentId: string,
+  workspace: string,
+  browseLink: string,
+  open: boolean,
+  error?: string,
+): string {
+  return `
+    <dialog id="${html(dialogId)}" class="modal" aria-labelledby="${html(dialogId)}-title"${open ? " open" : ""}>
+      <form method="post" action="/agents/workspace">${field(token)}<input type="hidden" name="agentId" value="${html(agentId)}">
+        <h3 id="${html(dialogId)}-title">修改 ${html(agentId)} 的工作区</h3>
+        <p class="lede">后续任务会在新工作区建立独立 Session，不会续接旧工作区的会话。</p>
+        ${error ? errorBar(error) : ""}
+        <div class="field">
+          <label for="${html(dialogId)}-path">Workspace</label>
+          <div class="picker" data-picker-root>
+            <input id="${html(dialogId)}-path" name="workspace" data-picker="dirs" value="${html(workspace)}" placeholder="点这里从本机目录里选" required autofocus>
+          </div>
+          <p class="hint">点输入框选目录，也可以直接输入绝对路径；必须是已存在的目录。<a class="no-js" href="${html(browseLink)}">整页浏览目录</a></p>
+        </div>
+        <div class="modal-actions"><a class="button ghost" href="/agents" data-close-dialog>取消</a><button>保存工作区</button></div>
+      </form>
+    </dialog>`;
+}
+
+function removeAgentDialog(
+  token: string,
+  dialogId: string,
+  agentId: string,
+  groups: Array<{ id: string; label: string }>,
+  isOnlyAgent: boolean,
+  open: boolean,
+  error?: string,
+): string {
+  const heading = groups.length > 0 ? "先解除群聊绑定" : isOnlyAgent ? "暂时不能删除" : `删除机器人 ${html(agentId)}`;
+  const content = groups.length > 0
+    ? `<p class="lede">这台机器人仍绑定以下群聊。请先进入群详情，点击“移除机器人”解除绑定。</p>
+       <ul class="links">${groups.map((group) => `<li><a href="${groupAnchor(group.id)}">${identity(group.label, group.id, "群 ID", false)}</a></li>`).join("")}</ul>
+       <div class="modal-actions"><a class="button ghost" href="/agents" data-close-dialog>取消</a><a class="button" href="${groupAnchor(groups[0]!.id)}">去解除绑定</a></div>`
+    : isOnlyAgent
+      ? `<p class="lede">ThreadFerry 至少需要保留一台机器人。请先添加另一台机器人，再删除这台。</p>
+         <div class="modal-actions"><a class="button" href="/agents" data-close-dialog>知道了</a></div>`
+      : `<p class="lede">删除后，这台机器人的配置将从 ThreadFerry 中移除。此操作无法撤销。</p>
+         <div class="modal-actions"><a class="button ghost" href="/agents" data-close-dialog>取消</a><button class="danger">确认删除</button></div>`;
+  const body = groups.length === 0 && !isOnlyAgent
+    ? `<form method="post" action="/agents/remove">${field(token)}<input type="hidden" name="agentId" value="${html(agentId)}"><h3 id="${html(dialogId)}-title">${heading}</h3>${error ? errorBar(error) : ""}${content}</form>`
+    : `<div class="modal-body"><h3 id="${html(dialogId)}-title">${heading}</h3>${error ? errorBar(error) : ""}${content}</div>`;
+  return `<dialog id="${html(dialogId)}" class="modal" aria-labelledby="${html(dialogId)}-title"${open ? " open" : ""}>${body}</dialog>`;
+}
+
 function addUserDialog(
   token: string,
   dialogId: string,
@@ -707,7 +784,7 @@ function addUserDialog(
     <dialog id="${html(dialogId)}" class="modal" aria-labelledby="${html(dialogId)}-title"${open ? " open" : ""}>
       <form method="post" action="/groups/users/add">${field(token)}<input type="hidden" name="groupId" value="${html(groupId)}"><input type="hidden" name="agentId" value="${html(agentId)}">
         <h3 id="${html(dialogId)}-title">添加可使用用户</h3>
-        <p class="lede">授权给 <code>${html(agentId)}</code> 在 ${html(label)} 里使用 · <code>${html(groupId)}</code></p>
+        <p class="lede">授权给 <b>${html(agentId)}</b> 在 ${identity(label, groupId, "群 ID")} 里使用</p>
         ${error ? errorBar(error) : ""}
         <div class="fields">
           <div class="field">
@@ -751,19 +828,20 @@ async function agentsPage(config: ThreadFerryConfig, dependencies: AdminDependen
   // 每个 Agent 一个机器人：授权状态与 Owner 都是 Agent 自己的属性，必须显示出来。
   const botStatuses = await fetchBotStatuses(config, dependencies);
   const openAuth = url.searchParams.get("auth")?.trim();
+  const openWorkspace = url.searchParams.get("editWorkspace")?.trim();
+  const openRemove = url.searchParams.get("remove")?.trim();
   const error = url.searchParams.get("error") ?? undefined;
   const authDialogs: string[] = [];
+  const workspaceDialogs: string[] = [];
+  const removeDialogs: string[] = [];
   const cards = Object.entries(config.agents).map(([id, agent], index) => {
     const bound = boundByAgent.get(id) ?? [];
-    const removable = total > 1 && !Object.values(config.groups).some((group) => {
-      const access = group.agents[id];
-      return access && access.enabled !== false;
-    });
+    const attached = bound.filter((group) => config.groups[group.id]?.agents[id]?.removed !== true);
     const bot = botStatuses.get(id);
     const botLine = bot === undefined
       ? ""
       : bot.authorized
-        ? `<p>机器人 ${bot.botName && bot.botName !== id ? `<b>${html(bot.botName)}</b> ` : ""}<span class="badge ok">已授权</span> <code>${html(bot.botId ?? "")}</code></p>`
+        ? `<p>机器人 ${identity(bot.botName ?? id, bot.botId ?? "", "Bot ID")} <span class="badge ok">已授权</span></p>`
         : `<p>机器人 <span class="badge warning">未授权</span></p><p class="muted">${html(bot.hint ?? `在终端执行 threadferry agent login ${id}`)}</p>`;
     const connection = bot?.connection;
     const connectionLine = connection
@@ -772,46 +850,67 @@ async function agentsPage(config: ThreadFerryConfig, dependencies: AdminDependen
     const dialogId = `auth-bot-${index}`;
     const authOpen = openAuth === id;
     authDialogs.push(botAuthDialog(token, dialogId, id, authOpen, authOpen ? error : undefined));
+    const workspaceDialogId = `edit-workspace-${index}`;
+    const workspaceOpen = openWorkspace === id;
+    const workspace = workspaceOpen ? url.searchParams.get("workspace")?.trim() || agent.workspace : agent.workspace;
+    const workspaceBrowseLink = `/agents/browse?${new URLSearchParams({ editWorkspace: id, path: workspace })}`;
+    workspaceDialogs.push(editWorkspaceDialog(token, workspaceDialogId, id, workspace, workspaceBrowseLink, workspaceOpen, workspaceOpen ? error : undefined));
+    const removeDialogId = `remove-agent-${index}`;
+    const removeOpen = openRemove === id;
+    removeDialogs.push(removeAgentDialog(token, removeDialogId, id, attached, total <= 1, removeOpen, removeOpen ? error : undefined));
     return `
     <article class="card">
       <div class="row"><h3>${html(id)}</h3><span>${bot?.org ? `<span class="badge org">${html(bot.org)}</span> ` : ""}<span class="badge">${html(agent.runtime)}</span></span></div>
       <p>${html(agent.model ?? "默认模型")}</p><code>${html(agent.workspace)}</code>
       ${botLine}
       ${connectionLine}
-      <p>Owner ${bot?.ownerName ? `<b>${html(bot.ownerName)}</b> ` : ""}<code>${html(agent.ownerUser)}</code></p>
+      <p>Owner ${identity(bot?.ownerName ?? "未获取姓名", agent.ownerUser, "Owner ID")}</p>
       <h4>接入群</h4>
       ${bound.length
-        ? `<ul class="links">${bound.map((group) => `<li><a href="${groupAnchor(group.id)}">${html(group.label)}</a><code>${html(group.id)}</code></li>`).join("")}</ul>`
+        ? `<ul class="links">${bound.map((group) => `<li><a href="${groupAnchor(group.id)}">${identity(group.label, group.id, "群 ID", false)}</a></li>`).join("")}</ul>`
         : `<p class="muted">未被任何群使用</p>`}
       <div class="actions">
+        <a class="button ghost" href="/agents?editWorkspace=${encodeURIComponent(id)}" data-dialog="${workspaceDialogId}">修改工作区</a>
         <a class="button ghost" href="/agents?auth=${encodeURIComponent(id)}" data-dialog="${dialogId}">${bot?.authorized ? "重新授权" : "授权机器人"}</a>
-        ${removable ? `<form method="post" action="/agents/remove">${field(token)}<input type="hidden" name="agentId" value="${html(id)}"><button class="danger">删除机器人</button></form>` : ""}
+        <a class="button danger" href="/agents?remove=${encodeURIComponent(id)}" data-dialog="${removeDialogId}">删除机器人</a>
       </div>
     </article>`;
   }).join("");
   const open = url.searchParams.get("new") === "1";
-  const errorInDialog = (open || (openAuth !== undefined && config.agents[openAuth] !== undefined)) && error !== undefined;
+  const errorInDialog = (open
+    || (openAuth !== undefined && config.agents[openAuth] !== undefined)
+    || (openWorkspace !== undefined && config.agents[openWorkspace] !== undefined)
+    || (openRemove !== undefined && config.agents[openRemove] !== undefined)) && error !== undefined;
   return shell("agents", config, url, `
     <div class="toolbar">
-      <div><h2 class="flush">机器人管理</h2><p class="sub">每台机器人对应一个独立 Agent，凭据、Owner、群、Workspace 和 Session 互相隔离。卡片右上角是 Owner 在通讯录里的顶层部门。</p></div>
+      <p class="sub">每台机器人对应一个独立 Agent，凭据、Owner、群、Workspace 和 Session 互相隔离。卡片右上角是 Owner 在通讯录里的顶层部门。</p>
       <a class="button" href="/agents?${carryParams(url, { new: "1" })}" data-dialog="add-agent">＋ 添加机器人</a>
     </div>
     <div class="grid">${cards}</div>
     ${authDialogs.join("")}
+    ${workspaceDialogs.join("")}
+    ${removeDialogs.join("")}
     ${addAgentDialog(token, prefill, browseLink, open, open ? error : undefined)}`, { errorInDialog });
 }
 
 // 无脚本时的目录浏览回退页：选中目录后带着已填的值回到添加对话框。
 async function browsePage(config: ThreadFerryConfig, url: URL): Promise<string> {
   const listing = await listDirectories(url.searchParams.get("path") ?? undefined, false);
-  const browse = (path: string) => `/agents/browse?${carryParams(url, { path })}`;
-  const choose = `/agents?${carryParams(url, { workspace: listing.current, new: "1" })}`;
+  const editWorkspace = url.searchParams.get("editWorkspace")?.trim();
+  if (editWorkspace && !config.agents[editWorkspace]) throw new Error("机器人不存在");
+  const browse = (path: string) => editWorkspace
+    ? `/agents/browse?${new URLSearchParams({ editWorkspace, path })}`
+    : `/agents/browse?${carryParams(url, { path })}`;
+  const choose = editWorkspace
+    ? `/agents?${new URLSearchParams({ editWorkspace, workspace: listing.current })}`
+    : `/agents?${carryParams(url, { workspace: listing.current, new: "1" })}`;
+  const back = editWorkspace ? `/agents?editWorkspace=${encodeURIComponent(editWorkspace)}` : "/agents";
   return shell("agents", config, url, `
     <article class="card">
       <h3>选择 Workspace 目录</h3>
       ${listing.note ? `<p class="muted">${html(listing.note)}</p>` : ""}
       <p>当前目录：<code>${html(listing.current)}</code></p>
-      <p><a class="button" href="${html(choose)}">使用此目录</a> <a href="/agents">返回机器人管理</a></p>
+      <p><a class="button" href="${html(choose)}">使用此目录</a> <a href="${html(back)}">返回机器人管理</a></p>
       ${listing.parent ? `<p><a href="${html(browse(listing.parent))}">↑ 上级目录</a></p>` : ""}
       <ul class="links">${listing.entries.map((entry) => `<li><a href="${html(browse(entry.path))}">${html(entry.name)}/</a></li>`).join("") || `<li class="muted">没有可进入的子目录</li>`}</ul>
       ${listing.truncated ? `<p class="muted">子目录过多，仅显示前 ${MAX_DIRECTORY_ENTRIES} 个。</p>` : ""}
@@ -843,35 +942,30 @@ function agentSection(
         </div>
         <p class="muted">ThreadFerry 不再响应这个群，原授权和 Session 已清理。企业微信暂不支持机器人主动退群；如需从群成员中移除，请由群管理员在企业微信中操作。</p>
       </section>`;
-  // 有名字就把名字放主位、加密 id 退成次要信息；没有名字（没权限或这人没露过面）就只显示 id。
+  // 成员一律名称优先；尚未收集到姓名时也只在悬停或聚焦后显示 id。
   const users = access.allowUsers.map((userId) => {
     const name = userName?.(userId);
-    const label = name
-      ? `<span class="person"><b>${html(name)}</b><code class="faint">${html(userId)}</code></span>`
-      : `<span class="person"><code>${html(userId)}</code></span>`;
+    const label = `<span class="person">${identity(name ?? "未识别用户", userId, "用户 ID")}</span>`;
     return `
-    <li>${label}${userId === owner ? "<span class=owner>Owner</span>" : ""}${userId === owner ? "" : `
+    <li class="member-row"><span class="member-main">${label}${userId === owner ? "<span class=owner>Owner</span>" : ""}</span>${userId === owner ? "" : `
       <form method="post" action="/groups/users/remove">${field(token)}<input type="hidden" name="groupId" value="${html(groupId)}"><input type="hidden" name="agentId" value="${html(agentId)}"><input type="hidden" name="userId" value="${html(userId)}"><button class="danger">移除</button></form>`}</li>`;
   }).join("");
   return `
       <section class="agent-block">
-        <div class="row">
+        <div class="agent-heading">
           <h4>${html(agentId)}${runtime ? ` <span class="badge">${html(runtime)}</span>` : ""}${confirmed ? ` <span class="badge ok">机器人已在群</span>` : ""} <span class="badge${enabled ? " ok" : " warning"}">${enabled ? "可用" : "已停用"}</span></h4>
-          <form method="post" action="/groups/enabled">${hidden}<input type="hidden" name="enabled" value="${enabled ? "off" : "on"}"><button class="ghost">${enabled ? "停用机器人" : "启用机器人"}</button></form>
+          <div class="agent-controls">
+            <form method="post" action="/groups/enabled">${hidden}<input type="hidden" name="enabled" value="${enabled ? "off" : "on"}"><button class="ghost">${enabled ? "停用机器人" : "启用机器人"}</button></form>
+            <form method="post" action="/groups/access">${hidden}<input type="hidden" name="allowAll" value="${access.allowAll ? "off" : "on"}"><button class="ghost">${access.allowAll ? "关闭全员可用" : "开启全员可用"}</button></form>
+          </div>
         </div>
         ${enabled ? "" : `<p class="muted">这台机器人已停用，群内 @ 不会启动 Agent；成员名单和 Session 仍保留。</p>`}
-        <div class="row">
-          <span class="badge${access.allowAll ? " ok" : ""}">${access.allowAll ? "全员可用" : "仅授权成员"}</span>
-          <form method="post" action="/groups/access">${hidden}<input type="hidden" name="allowAll" value="${access.allowAll ? "off" : "on"}">
-            <button class="ghost">${access.allowAll ? "关闭全员可用" : "开启全员可用"}</button>
-          </form>
-        </div>
-        ${access.allowAll ? `<p class="muted">全员可用已开启，群内所有成员都可以 @ 这台机器人；以下名单在关闭后生效。</p>` : ""}
-        <ul>${users}</ul>
-        <div class="actions">
+        <div class="agent-access"><span class="badge${access.allowAll ? " ok" : ""}">${access.allowAll ? "全员可用" : "仅授权成员"}</span>${access.allowAll ? `<p class="muted">群内所有成员都可以 @ 这台机器人；以下名单在关闭后生效。</p>` : ""}</div>
+        <ul class="member-list">${users}</ul>
+        <div class="agent-actions">
           <a class="button ghost" href="${html(groupUserAnchor(groupId, agentId))}" data-dialog="${html(dialogId)}">＋ 添加可使用用户</a>
           ${canReset ? `<form method="post" action="/groups/session/reset">${hidden}<button class="ghost">重置 Session</button></form>` : ""}
-          ${canRemove ? `<form method="post" action="/groups/remove" data-confirm="确定移除 ${html(agentId)} 在这个群的 ThreadFerry 绑定吗？授权和 Session 会被清理。"><input type="hidden" name="csrf" value="${html(token)}"><input type="hidden" name="groupId" value="${html(groupId)}"><input type="hidden" name="agentId" value="${html(agentId)}"><button class="danger">移除机器人</button></form>` : ""}
+          ${canRemove ? `<form class="danger-action" method="post" action="/groups/remove" data-confirm="确定移除 ${html(agentId)} 在这个群的 ThreadFerry 绑定吗？授权和 Session 会被清理。"><input type="hidden" name="csrf" value="${html(token)}"><input type="hidden" name="groupId" value="${html(groupId)}"><input type="hidden" name="agentId" value="${html(agentId)}"><button class="danger">移除机器人</button></form>` : ""}
         </div>
         ${canRemove ? `<p class="muted">“移除机器人”只移除 ThreadFerry 绑定；从企业微信群成员中移除仍需群管理员操作。</p>` : ""}
       </section>`;
@@ -883,7 +977,7 @@ function groupListItem(id: string, label: string, group: GroupBinding | undefine
   const attached = agents.filter((agentId) => !group?.agents[agentId]?.removed);
   const state = agents.length === 0 ? "等待首次 @" : attached.length === 0 ? "已移除" : enabled.length > 0 ? `${enabled.length} 台可用` : "已停用";
   return `<a class="group-row" href="${html(groupAnchor(id))}">
-    <span class="group-main"><span class="group-avatar" aria-hidden="true">群</span><span><b>${html(label)}</b><code>${html(id)}</code></span></span>
+    <span class="group-main"><span class="group-avatar" aria-hidden="true">群</span><span class="group-label">${identity(label, id, "群 ID", false)}</span></span>
     <span class="group-agents">${agents.length
       ? agents.map((agentId) => `<span class="badge${group?.agents[agentId]?.enabled !== false ? " ok" : " warning"}">${html(agentId)}${group?.agents[agentId]?.removed ? " · 已移除" : group?.agents[agentId]?.enabled === false ? " · 停用" : ""}</span>`).join("")
       : `<span class="muted">收到机器人首次群 @ 后自动启用</span>`}</span>
@@ -898,7 +992,7 @@ async function groupsPage(config: ThreadFerryConfig, dependencies: AdminDependen
   const groups = groupIds.map((id) => groupListItem(id, byId.get(id)?.name ?? "未获取群名", config.groups[id]));
   return shell("groups", config, url, `
     ${failures.length > 0 ? `<h2>群查询失败</h2><div class="grid">${failureCard(failures)}</div>` : ""}
-    <div class="section-head"><div><h2>群聊</h2><p class="sub">把机器人拉入群后，第一次 @它 即自动启用；群详情可停用、重新接入、移除 ThreadFerry 绑定和管理成员。</p></div><a class="button ghost" href="/groups">↻ 刷新群列表</a></div>
+    <div class="toolbar"><p class="sub">把机器人拉入群后，第一次 @它 即自动启用；群详情可停用、重新接入、移除 ThreadFerry 绑定和管理成员。</p><a class="button ghost" href="/groups">刷新群列表</a></div>
     <div class="list-panel">${groups.join("") || `<p class="empty-state">还没发现任何群。${DISCOVERY_HINT}</p>`}</div>`);
 }
 
@@ -929,14 +1023,11 @@ async function groupDetailPage(config: ThreadFerryConfig, dependencies: AdminDep
         config.agents[agentId]?.runtime, dialogId, dependencies.userName, Boolean(dependencies.resetSession), Boolean(dependencies.removeGroup), confirmed.has(agentId));
     }).join("");
     const spare = [...visible].filter((agentId) => config.agents[agentId] && !group.agents[agentId]);
-    const enabled = Object.values(group.agents).filter((access) => access.enabled !== false).length;
-    const attached = Object.values(group.agents).filter((access) => !access.removed).length;
-    body = `<article class="card group-detail"><div class="row"><div><h3>${html(label)}</h3><code>${html(id)}</code></div><span class="badge${enabled > 0 ? " ok" : " warning"}">${enabled > 0 ? `${enabled} 台机器人可用` : attached === 0 ? "机器人已移除" : "机器人已停用"}</span></div>
-      <p class="muted">群里 @ 哪台机器人，就由它用自己的 Workspace 回答；名单、开关和 Session 各自独立。</p>${sections}
+    body = `<article class="card group-detail"><p class="muted group-intro">群里 @ 哪台机器人，就由它用自己的 Workspace 回答；名单、开关和 Session 各自独立。</p>${sections}
       ${spare.length > 0 ? `<p class="muted">要让其他机器人也接入本群，直接在群里分别 @它们一次；收到后会自动启用。</p>` : ""}</article>`;
   }
   return shell("groups", config, url, `<p><a class="back-link" href="/groups">← 返回群聊列表</a></p>
-    <div class="detail-title"><div><p class="eyebrow">群聊详情</p><h2>${html(label)}</h2><code>${html(id)}</code></div><a class="button ghost" href="${html(groupAnchor(id))}">↻ 刷新</a></div>
+    <div class="detail-title"><div><p class="eyebrow">群聊详情</p><h2>${identity(label, id, "群 ID")}</h2></div><div class="detail-title-actions"><span class="badge${group && Object.values(group.agents).some((access) => access.enabled !== false) ? " ok" : " warning"}">${group ? `${Object.values(group.agents).filter((access) => access.enabled !== false).length} 台机器人可用` : "等待首次 @"}</span><a class="button ghost" href="${html(groupAnchor(id))}">↻ 刷新</a></div></div>
     ${failures.length > 0 ? failureCard(failures) : ""}${body}${dialogs.join("")}`, { errorInDialog: openedInDialog });
 }
 
@@ -990,7 +1081,7 @@ export async function startAdminServer(
         if (!dependencies.checkUpdate) throw new Error("当前启动方式不支持检查更新");
         const release = await dependencies.checkUpdate();
         message = release
-          ? `发现新版本 ThreadFerry ${release.version}，请前往 GitHub Releases 下载升级`
+          ? `发现新版本 ThreadFerry ${release.version}，请保持 ThreadFerry 桌面应用运行以自动更新`
           : "ThreadFerry 已是最新版本";
       } else if (url.pathname === "/agents/add") {
         target = "/agents";
@@ -1039,16 +1130,29 @@ export async function startAdminServer(
         message = authorization.mode === "qr"
           ? `机器人 ${agentId} 的扫码授权页已打开；完成后刷新本页并重启 ThreadFerry`
           : `机器人 ${agentId} 已授权；重启 ThreadFerry 后启用`;
+      } else if (url.pathname === "/agents/workspace") {
+        target = "/agents";
+        const agentId = required(input, "agentId");
+        const workspaceInput = input.get("workspace")?.trim() ?? "";
+        errorTarget = `/agents?${new URLSearchParams({ editWorkspace: agentId, ...(workspaceInput ? { workspace: workspaceInput } : {}) })}`;
+        const workspace = await resolveWorkspace(required(input, "workspace"));
+        await dependencies.updateConfig((latest) => {
+          const agent = latest.agents[agentId];
+          if (!agent) throw new Error("机器人不存在");
+          agent.workspace = workspace;
+        });
+        message = `机器人 ${agentId} 的工作区已更新`;
       } else if (url.pathname === "/agents/remove") {
         target = "/agents";
         const agentId = required(input, "agentId");
+        errorTarget = `/agents?remove=${encodeURIComponent(agentId)}`;
         await dependencies.updateConfig((latest) => {
           if (!latest.agents[agentId]) throw new Error("机器人不存在");
           if (Object.values(latest.groups).some((group) => {
             const access = group.agents[agentId];
-            return access && access.enabled !== false;
+            return access && access.removed !== true;
           })) {
-            throw new Error("仍有群正在使用此机器人，请先在群详情停用它");
+            throw new Error("仍有群绑定此机器人，请先在群详情解除绑定");
           }
           if (Object.keys(latest.agents).length <= 1) throw new Error("至少保留一个机器人");
           for (const [groupId, group] of Object.entries(latest.groups)) {

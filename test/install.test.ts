@@ -26,7 +26,8 @@ const packageMetadata = JSON.parse(
   build?: {
     electronLanguages?: string[];
     files?: string[];
-    mac?: { target?: Array<{ target: string; arch: string[] }> };
+    publish?: Array<{ provider: string; owner: string; repo: string }>;
+    mac?: { notarize?: boolean; target?: Array<{ target: string; arch: string[] }> };
   };
 };
 
@@ -177,10 +178,20 @@ test("release workflow publishes directly installable desktop packages", () => {
   assert.deepEqual(packageMetadata.build?.electronLanguages, ["en-US", "zh-CN", "zh_CN"]);
   assert.ok(packageMetadata.build?.files?.includes("!**/*.d.ts"));
   assert.ok(packageMetadata.build?.files?.includes("!**/*.map"));
-  assert.deepEqual(packageMetadata.build?.mac?.target, [{ target: "dmg", arch: ["arm64", "x64"] }]);
+  assert.deepEqual(packageMetadata.build?.publish, [{ provider: "github", owner: "GnaixEuy", repo: "threadferry" }]);
+  assert.equal(packageMetadata.build?.mac?.notarize, true);
+  assert.deepEqual(packageMetadata.build?.mac?.target, [
+    { target: "dmg", arch: ["arm64", "x64"] },
+    { target: "zip", arch: ["arm64", "x64"] },
+  ]);
   for (const runner of ["macos-latest", "windows-latest", "ubuntu-latest"]) assert.match(workflow, new RegExp(`os: ${runner}`));
-  for (const extension of ["dmg", "exe", "AppImage", "deb"]) assert.match(workflow, new RegExp(`release/desktop/\\*\\.${extension}`));
-  assert.doesNotMatch(workflow, /release\/desktop\/\*\.zip/);
+  for (const extension of ["dmg", "zip", "exe", "AppImage", "deb", "blockmap"]) {
+    assert.match(workflow, new RegExp(`release/desktop/\\*\\.${extension}`));
+  }
+  assert.match(workflow, /release\/desktop\/latest\*\.yml/);
+  for (const secret of ["MAC_CSC_LINK", "MAC_CSC_KEY_PASSWORD", "APPLE_ID", "APPLE_APP_SPECIFIC_PASSWORD", "APPLE_TEAM_ID"]) {
+    assert.match(workflow, new RegExp(`secrets\\.${secret}`));
+  }
   assert.match(workflow, /needs: \[cli, desktop\]/);
   assert.match(workflow, /merge-multiple: true/);
   assert.match(workflow, /sha256sum > SHA256SUMS/);

@@ -5,29 +5,11 @@ import { join } from "node:path";
 import { prepareRuntimeResources } from "../attachments.js";
 import { resolveWorkspace } from "../config.js";
 import { runCommand } from "../process.js";
+import { nativeRuntimeEnvironment } from "./environment.js";
 import { runtimeFailure } from "./runtime-error.js";
 import type { CommandRunner, RuntimeRequest, RuntimeResult } from "../types.js";
 
-const DENIED_TOOLS = [
-  "Bash", "Edit", "Write", "MCPTool", "WebFetch", "WebSearch",
-  "Read(.env)", "Read(.env.*)", "Read(**/.env)", "Read(**/.env.*)",
-  "Read(.npmrc)", "Read(**/.npmrc)", "Read(.git-credentials)", "Read(**/.git-credentials)",
-  "Read(*.pem)", "Read(**/*.pem)", "Read(*.key)", "Read(**/*.key)",
-  "Read(*.p12)", "Read(**/*.p12)", "Read(id_rsa*)", "Read(**/id_rsa*)",
-  "Read(id_ed25519*)", "Read(**/id_ed25519*)",
-];
-
 const MAX_PROMPT_JSON_BYTES = 700 * 1024;
-
-function safeEnvironment(): NodeJS.ProcessEnv {
-  const allowed = [
-    "PATH", "HOME", "TMPDIR", "LANG", "LC_ALL", "GROK_HOME",
-    "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "APPDATA", "LOCALAPPDATA", "TEMP", "TMP",
-    "SystemRoot", "WINDIR", "ComSpec", "PATHEXT",
-    "SSL_CERT_FILE", "NODE_EXTRA_CA_CERTS", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "XAI_API_KEY",
-  ];
-  return Object.fromEntries(allowed.flatMap((key) => process.env[key] === undefined ? [] : [[key, process.env[key]]]));
-}
 
 export async function runGrok(
   request: Omit<RuntimeRequest, "agentId" | "runtime">,
@@ -60,10 +42,6 @@ export async function runGrok(
     const args = [
       "--no-auto-update", "--cwd", workspace,
       "--output-format", "json",
-      "--permission-mode", "dontAsk", "--sandbox", "strict",
-      "--tools", "Read,Grep", "--disable-web-search", "--no-subagents", "--no-memory",
-      ...DENIED_TOOLS.flatMap((rule) => ["--deny", rule]),
-      "--system-prompt-override", "Analyze the workspace read-only. Never modify files, run commands, use network tools, plugins, MCP servers, hooks, or reveal secrets.",
       "--verbatim",
       ...(request.model ? ["--model", request.model] : []),
       ...(request.sessionId ? ["--resume", request.sessionId] : ["--session-id", sessionId]),
@@ -71,7 +49,7 @@ export async function runGrok(
     ];
     ({ stdout } = await runner("grok", args, {
       cwd: workspace,
-      env: safeEnvironment(),
+      env: nativeRuntimeEnvironment(),
       timeoutMs: 10 * 60_000,
       signal: request.signal,
     }));

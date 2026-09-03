@@ -51,7 +51,7 @@ import { findUpdate, installUpdate } from "./update.js";
 import { installOfficialWecomSkills, officialWecomSkillsInstalled } from "./wecom-skills.js";
 import { runWorkflowTick } from "./workflow.js";
 
-const VERSION = "0.29.1";
+const VERSION = "0.32.2";
 const UPDATE_INTERVAL_MS = 6 * 60 * 60 * 1_000;
 const WORKFLOW_INTERVAL_MS = 30_000;
 interface DesktopParentPort {
@@ -1342,7 +1342,8 @@ async function start(
         workflowTimer.unref();
         runWorkflows();
         const onParentMessage = (event: { data: unknown }) => {
-          if ((event.data as { type?: unknown } | undefined)?.type === "threadferry:stop") stop(true);
+          const message = event.data as { type?: unknown; cancel?: unknown } | undefined;
+          if (message?.type === "threadferry:stop") stop(message.cancel !== false);
         };
         desktopPort?.on("message", onParentMessage);
         desktopPort?.postMessage({ type: "threadferry:ready", url: admin.url });

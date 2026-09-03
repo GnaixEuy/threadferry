@@ -13,7 +13,6 @@ import { CommandExecutionError, CommandTimeoutError, runCommand } from "../src/p
 import { runClaude } from "../src/runtimes/claude.js";
 import { runCodex } from "../src/runtimes/codex.js";
 import { runGrok } from "../src/runtimes/grok.js";
-import { allowedReadPath } from "../src/runtimes/pi-readonly-extension.js";
 import { runPi } from "../src/runtimes/pi.js";
 import { runtimeFailure } from "../src/runtimes/runtime-error.js";
 import { ThreadFerryState } from "../src/state.js";
@@ -80,13 +79,10 @@ test("mock WeCom -> history -> context -> Codex -> reply vertical slice", async 
     assert.equal(command, "codex");
     assert.equal(options?.cwd, workspace);
     assert.equal(args[args.indexOf("-C") + 1], workspace);
-    assert.match(args.find((arg) => arg.startsWith("permissions.threadferry-read-only.filesystem=")) ?? "", /":workspace_roots"=\{"\."="read"/);
-    assert.ok(args.includes("permissions.threadferry-read-only.network.enabled=false"));
-    assert.ok(!args.includes("workspace-write"));
-    assert.ok(args.indexOf("-a") < args.indexOf("exec"));
-    assert.ok(args.includes("never"));
     assert.ok(args.includes("--json"));
-    assert.ok(args.includes("--ignore-user-config"));
+    for (const flag of ["--ignore-user-config", "--ignore-rules", "--disable", "--sandbox"]) {
+      assert.ok(!args.includes(flag));
+    }
     assert.ok(!args.includes("--ephemeral"));
     assert.equal(options?.env?.THREADFERRY_WECOM_BOT_SECRET, undefined);
     return {
@@ -1974,7 +1970,7 @@ test("Codex starts a fresh session only when a saved session is definitely missi
   assert.deepEqual(result, { text: "新会话结果", sessionId: "new-session" });
 });
 
-test("Pi uses only guarded read tools and parses its machine-readable result", async (t) => {
+test("Pi loads project context and native tools while parsing its machine-readable result", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "threadferry-pi-test-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   const workspace = await realpath(root);
@@ -1984,20 +1980,20 @@ test("Pi uses only guarded read tools and parses its machine-readable result", a
     return {
       stdout: `${JSON.stringify({ type: "session", id: "pi-session" })}\n${JSON.stringify({
         type: "message_end",
-        message: { role: "assistant", content: [{ type: "text", text: "Pi 只读分析" }] },
+        message: { role: "assistant", content: [{ type: "text", text: "Pi 完成" }] },
       })}\n`,
       stderr: "",
     };
   };
   const result = await runPi({ agentId: "reviewer", workspace, prompt: "分析", model: "provider/model" }, runner, join(root, "sessions"));
-  assert.deepEqual(result, { text: "Pi 只读分析", sessionId: "pi-session" });
+  assert.deepEqual(result, { text: "Pi 完成", sessionId: "pi-session" });
   assert.equal(received?.command, "pi");
   assert.equal(received?.cwd, workspace);
   assert.equal(received?.input, "分析");
   assert.equal(received?.secret, undefined);
-  assert.equal(received?.args[received.args.indexOf("--tools") + 1], "read,ls");
-  for (const flag of ["--no-extensions", "--extension", "--no-skills", "--skill", "--no-context-files", "--no-approve"]) {
-    assert.ok(received?.args.includes(flag));
+  assert.ok(received?.args.includes("--approve"));
+  for (const flag of ["--tools", "--no-extensions", "--no-skills", "--no-context-files", "--no-approve"]) {
+    assert.ok(!received?.args.includes(flag));
   }
   const piSkillPaths = received?.args.flatMap((arg, index, args) => args[index - 1] === "--skill" ? [arg] : []) ?? [];
   assert.equal(piSkillPaths.length, 1);
@@ -2042,24 +2038,25 @@ test("Pi retries a resumed session after a connection error and reports the real
   assert.equal(failure.message, "Pi：TypeError: fetch failed");
 });
 
-test("Claude Code runs headlessly with only read tools and resumes its session", async (t) => {
+test("Claude Code keeps native project automation and resumes its session", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "threadferry-claude-test-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   const workspace = await realpath(root);
   let received: { command: string; args: string[]; cwd?: string; input?: string; secret?: string } | undefined;
   const runner: CommandRunner = async (command, args, options) => {
     received = { command, args, cwd: options?.cwd, input: options?.input, secret: options?.env?.THREADFERRY_WECOM_BOT_SECRET };
-    return { stdout: JSON.stringify({ type: "result", subtype: "success", result: "Claude 只读分析", session_id: "claude-session" }), stderr: "" };
+    return { stdout: JSON.stringify({ type: "result", subtype: "success", result: "Claude 完成", session_id: "claude-session" }), stderr: "" };
   };
   const result = await runClaude({ workspace, prompt: "分析", model: "sonnet", sessionId: "claude-session" }, runner);
-  assert.deepEqual(result, { text: "Claude 只读分析", sessionId: "claude-session" });
+  assert.deepEqual(result, { text: "Claude 完成", sessionId: "claude-session" });
   assert.equal(received?.command, "claude");
   assert.equal(received?.cwd, workspace);
   assert.match(received?.input ?? "", /^分析/);
   assert.match(received?.input ?? "", /TRUSTED_WECOM_SKILL_DIRECTORIES[\s\S]*\.agents\/skills\/wecom-unified/);
   assert.equal(received?.secret, undefined);
-  for (const flag of ["--safe-mode", "--permission-mode", "--allowedTools", "--disallowedTools", "--resume"]) {
-    assert.ok(received?.args.includes(flag));
+  assert.ok(received?.args.includes("--resume"));
+  for (const flag of ["--safe-mode", "--disable-slash-commands", "--no-chrome", "--permission-mode", "--allowedTools", "--disallowedTools"]) {
+    assert.ok(!received?.args.includes(flag));
   }
   const claudeSkillPaths = received?.args.flatMap((arg, index, args) => args[index - 1] === "--add-dir" ? [arg] : []) ?? [];
   assert.equal(claudeSkillPaths.length, 1);
@@ -2072,7 +2069,7 @@ test("Claude Code runs headlessly with only read tools and resumes its session",
   await assert.rejects(runClaude({ workspace, prompt: "分析" }, loggedOut), /Claude：Not logged in/);
 });
 
-test("Grok Build runs in the strict read-only sandbox and creates a resumable session", async (t) => {
+test("Grok Build keeps native automation and creates a resumable session", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "threadferry-grok-test-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   const workspace = await realpath(root);
@@ -2086,20 +2083,19 @@ test("Grok Build runs in the strict read-only sandbox and creates a resumable se
       secret: options?.env?.THREADFERRY_WECOM_BOT_SECRET,
     };
     const sessionId = args[args.indexOf("--session-id") + 1];
-    return { stdout: JSON.stringify({ text: "Grok 只读分析", sessionId, stopReason: "end_turn" }), stderr: "" };
+    return { stdout: JSON.stringify({ text: "Grok 完成", sessionId, stopReason: "end_turn" }), stderr: "" };
   };
   const result = await runGrok({ workspace, prompt: "分析", model: "grok-4.6" }, runner);
-  assert.equal(result.text, "Grok 只读分析");
+  assert.equal(result.text, "Grok 完成");
   assert.match(result.sessionId ?? "", /^[0-9a-f-]{36}$/);
   assert.equal(received?.command, "grok");
   assert.equal(received?.cwd, workspace);
   assert.equal(received?.prompt, "分析");
   await assert.rejects(stat(received?.promptPath ?? ""), /ENOENT/);
   assert.equal(received?.secret, undefined);
-  assert.equal(received?.args[received.args.indexOf("--sandbox") + 1], "strict");
-  assert.equal(received?.args[received.args.indexOf("--permission-mode") + 1], "dontAsk");
-  assert.equal(received?.args[received.args.indexOf("--tools") + 1], "Read,Grep");
-  assert.ok(received?.args.includes("--disable-web-search"));
+  for (const flag of ["--sandbox", "--permission-mode", "--tools", "--disable-web-search", "--no-subagents", "--no-memory", "--deny", "--system-prompt-override"]) {
+    assert.ok(!received?.args.includes(flag));
+  }
   assert.equal(received?.args[received.args.indexOf("--model") + 1], "grok-4.6");
 });
 
@@ -2168,20 +2164,6 @@ test("all runtimes receive images and safe text attachment content", async (t) =
   assert.equal(promptJson[1]?.type, "image");
   assert.equal(promptJson[1]?.mimeType, "image/png");
   assert.equal(promptJson[1]?.data, Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1]).toString("base64"));
-});
-
-test("Pi read guard rejects workspace escapes, symlinks, and sensitive files", async (t) => {
-  const root = await mkdtemp(join(tmpdir(), "threadferry-pi-guard-"));
-  const outside = await mkdtemp(join(tmpdir(), "threadferry-pi-outside-"));
-  t.after(() => Promise.all([rm(root, { recursive: true, force: true }), rm(outside, { recursive: true, force: true })]));
-  await writeFile(join(root, "source.ts"), "export {};\n");
-  await writeFile(join(root, ".env"), "SECRET=hidden\n");
-  await symlink(outside, join(root, "outside"), "dir");
-  assert.equal(allowedReadPath(root, "source.ts"), true);
-  assert.equal(allowedReadPath(root, "../outside"), false);
-  assert.equal(allowedReadPath(root, "~/.ssh/id_ed25519"), false);
-  assert.equal(allowedReadPath(root, "outside"), false);
-  assert.equal(allowedReadPath(root, ".env"), false);
 });
 
 test("running Codex work can be cancelled during shutdown", async () => {

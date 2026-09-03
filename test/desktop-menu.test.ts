@@ -16,3 +16,21 @@ test("desktop reuses the visible management page instead of reloading it", async
   assert.match(source, /managementWindow\?\.webContents\.getURL\(\) === url/);
   assert.match(source, /managementWindow\.show\(\);\s*managementWindow\.focus\(\);\s*} else {\s*openManagementWindow\(url\)/);
 });
+
+test("desktop installs updates and restarts instead of opening downloaded installers", async () => {
+  const [source, preload, cli] = await Promise.all([
+    readFile(resolve("src/desktop.ts"), "utf8"),
+    readFile(resolve("build/desktop-preload.cjs"), "utf8"),
+    readFile(resolve("src/cli.ts"), "utf8"),
+  ]);
+
+  assert.match(preload, /desktop-update:install/);
+  assert.match(preload, /desktop-update:status/);
+  assert.match(source, /installDesktopUpdate\(autoUpdater/);
+  assert.match(source, /setTimeout\(\(\) => void runDesktopUpdate/);
+  assert.match(source, /setInterval\(\(\) => void runDesktopUpdate/);
+  assert.match(source, /stopService\(false\)/);
+  assert.match(source, /postMessage\(\{ type: "threadferry:stop", cancel \}\)/);
+  assert.match(cli, /stop\(message\.cancel !== false\)/);
+  assert.doesNotMatch(source, /webContents\.downloadURL|shell\.openPath/);
+});

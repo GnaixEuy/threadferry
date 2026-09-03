@@ -17,6 +17,7 @@ import {
   type NativeImage,
   type UtilityProcess,
 } from "electron";
+import { autoUpdater } from "electron-updater";
 import { desktopEnvironment } from "./desktop-environment.js";
 import {
   DEFAULT_DESKTOP_PREFERENCES,
@@ -24,10 +25,12 @@ import {
   writeDesktopPreferences,
   type DesktopPreferences,
 } from "./desktop-preferences.js";
+import { installDesktopUpdate, type DesktopUpdateStatus } from "./desktop-update.js";
 
 const ADMIN_URL = "http://127.0.0.1:17638";
 const MAX_LOG_BYTES = 2 * 1024 * 1024;
 const MAX_RECENT_OUTPUT = 8_000;
+const UPDATE_INTERVAL_MS = 6 * 60 * 60 * 1_000;
 
 type ServicePhase = "stopped" | "starting" | "running" | "stopping" | "error";
 interface ServiceState {
@@ -50,6 +53,9 @@ let pendingManagementPath: string | undefined;
 let quitting = false;
 let preferencesPath = "";
 let desktopPreferences = { ...DEFAULT_DESKTOP_PREFERENCES };
+let updateStatus: DesktopUpdateStatus = { phase: "current", version: app.getVersion() };
+let updateOperation: Promise<{ status: "current" | "installing"; version: string }> | undefined;
+let updatePreparingRestart = false;
 
 function appendOutput(chunk: Uint8Array | string): void {
   const text = typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8");
@@ -184,7 +190,7 @@ async function startService(): Promise<void> {
   }
 }
 
-async function stopService(): Promise<void> {
+async function stopService(cancel = true): Promise<void> {
   serviceGeneration += 1;
   const child = service;
   managementWindow?.hide();
@@ -193,10 +199,15 @@ async function stopService(): Promise<void> {
     return;
   }
   setServiceState({ phase: "stopping", owned: true });
-  child.postMessage({ type: "threadferry:stop" });
+  const exited = new Promise<void>((resolve) => child.once("exit", () => resolve()));
+  child.postMessage({ type: "threadferry:stop", cancel });
+  if (!cancel) {
+    await exited;
+    return;
+  }
   let timedOut = false;
   await Promise.race([
-    new Promise<void>((resolve) => child.once("exit", () => resolve())),
+    exited,
     new Promise<void>((resolve) => {
       const timer = setTimeout(() => { timedOut = true; resolve(); }, 10_000);
       timer.unref();
@@ -334,7 +345,53 @@ function assertAdminSender(event: IpcMainInvokeEvent): void {
   throw new Error("偏好设置只允许本机管理台访问");
 }
 
-function registerPreferenceHandlers(): void {
+function reportUpdateStatus(status: DesktopUpdateStatus): void {
+  updateStatus = status;
+  if (managementWindow && !managementWindow.isDestroyed()) {
+    managementWindow.webContents.send("desktop-update:status", status);
+  }
+}
+
+function runDesktopUpdate(): Promise<{ status: "current" | "installing"; version: string }> {
+  if (!app.isPackaged) return Promise.reject(new Error("开发模式不执行桌面自动更新"));
+  if (!updateOperation) {
+    updateOperation = installDesktopUpdate(autoUpdater, app.getVersion(), async () => {
+      updatePreparingRestart = true;
+      await stopService(false);
+      quitting = true;
+    }, reportUpdateStatus).catch(async (error: unknown) => {
+      if (updatePreparingRestart) {
+        updatePreparingRestart = false;
+        quitting = false;
+        await startService();
+      }
+      const message = error instanceof Error ? error.message : String(error);
+      appendOutput(`[update] ${message}\n`);
+      reportUpdateStatus({ phase: "error", message });
+      throw error;
+    }).finally(() => { updateOperation = undefined; });
+  }
+  return updateOperation;
+}
+
+function configureAutomaticUpdates(): void {
+  autoUpdater.autoDownload = false;
+  autoUpdater.autoInstallOnAppQuit = false;
+  autoUpdater.autoRunAppAfterInstall = true;
+  autoUpdater.allowPrerelease = false;
+  autoUpdater.allowDowngrade = false;
+  autoUpdater.disableWebInstaller = true;
+  autoUpdater.on("download-progress", ({ percent }) => {
+    reportUpdateStatus({ phase: "downloading", version: updateStatus.version, percent });
+  });
+  autoUpdater.on("error", (error) => appendOutput(`[update] ${error.message}\n`));
+  const firstCheck = setTimeout(() => void runDesktopUpdate().catch(() => undefined), 10_000);
+  firstCheck.unref();
+  const interval = setInterval(() => void runDesktopUpdate().catch(() => undefined), UPDATE_INTERVAL_MS);
+  interval.unref();
+}
+
+function registerDesktopHandlers(): void {
   ipcMain.handle("desktop-preferences:get", (event) => {
     assertAdminSender(event);
     return preferenceState();
@@ -345,13 +402,18 @@ function registerPreferenceHandlers(): void {
     applyDesktopPreferences();
     return preferenceState();
   });
+  ipcMain.handle("desktop-update:install", (event) => {
+    assertAdminSender(event);
+    return runDesktopUpdate();
+  });
 }
 
 async function initialize(): Promise<void> {
   await prepareLog();
   preferencesPath = join(app.getPath("userData"), "desktop-preferences.json");
   desktopPreferences = await readDesktopPreferences(preferencesPath);
-  registerPreferenceHandlers();
+  registerDesktopHandlers();
+  if (app.isPackaged) configureAutomaticUpdates();
   Menu.setApplicationMenu(null);
   applyDesktopPreferences();
   tray = new Tray(trayImage());

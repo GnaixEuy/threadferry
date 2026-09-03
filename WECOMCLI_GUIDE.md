@@ -153,8 +153,8 @@ ThreadFerry Broker 只接受以下两种命令：
 
 ## 5. ThreadFerry 执行协议
 
-Agent 完整读取对应官方 Skill 及其为当前操作指定的 reference，然后输出一个动作提议。Agent 不直接
-运行 CLI。
+Agent 完整读取对应官方 Skill 及其为当前操作指定的 reference，然后输出一个动作提议。企业微信业务
+动作不得由 Agent 自己运行 CLI，必须交给 ThreadFerry Broker 使用所属 Agent 的隔离凭据执行。
 
 ```threadferry-action
 {

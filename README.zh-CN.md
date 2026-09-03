@@ -7,7 +7,7 @@
 </p>
 
 <p align="center">
-  <a href="#安装">安装</a> · <a href="#首次运行">首次运行</a> ·
+  <a href="#架构">架构</a> · <a href="#安装">安装</a> · <a href="#首次运行">首次运行</a> ·
   <a href="#对话使用">对话使用</a> · <a href="#安全边界">安全边界</a> ·
   <a href="#运维">运维</a> · <a href="./CHANGELOG.md">更新日志</a>
 </p>
@@ -23,13 +23,23 @@ ThreadFerry 把企业微信连接到相互隔离的本地 AI Agent。一个 Agen
 ## 主要能力
 
 - 在固定本地 Workspace 中运行 Codex、Pi、Claude Code 或 Grok Build。
-- 分析私聊和受控群聊上下文，不向 Runtime 开放文件写入或任意 shell。
+- 遵循各 Runtime 的原生用户配置和 Workspace 指令，保留本地工具、Skills、插件与自动化能力。
 - 读取图片、UTF-8 文本附件、引用资源和近期会话资源。
 - 由企业微信官方 `wecom-unified` Skill 驱动通讯录、日程、会议与会议室、待办、邮件、消息、文档、
   微盘、普通表格、智能表格和智能文档，通过受控 `wecom-cli` Broker 执行。
 - 创建提醒，并在同一 Owner 的 Agent 之间交接工作。
 - 重启后恢复 Session、排队任务和未投递回复。
 - 持续重连企业微信长连接，并在管理台显示每个 Agent 的在线、重连和最后回调状态。
+
+## 架构
+
+<p align="center">
+  <img src="./docs/assets/threadferry-architecture.png" alt="ThreadFerry 架构：企业微信连接相互隔离的本地 Agent、Runtime、状态存储和受控动作 Broker" width="100%">
+</p>
+
+每个 Agent 独立拥有机器人连接、Owner、凭据目录、Workspace、Runtime、Session 和授权群。Runtime
+负责处理任务，只提议企业操作；ThreadFerry 校验后使用所属 Agent 的凭据执行。状态、会话历史、提醒、
+协作任务和投递队列均按 Agent 或会话分区。
 
 ## 安装
 
@@ -85,7 +95,9 @@ ThreadFerry 图标，可以打开管理台、重启或停止服务、查看日�
 入口可以在偏好设置中隐藏；偏好设置还可以切换主题，并控制登录时启动、服务自动启动、启动后打开
 管理台和 macOS Dock 入口。首次打开管理台会显示状态驱动的开始使用清单和三步界面引导；完成
 机器人授权和第一次 Owner 私聊后清单自动收起，群聊接入保持可选，引导可以跳过或从偏好设置重新查看。
-概览还会用近 7 天处理趋势和任务状态分布展示脱敏运行状态。桌面偏好只保存在当前设备。
+概览还会用近 7 天处理趋势和任务状态分布展示脱敏运行状态。桌面应用会在启动后及每 6 小时自动检查更新，
+在后台下载并校验新版本，等待当前任务安全结束后自动安装和重启；偏好设置也可立即检查。桌面偏好只保存
+在当前设备。
 
 需要终端运维时仍可直接启动：
 
@@ -195,9 +207,10 @@ Owner 可用，不再需要单独绑定。之后可在管理台群详情停用�
 - 每台机器人只接受自己 Owner 的私聊 Agent 请求。
 - 已停用或已移除的群、未授权用户和没有 `@机器人` 的消息不会启动 Runtime。
 - Agent 之间不共享凭据、Owner、Session、会话历史或 Workspace。
-- Codex 禁用网络和文件写入；Pi 只开放经过路径守卫的 `read` 和 `ls`；Claude Code 使用 Safe Mode
-  和只读工具；Grok Build 使用 strict sandbox，并关闭 Web、子 Agent 和 Memory。
-- Runtime 不能提交、推送、部署、删除文件、执行任意 shell，也不能直接调用 `wecom-cli`。
+- ThreadFerry 不覆盖 Codex、Pi、Claude Code 或 Grok Build 的本地权限配置；它们会加载各自的用户配置、
+  Workspace 指令、Skills、插件和工具，并可能按这些原生规则执行命令、修改文件或访问网络。
+- 只应把机器人开放给可信用户和群，并在各 Runtime 中自行配置需要的审批与沙箱。企业微信动作仍应通过
+  `threadferry-action` 交给 Broker 校验、确认和审计。
 - 机器人凭据保存在各 Agent 的 `wecom-cli` 加密存储中。ThreadFerry 不会把 Bot Secret 写入配置、
   状态、日志、URL、测试夹具或环境变量。
 - 群历史、引用消息、附件和企业内容始终按不可信输入处理。

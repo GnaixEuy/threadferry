@@ -90,7 +90,34 @@ jobs:
       - name: Install development dependencies
         run: npm ci --ignore-scripts
 
+      - name: Verify macOS signing configuration
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          CSC_LINK: ${{ secrets.MAC_CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.MAC_CSC_KEY_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          test -n "$CSC_LINK"
+          test -n "$CSC_KEY_PASSWORD"
+          test -n "$APPLE_ID"
+          test -n "$APPLE_APP_SPECIFIC_PASSWORD"
+          test -n "$APPLE_TEAM_ID"
+
+      - name: Build signed and notarized macOS package
+        if: runner.os == 'macOS'
+        env:
+          CSC_LINK: ${{ secrets.MAC_CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.MAC_CSC_KEY_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: npm run desktop:dist
+
       - name: Build desktop package
+        if: runner.os != 'macOS'
         run: npm run desktop:dist
 
       - name: Upload desktop assets
@@ -99,9 +126,12 @@ jobs:
           name: desktop-${{ matrix.name }}
           path: |
             release/desktop/*.dmg
+            release/desktop/*.zip
             release/desktop/*.exe
             release/desktop/*.AppImage
             release/desktop/*.deb
+            release/desktop/*.blockmap
+            release/desktop/latest*.yml
           if-no-files-found: error
 
   release:
