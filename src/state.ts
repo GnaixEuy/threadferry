@@ -705,6 +705,21 @@ export class ThreadFerryState {
     });
   }
 
+  async clearLogs(): Promise<number> {
+    return this.exclusive(async () => {
+      await this.load();
+      const failures = this.data.turns.filter((turn) => turn.errorId !== undefined || turn.failurePhase !== undefined);
+      const removed = failures.length + this.data.activities.length;
+      for (const turn of failures) {
+        delete turn.errorId;
+        delete turn.failurePhase;
+      }
+      this.data.activities = [];
+      if (removed > 0) await this.save();
+      return removed;
+    });
+  }
+
   async createReminder(input: {
     agent: string;
     chatId: string;

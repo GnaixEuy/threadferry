@@ -161,7 +161,8 @@ export function standardizeAuthChange(frame: WsFrame<unknown>): IncomingWecomEve
 
 // ponytail: 750 ms quiet window identifies one WeCom send burst; use a platform correlation id if the SDK exposes one later.
 const DIRECT_MESSAGE_BUNDLE_MS = 750;
-const RESOURCE_FAILURE_REPLY = "ThreadFerry 已收到消息，但资源下载、解密或分析失败。请在运行 ThreadFerry 的机器上执行 `threadferry doctor` 检查依赖和授权。";
+const RESOURCE_FAILURE_REPLY = "ThreadFerry 已收到消息，但资源下载或解密失败。请在运行 ThreadFerry 的机器上执行 `threadferry doctor` 检查依赖和授权。";
+const PROCESS_FAILURE_REPLY = "ThreadFerry 已收到消息，但处理过程失败。请稍后重试；如果持续发生，请在运行 ThreadFerry 的机器上执行 `threadferry status` 查看原因。";
 
 type BufferedWecomMessage = {
   key?: string;
@@ -201,8 +202,8 @@ export function createWecomMessageDispatcher(
     timer: ReturnType<typeof setTimeout>;
   }>();
 
-  async function fail(reply: Reply): Promise<void> {
-    await reply(RESOURCE_FAILURE_REPLY).catch(() => undefined);
+  async function fail(reply: Reply, resource = false): Promise<void> {
+    await reply(resource ? RESOURCE_FAILURE_REPLY : PROCESS_FAILURE_REPLY).catch(() => undefined);
   }
 
   async function deliver(messages: BufferedWecomMessage[]): Promise<void> {
@@ -214,7 +215,7 @@ export function createWecomMessageDispatcher(
         if (rejected) throw rejected.reason;
         if (events.length) await handle(mergeDirectEvents(events), messages.at(-1)!.reply);
       } catch {
-        await fail(messages.at(-1)!.reply);
+        await fail(messages.at(-1)!.reply, true);
       } finally {
         await cleanupAttachmentResources(events.flatMap((event) => event.message.resources ?? []));
       }
@@ -223,7 +224,7 @@ export function createWecomMessageDispatcher(
     for (const [index, result] of settled.entries()) {
       const message = messages[index]!;
       if (result.status === "rejected") {
-        await fail(message.reply);
+        await fail(message.reply, true);
         continue;
       }
       if (!result.value) continue;
@@ -308,9 +309,6 @@ function cliEnvelope(stdout: string, label: string): Record<string, unknown> {
   const rawMessage = envelope.errmsg ?? nested?.message;
   const message = typeof rawMessage === "string" ? rawMessage.replace(/\s+/g, " ").trim().slice(0, 300) : "";
   if ((nested && rawCode === undefined) || (rawCode !== undefined && (!Number.isFinite(code) || code !== 0))) {
-    if (code === 853006) {
-      throw new Error(`企业未授权机器人访问会话数据（errcode 853006）；请让企业管理员批准机器人数据访问权限`);
-    }
     throw new Error(`wecom-cli ${label} 失败${code === undefined || !Number.isFinite(code) ? "" : `（errcode ${code}）`}${message ? `：${message}` : ""}`);
   }
   return envelope;
@@ -381,28 +379,134 @@ async function listMessagedGroups(runner: CommandRunner, now: Date): Promise<Wec
   return [...found.values()];
 }
 
-function cliErrorMessage(output: string): string | undefined {
+interface CliFailureDetail {
+  code?: number;
+  message?: string;
+}
+
+const SERVICE_LABELS: Record<string, string> = {
+  calendar: "日程",
+  chat: "完整会话历史",
+  contact: "通讯录",
+  disk: "微盘",
+  doc: "文档",
+  mail: "邮件",
+  media: "媒体文件",
+  meeting: "会议",
+  message: "主动消息",
+  sheet: "在线表格",
+  smartpage: "智能文档",
+  smartsheet: "智能表格",
+  todo: "待办",
+};
+
+function cliFailureDetail(output: string): CliFailureDetail | undefined {
   const text = output.trim();
   if (!text) return undefined;
   if (text.startsWith("{")) {
     try {
-      const message = (JSON.parse(text) as { error?: { message?: unknown } }).error?.message;
-      return typeof message === "string" && message.trim() ? message.trim().replace(/\s+/g, " ") : undefined;
+      const envelope = JSON.parse(text) as { errcode?: unknown; errmsg?: unknown; error?: { code?: unknown; message?: unknown } };
+      const rawCode = envelope.errcode ?? envelope.error?.code;
+      const code = rawCode === undefined ? undefined : Number(rawCode);
+      const rawMessage = envelope.errmsg ?? envelope.error?.message;
+      const message = typeof rawMessage === "string" && rawMessage.trim()
+        ? rawMessage.trim().replace(/\s+/g, " ")
+        : undefined;
+      return {
+        ...(Number.isFinite(code) ? { code } : {}),
+        ...(message ? { message } : {}),
+      };
     } catch {
       return undefined; // 半截 JSON 就别硬凑，交给下一个来源
     }
   }
-  return text.split("\n").map((line) => line.trim()).find(Boolean);
+  const message = text.split("\n").map((line) => line.trim()).find(Boolean);
+  if (!message) return undefined;
+  const code = Number(message.match(/errcode\s+(\d+)/i)?.[1]);
+  return { ...(Number.isFinite(code) ? { code } : {}), message };
+}
+
+function permissionReason(detail: CliFailureDetail | undefined, service?: string): string | undefined {
+  if (!detail) return undefined;
+  const label = SERVICE_LABELS[service ?? ""] ?? "这项企业微信能力";
+  if (detail.code === 850002) return `当前企业未授权${label}；ThreadFerry 已进入兼容模式，普通 Agent 对话仍可使用`;
+  if (detail.code === 850003) return `当前机器人${label}授权已过期；ThreadFerry 已进入兼容模式，普通 Agent 对话仍可使用`;
+  if (detail.code === 853006) return `当前企业未开放${label}；ThreadFerry 已进入兼容模式，普通 Agent 对话仍可使用`;
+  if (detail.code === 851003) return `当前账号或机器人没有${label}的操作权限；该能力暂不可用，普通 Agent 对话不受影响`;
+  if (detail.message && /no authorization|no authority|not available for your corporation|permission denied|无权限|未授权/i.test(detail.message)) {
+    return `当前账号或企业没有${label}权限；该能力暂不可用，普通 Agent 对话不受影响`;
+  }
+  return undefined;
+}
+
+export function isWecomCapabilityUnavailable(error: unknown): boolean {
+  if (error instanceof CommandExecutionError) {
+    const detail = cliFailureDetail(error.stdout) ?? cliFailureDetail(error.stderr);
+    return permissionReason(detail) !== undefined;
+  }
+  return error instanceof Error && /errcode (?:850002|850003|851003|853006)|authorization expired|no authorization|no authority|not available for your corporation|permission denied|无权限|未授权/i.test(error.message);
 }
 
 // wecom-cli 失败时 Error.message 只剩「执行失败（退出码 1）」，能照着做的原因（例如「该请求需要授权」）
 // 在**退出码非 0 时的 stdout** 里，个别情况才落到 stderr。管理台要显示的是后者，这里就把它抠出来。
-export function wecomFailureReason(error: unknown): string {
+export function wecomFailureReason(error: unknown, service?: string): string {
   if (error instanceof CommandExecutionError) {
-    const detail = cliErrorMessage(error.stdout) ?? cliErrorMessage(error.stderr);
-    if (detail) return detail;
+    const detail = cliFailureDetail(error.stdout) ?? cliFailureDetail(error.stderr);
+    const permission = permissionReason(detail, service);
+    if (permission) return permission;
+    if (detail?.message) return detail.message;
+  }
+  if (error instanceof Error && isWecomCapabilityUnavailable(error)) {
+    return permissionReason(cliFailureDetail(error.message), service) ?? error.message;
   }
   return error instanceof Error && error.message ? error.message : "企业微信查询失败";
+}
+
+export type WecomCapabilityState = "available" | "unavailable" | "unknown";
+
+export interface WecomCapabilitySnapshot {
+  mode: "full" | "compatible" | "detecting";
+  contact: WecomCapabilityState;
+  groupHistory: WecomCapabilityState;
+  recentSessions: WecomCapabilityState;
+  checkedAt: string;
+}
+
+async function probeCapability(operation: () => Promise<unknown>): Promise<WecomCapabilityState> {
+  try {
+    await operation();
+    return "available";
+  } catch (error) {
+    return isWecomCapabilityUnavailable(error) ? "unavailable" : "unknown";
+  }
+}
+
+/** 只探测不会产生外部写入的基础能力；业务服务在真实调用时按返回权限自动降级。 */
+export async function probeWecomCapabilities(
+  runner: CommandRunner = runCommand,
+  now: Date = new Date(),
+): Promise<WecomCapabilitySnapshot> {
+  const [contact, groupHistory, recentSessions] = await Promise.all([
+    probeCapability(() => searchWecomUsers(["ThreadFerry权限探测"], runner)),
+    probeCapability(async () => {
+      const request = JSON.stringify({
+        begin_time: cliTime(new Date(now.getTime() - 60_000)),
+        end_time: cliTime(now),
+      });
+      const { stdout } = await runner("wecom-cli", ["chat", "groups", "list", "--json", request], { timeoutMs: 30_000 });
+      envelopeData(stdout, "chat.groups.list");
+    }),
+    probeCapability(() => listBotSessions(runner)),
+  ]);
+  return {
+    mode: [contact, groupHistory, recentSessions].some((state) => state === "unavailable")
+      ? "compatible"
+      : [contact, groupHistory, recentSessions].every((state) => state === "available") ? "full" : "detecting",
+    contact,
+    groupHistory,
+    recentSessions,
+    checkedAt: now.toISOString(),
+  };
 }
 
 // 两个来源合并：`chat groups list` 负责发现，`aibot sessions list` 负责给「机器人确实在群」盖章。

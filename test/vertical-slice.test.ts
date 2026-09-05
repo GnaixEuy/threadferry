@@ -5,7 +5,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { createApp } from "../src/app.js";
 import { cleanupAttachmentResources, createAttachmentRoot } from "../src/attachments.js";
-import { createWecomMessageDispatcher, listWecomGroups, runWecomAction, searchWecomUsers, sendWecomReply, standardizeAuthChange, standardizeMessage, WecomActionUnknownError, wecomFailureReason } from "../src/channels/wecom.js";
+import { createWecomMessageDispatcher, listWecomGroups, probeWecomCapabilities, runWecomAction, searchWecomUsers, sendWecomReply, standardizeAuthChange, standardizeMessage, WecomActionUnknownError, wecomFailureReason } from "../src/channels/wecom.js";
 import { addAgent, agentView, ensureGroupAccess, loadConfig, onboardingDefaults, pairConfig, refreshAgentView, resolveWorkspace, saveConfig, setupConfig } from "../src/config.js";
 import { fetchWecomHistory, WecomHistory } from "../src/history/wecom-cli.js";
 import { LocalWecomHistory } from "../src/history/local.js";
@@ -418,6 +418,28 @@ test("owner is recognized when the callback uses a different userid namespace th
   // 非 Owner 的明文回调 ID 映射后仍被拒绝。
   assert.equal(await send("m3", "OtherUser", "threadferry groups"), "command");
   assert.match(replies.at(-1) ?? "", /只有.*Owner/);
+});
+
+test("missing directory permission returns pairing guidance instead of crashing direct messages", async () => {
+  const config = testConfig("/workspace", "owner-directory-id");
+  let runtimeCalls = 0;
+  const app = createApp(config, {
+    history: async () => [],
+    runtime: async () => { runtimeCalls += 1; return { text: "不应执行" }; },
+    searchUsers: async () => {
+      throw new CommandExecutionError("wecom-cli", 1, JSON.stringify({ errcode: 850002, errmsg: "no authorization" }), "");
+    },
+  });
+  const replies: string[] = [];
+
+  const result = await app.handleDirect({
+    msgId: "compatible-owner", senderId: "owner-callback-id", time: new Date(), text: "帮我分析",
+  }, async (content) => { replies.push(content); });
+
+  assert.equal(result, "command");
+  assert.equal(runtimeCalls, 0);
+  assert.match(replies.at(-1) ?? "", /未开放通讯录.*普通 Agent 能力仍可使用.*一次性私聊配对/s);
+  assert.doesNotMatch(replies.at(-1) ?? "", /资源下载/);
 });
 
 test("a non-owner direct message explains the fix without leaking the configured owner", async () => {
@@ -1144,6 +1166,43 @@ test("a failed group lookup reports the reason wecom-cli printed, not just the e
   assert.equal(wecomFailureReason("not an error"), "企业微信查询失败");
 });
 
+test("capability probing automatically selects compatibility mode without writing enterprise data", async () => {
+  const calls: string[] = [];
+  const snapshot = await probeWecomCapabilities(async (_command, args) => {
+    calls.push(args.slice(0, 3).join("."));
+    if (args[0] === "contact") {
+      throw new CommandExecutionError("wecom-cli", 1, JSON.stringify({ errcode: 850003, errmsg: "authorization expired" }), "");
+    }
+    if (args[0] === "chat") {
+      return { stdout: JSON.stringify({ errcode: 853006, errmsg: "this tool is not available for your corporation" }), stderr: "" };
+    }
+    return { stdout: JSON.stringify({ data: { sessions: [] } }), stderr: "" };
+  }, new Date("2026-09-03T10:00:00+08:00"));
+
+  assert.deepEqual(snapshot, {
+    mode: "compatible",
+    contact: "unavailable",
+    groupHistory: "unavailable",
+    recentSessions: "available",
+    checkedAt: "2026-09-03T02:00:00.000Z",
+  });
+  assert.deepEqual(calls.sort(), ["chat.groups.list", "contact.users.search", "message.aibot.sessions"].sort());
+  const detecting = await probeWecomCapabilities(async () => {
+    throw new Error("temporary network failure");
+  });
+  assert.equal(detecting.mode, "detecting");
+  assert.deepEqual([detecting.contact, detecting.groupHistory, detecting.recentSessions], ["unknown", "unknown", "unknown"]);
+  assert.match(wecomFailureReason(
+    new CommandExecutionError("wecom-cli", 1, JSON.stringify({ errcode: 850002, errmsg: "no authorization" }), ""),
+    "contact",
+  ), /通讯录.*兼容模式.*普通 Agent 对话仍可使用/);
+  assert.match(wecomFailureReason(
+    new CommandExecutionError("wecom-cli", 1, JSON.stringify({ errcode: 850003, errmsg: "authorization expired" }), ""),
+    "contact",
+  ), /通讯录授权已过期.*兼容模式.*普通 Agent 对话仍可使用/);
+  assert.match(wecomFailureReason(new Error("wecom-cli meeting.search 失败（errcode 853006）"), "meeting"), /未开放会议.*普通 Agent 对话仍可使用/);
+});
+
 test("wecom contact search uses names without shell interpolation", async () => {
   let received: { command: string; args: string[] } | undefined;
   const users = await searchWecomUsers(["张三"], async (command, args) => {
@@ -1706,6 +1765,27 @@ test("wecom history reports unavailable corporation permission", async () => {
   }, runner), /企业未授权群消息历史能力.*853006/);
 });
 
+test("group history permission failure falls back to local history and exposes a trusted notice", async (t) => {
+  const localRoot = await mkdtemp(join(tmpdir(), "threadferry-compatible-history-test-"));
+  t.after(() => rm(localRoot, { recursive: true, force: true }));
+  const history = new WecomHistory("compatible-history", async () => {
+    throw new CommandExecutionError("wecom-cli", 1, JSON.stringify({
+      error: { code: 853006, message: "this tool is not available for your corporation" },
+    }), "");
+  }, localRoot);
+  await history.remember("group", "group", {
+    msgId: "local-message", groupId: "group", senderId: "owner", time: new Date("2026-09-03T10:00:00+08:00"), text: "本机已处理过的消息", mentioned: true,
+  });
+
+  const messages = await history.list("group", {
+    chatType: "group", lookbackHours: 6, maxMessages: 80,
+    endTime: new Date("2026-09-03T10:05:00+08:00"), includeResources: true,
+  });
+  assert.equal(messages.length, 1);
+  assert.equal(messages[0]?.text, "本机已处理过的消息");
+  assert.match(history.notice("group", "group") ?? "", /未开放完整群消息读取.*不能猜测/);
+});
+
 test("same-second history changes are detected by fingerprint", async () => {
   const now = new Date("2026-08-18T10:05:00+08:00");
   const base: GroupMessage = { senderId: "first", time: new Date(now.getTime() - 60_000), text: "原消息" };
@@ -1891,6 +1971,23 @@ test("a direct attachment and its separately delivered caption run as one turn",
   assert.deepEqual(handled[0]?.message.resources?.map((item) => item.name), ["report.md"]);
   assert.deepEqual(repliedBy, ["caption"]);
   await assert.rejects(stat(path), /ENOENT/);
+});
+
+test("dispatcher does not misreport a handler failure as a resource failure", async () => {
+  const replies: string[] = [];
+  const dispatch = createWecomMessageDispatcher(async () => {
+    throw new Error("owner lookup failed");
+  }, 1);
+  await dispatch({
+    hasAttachment: false,
+    event: Promise.resolve({
+      chatType: "single",
+      message: { msgId: "plain", senderId: "owner", time: new Date(), text: "普通文本" },
+    }),
+    reply: async (content) => { replies.push(content); },
+  });
+  assert.match(replies[0] ?? "", /处理过程失败/);
+  assert.doesNotMatch(replies[0] ?? "", /资源下载/);
 });
 
 test("attachment paths never enter durable group state", async (t) => {

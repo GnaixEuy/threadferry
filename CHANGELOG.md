@@ -4,6 +4,45 @@ ThreadFerry 的每个 GitHub Release 都使用这里对应版本的内容，不�
 
 ## Unreleased
 
+## 0.32.7
+
+ThreadFerry 现在能在企业微信权限受限时保持 Agent 可用，并补齐权限恢复、日志清理和问题反馈流程。
+
+### 主要变化
+
+- 机器人配对时立即探测通讯录、完整会话历史和最近会话权限并弹窗提示；只有明确未审批、未开放或已
+  过期时才进入兼容模式，探测异常保持“检测中”。运行期间每 5 分钟重试，也可在机器人卡片手动刷新；
+  权限恢复后自动切回完整模式。
+- 完整群历史不可用时回退到当前 `@` 消息和该 Agent 的本机授权历史，并向 Runtime 注入可信能力说明；
+  通讯录不可用时保留一次性私聊配对、邀请码和全员可用模式，普通 Agent 对话与本地自动化不被阻断。
+- 日程、会议、待办、邮件、文档、表格、微盘等业务能力在真实调用时识别权限错误，只停用受限操作并
+  给出对应提示；纯文本处理失败不再误报成资源下载、解密或分析失败。
+- 日志追踪新增带二次确认的清理入口，只移除失败诊断字段和 Activity，保留任务去重、Session、待补发、
+  提醒和机器人配置。
+- 新增“上报问题”入口，自动预填问题描述、复现步骤、运行环境以及当前筛选后的失败记录和 Activity；
+  用户仍会在 GitHub 页面检查并确认提交。
+- 报告最多携带最近的脱敏记录，不包含消息正文、机器人凭据或原始服务日志。
+- 桌面管理台只允许 ThreadFerry 官方 Issue 地址通过系统浏览器打开，其他外部新窗口继续拒绝。
+
+### 安装与升级
+
+无需迁移配置，也不需要配置 GitHub Token。macOS 或 Linux：
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/GnaixEuy/threadferry/main/install.sh | bash
+```
+
+Windows PowerShell：
+
+```powershell
+irm https://raw.githubusercontent.com/GnaixEuy/threadferry/main/install.ps1 | iex
+```
+
+发布资产包含预编译 CLI、Windows 与 Linux 桌面安装包；macOS 桌面包仅在 Developer ID 签名和公证
+凭据完整时发布，不会降级提供未签名安装包。
+
+完整变更：[v0.32.3...v0.32.7](https://github.com/GnaixEuy/threadferry/compare/v0.32.3...v0.32.7)
+
 ## 0.32.3
 
 这是自 v0.29.1 以来的累计发布：恢复本地 Runtime 的原生自动化能力，补齐桌面应用内自动更新，

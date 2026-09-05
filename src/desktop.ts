@@ -28,6 +28,7 @@ import {
 import { installDesktopUpdate, type DesktopUpdateStatus } from "./desktop-update.js";
 
 const ADMIN_URL = "http://127.0.0.1:17638";
+const ISSUE_URL = "https://github.com/GnaixEuy/threadferry/issues/new";
 const MAX_LOG_BYTES = 2 * 1024 * 1024;
 const MAX_RECENT_OUTPUT = 8_000;
 const UPDATE_INTERVAL_MS = 6 * 60 * 60 * 1_000;
@@ -246,7 +247,10 @@ function openManagementWindow(url: string): void {
     });
     managementWindow = window;
     window.removeMenu();
-    window.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
+    window.webContents.setWindowOpenHandler(({ url: target }) => {
+      if (target === ISSUE_URL || target.startsWith(`${ISSUE_URL}?`)) void shell.openExternal(target).catch(() => undefined);
+      return { action: "deny" };
+    });
     window.webContents.on("will-navigate", (event, target) => {
       if (new URL(target).origin !== ADMIN_URL) event.preventDefault();
     });

@@ -17,6 +17,14 @@ test("desktop reuses the visible management page instead of reloading it", async
   assert.match(source, /managementWindow\.show\(\);\s*managementWindow\.focus\(\);\s*} else {\s*openManagementWindow\(url\)/);
 });
 
+test("desktop opens only ThreadFerry issue reports in the system browser", async () => {
+  const source = await readFile(resolve("src/desktop.ts"), "utf8");
+
+  assert.match(source, /target === ISSUE_URL \|\| target\.startsWith\(`\$\{ISSUE_URL\}\?`\)/);
+  assert.match(source, /shell\.openExternal\(target\)/);
+  assert.match(source, /return \{ action: "deny" \}/);
+});
+
 test("desktop installs updates and restarts instead of opening downloaded installers", async () => {
   const [source, preload, cli] = await Promise.all([
     readFile(resolve("src/desktop.ts"), "utf8"),

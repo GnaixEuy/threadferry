@@ -13,7 +13,7 @@ import { DirectoryNameCache } from "./directory-names.js";
 import { fanOutTargets, quotedReply } from "./group-fanout.js";
 import { authorizeHint, botConfigDir, botStatus, loadBotCredentials, validateAgentId, wecomEnv, type BotCredentials } from "./bots.js";
 import type { WSClient } from "@wecom/aibot-node-sdk";
-import { listWecomGroups, pushWecomMessage, runWecomAction, searchWecomUsers, sendWecomReply, startWecomChannel, WecomActionUnknownError, wecomFailureReason } from "./channels/wecom.js";
+import { isWecomCapabilityUnavailable, listWecomGroups, probeWecomCapabilities, pushWecomMessage, runWecomAction, searchWecomUsers, sendWecomReply, startWecomChannel, WecomActionUnknownError, wecomFailureReason, type WecomCapabilitySnapshot } from "./channels/wecom.js";
 import {
   addAgent,
   adoptOwner,
@@ -25,7 +25,7 @@ import {
   resolveWorkspace,
   saveConfig,
 } from "./config.js";
-import { fetchWecomHistory, WecomHistory } from "./history/wecom-cli.js";
+import { WecomHistory } from "./history/wecom-cli.js";
 import { describeIdentity, fetchWecomIdentity } from "./identity.js";
 import { runCommand } from "./process.js";
 import { runClaude } from "./runtimes/claude.js";
@@ -51,9 +51,10 @@ import { findUpdate, installUpdate } from "./update.js";
 import { installOfficialWecomSkills, officialWecomSkillsInstalled } from "./wecom-skills.js";
 import { runWorkflowTick } from "./workflow.js";
 
-const VERSION = "0.32.3";
+const VERSION = "0.32.7";
 const UPDATE_INTERVAL_MS = 6 * 60 * 60 * 1_000;
 const WORKFLOW_INTERVAL_MS = 30_000;
+const CAPABILITY_PROBE_TTL_MS = 5 * 60 * 1_000;
 interface DesktopParentPort {
   on(event: "message", listener: (event: { data: unknown }) => void): void;
   off(event: "message", listener: (event: { data: unknown }) => void): void;
@@ -360,6 +361,16 @@ async function adoptAuthorizedOwner(
     console.log("未能识别授权用户身份，请通过手机私聊配对指定 Owner。");
     return false;
   }
+  try {
+    await searchWecomUsers([authorized.name ?? userId], wecomRunner(credentials.configDir));
+  } catch (error) {
+    if (isWecomCapabilityUnavailable(error)) {
+      console.log("当前企业未开放通讯录，无法安全映射授权身份与消息回调；将改用一次性私聊配对确认 Owner。");
+      return false;
+    }
+    console.log("暂时无法核对通讯录身份；为避免认错 Owner，将改用一次性私聊配对。");
+    return false;
+  }
   const approved = await confirmOwnerAdopt(agentId, authorized);
   if (!approved) {
     console.log("已拒绝自动认领；请通过手机私聊配对指定其他 Owner。");
@@ -658,10 +669,8 @@ async function doctor(configPath?: string): Promise<boolean> {
   }
 
   // 凭据按 Agent 隔离，逐个报告。值始终不显示。
-  let authorizedAgents = 0;
   for (const [agentId, agent] of Object.entries(loadedConfig?.agents ?? {})) {
     const status = await botStatus(agentId, agent.configDir);
-    if (status.authorized) authorizedAgents += 1;
     checks.push({
       ok: status.authorized,
       message: status.authorized
@@ -670,42 +679,38 @@ async function doctor(configPath?: string): Promise<boolean> {
     });
   }
 
-  // 身份和群历史都必须用该 Agent 自己的凭据目录来查；用默认目录会检查到别的机器人。
-  let probeAgent: string | undefined;
-  for (const [agentId, agent] of Object.entries(loadedConfig?.agents ?? {})) {
-    if (await loadBotCredentials(agentId, agent.configDir)) { probeAgent = agentId; break; }
-  }
-  const probeRunner = probeAgent
-    ? wecomRunner(botConfigDir(probeAgent, loadedConfig?.agents[probeAgent]?.configDir))
-    : undefined;
-
-  let wecomAuthorized = false;
   try {
     const { stdout } = await runCommand("wecom-cli", ["--version"], { timeoutMs: 10_000 });
     const supported = atLeast(stdout, [1, 2, 0]);
     checks.push({ ok: supported, message: supported ? stdout.trim() : `${stdout.trim()}；ThreadFerry 要求 1.2.0+` });
-    if (probeRunner && probeAgent) {
+    for (const [agentId, agent] of Object.entries(loadedConfig?.agents ?? {})) {
+      if (!await loadBotCredentials(agentId, agent.configDir)) continue;
+      const runner = wecomRunner(botConfigDir(agentId, agent.configDir));
       try {
-        await probeRunner("wecom-cli", ["identity", "whoami", "--json", "{}"], { timeoutMs: 30_000 });
-        wecomAuthorized = true;
-        checks.push({ ok: true, message: `Agent ${probeAgent} 的机器人身份授权有效（详情未显示）` });
+        await runner("wecom-cli", ["identity", "whoami", "--json", "{}"], { timeoutMs: 30_000 });
+        checks.push({ ok: true, message: `Agent ${agentId} 的机器人身份授权有效（详情未显示）` });
+        const capabilities = await probeWecomCapabilities(runner);
+        const unavailable = [
+          capabilities.contact === "unavailable" ? "通讯录" : undefined,
+          capabilities.groupHistory === "unavailable" ? "完整会话历史" : undefined,
+          capabilities.recentSessions === "unavailable" ? "最近会话" : undefined,
+        ].filter(Boolean);
+        const uncertain = [capabilities.contact, capabilities.groupHistory, capabilities.recentSessions]
+          .filter((state) => state === "unknown").length;
+        checks.push({
+          ok: true,
+          message: capabilities.mode === "compatible"
+            ? `Agent ${agentId} 已自动使用兼容模式：${unavailable.join("、")}不可用${uncertain ? `；${uncertain} 项能力仍在检测` : ""}；普通 Agent 对话可继续使用`
+            : capabilities.mode === "detecting"
+              ? `Agent ${agentId} 有 ${uncertain} 项企业能力暂时无法确认，尚未判定为权限缺失；后台会继续探测`
+              : `Agent ${agentId} 的通讯录、完整会话历史和最近会话能力可用，使用完整模式`,
+        });
       } catch {
-        checks.push({ ok: false, message: `Agent ${probeAgent} 的机器人身份检查失败；请重新执行 threadferry agent login ${probeAgent}` });
+        checks.push({ ok: false, message: `Agent ${agentId} 的机器人身份检查失败；请重新执行 threadferry agent login ${agentId}` });
       }
     }
   } catch {
     checks.push({ ok: false, message: "找不到 wecom-cli；请安装企业微信官方 wecom-cli 1.2.0+ 并加入 PATH" });
-  }
-
-  const probeGroup = probeAgent
-    && Object.entries(loadedConfig?.groups ?? {}).find(([, group]) => group.agents[probeAgent])?.[0];
-  if (wecomAuthorized && probeGroup && probeRunner) {
-    try {
-      await fetchWecomHistory(probeGroup, { lookbackHours: 1 / 60, maxMessages: 1, endTime: new Date() }, probeRunner);
-      checks.push({ ok: true, message: "企业微信群消息历史权限有效" });
-    } catch (error) {
-      checks.push({ ok: false, message: error instanceof Error ? error.message : "企业微信群消息历史检查失败" });
-    }
   }
 
   if (configuredRuntimes.has("codex")) {
@@ -813,7 +818,7 @@ async function status(configPath?: string): Promise<void> {
   const active = (counts.get("queued") ?? 0) + (counts.get("running") ?? 0);
   const reminders = (snapshot.reminders ?? []).filter((item) => item.status === "scheduled" || item.status === "running").length;
   const workItems = (snapshot.workItems ?? []).filter((item) => item.status !== "completed" && item.status !== "failed").length;
-  const lastFailure = snapshot.turns.slice().reverse().find((turn) => turn.status === "failed");
+  const lastFailure = snapshot.turns.slice().reverse().find((turn) => turn.status === "failed" && turn.errorId !== undefined);
   console.log(`ThreadFerry: ${active > 0 ? `${active} 个任务处理中或排队` : "空闲"}`);
   console.log(`配置 Agent: ${Object.keys(config.agents).length}；群: ${Object.keys(config.groups).length}；Session: ${snapshot.sessions.length}；执行记录: ${snapshot.turns.length}`);
   console.log(`可靠性队列: inbox=${snapshot.inbox.length}, outbox=${snapshot.outbox.length}`);
@@ -846,7 +851,8 @@ async function resetSession(configPath: string | undefined, groupId: string): Pr
 // 不一致就在本机终端询问——信任根仍是本机，与 setup 配对确认保持一致。
 async function confirmOwnerIdentity(config: ThreadFerryConfig, agentId: string, updateConfig: ConfigUpdater): Promise<void> {
   const agent = config.agents[agentId]!;
-  const identity = await fetchWecomIdentity(wecomRunner(botConfigDir(agentId, agent.configDir)));
+  const runner = wecomRunner(botConfigDir(agentId, agent.configDir));
+  const identity = await fetchWecomIdentity(runner);
   const bot = describeIdentity(identity.bot);
   const user = describeIdentity(identity.user);
   if (bot) console.log(`企业微信机器人: ${bot}`);
@@ -856,6 +862,16 @@ async function confirmOwnerIdentity(config: ThreadFerryConfig, agentId: string, 
   console.log(`Agent ${agentId} 配置的 Owner: ${ownerLabel}`);
   const currentUser = identity.user?.id;
   if (!currentUser || currentUser === agent.ownerUser) return;
+
+  try {
+    await searchWecomUsers([identity.user?.name ?? currentUser], runner);
+  } catch (error) {
+    const reason = isWecomCapabilityUnavailable(error)
+      ? "当前企业未开放通讯录，无法安全映射授权身份与消息回调"
+      : "暂时无法核对通讯录身份映射";
+    console.warn(`[owner] ${reason}；已保持机器人运行，但 Owner 私聊需要执行 threadferry setup，通过一次性私聊配对确认。`);
+    return;
+  }
 
   console.warn(`[owner] Agent ${agentId} 的当前授权用户与配置 Owner 不一致；在更正之前，私聊该 Agent 会被拒绝。`);
   if (!process.stdin.isTTY || !process.stdout.isTTY) {
@@ -1012,6 +1028,39 @@ async function start(
       }
     };
 
+    const capabilitySnapshots = new Map<string, WecomCapabilitySnapshot>();
+    const capabilityRefreshes = new Map<string, Promise<WecomCapabilitySnapshot | undefined>>();
+    const scheduleCapabilityProbe = (agentId: string, runner: CommandRunner, force = false): Promise<WecomCapabilitySnapshot | undefined> => {
+      const current = capabilitySnapshots.get(agentId);
+      if (!force && current && Date.now() - Date.parse(current.checkedAt) < CAPABILITY_PROBE_TTL_MS) return Promise.resolve(current);
+      const pending = capabilityRefreshes.get(agentId);
+      if (pending) return pending;
+      const refresh = probeWecomCapabilities(runner)
+        .then((snapshot) => {
+          capabilitySnapshots.set(agentId, snapshot);
+          const unavailable = [
+            snapshot.contact === "unavailable" ? "通讯录" : undefined,
+            snapshot.groupHistory === "unavailable" ? "完整会话历史" : undefined,
+            snapshot.recentSessions === "unavailable" ? "最近会话" : undefined,
+          ].filter(Boolean);
+          const unknown = [snapshot.contact, snapshot.groupHistory, snapshot.recentSessions]
+            .filter((state) => state === "unknown").length;
+          if (!current || current.mode !== snapshot.mode || current.contact !== snapshot.contact
+            || current.groupHistory !== snapshot.groupHistory || current.recentSessions !== snapshot.recentSessions) {
+            console.log(snapshot.mode === "full"
+              ? `[wecom] Agent ${agentId} 已切换到完整模式`
+              : snapshot.mode === "compatible"
+                ? `[wecom] Agent ${agentId} 自动进入兼容模式：${unavailable.join("、")}不可用；普通 Agent 对话继续运行`
+                : `[wecom] Agent ${agentId} 企业能力仍在检测中；${unknown} 项暂时无法确认，普通 Agent 对话继续运行`);
+          }
+          return snapshot;
+        })
+        .catch(() => undefined)
+        .finally(() => capabilityRefreshes.delete(agentId));
+      capabilityRefreshes.set(agentId, refresh);
+      return refresh;
+    };
+
     // 各 Agent 的连接索引。连接在下面才建立，但 app 的依赖里要先捕获这个 Map：
     // 转交回复和动作回执都优先走机器人自己的 WS 连接。
     const clients = new Map<string, WSClient>();
@@ -1021,6 +1070,7 @@ async function start(
       views.set(agentId, view);
       const runner = wecomRunner(configDir);
       const history = new WecomHistory(agentId, runner);
+      void scheduleCapabilityProbe(agentId, runner);
       const listGroups = async () => {
         const groups = await listWecomGroups(runner);
         const joined = groups.filter((group) => group.hasBotSession);
@@ -1031,6 +1081,7 @@ async function start(
       };
       const app = createApp(view, {
       history: (chatId, options) => history.list(chatId, options),
+      historyNotice: (chatType, chatId) => history.notice(chatType, chatId),
       rememberHistory: (chatType, chatId, message) => history.remember(chatType, chatId, message),
       runtime: runAgentRuntime,
       // 写回只动「这个 host 的 Agent」那一份：同群的另一台机器人有它自己的名单和开关。
@@ -1059,7 +1110,7 @@ async function start(
           return await runWecomAction(command, runner, write);
         } catch (error) {
           if (error instanceof WecomActionUnknownError) throw error;
-          throw new Error(wecomFailureReason(error));
+          throw new Error(wecomFailureReason(error, command[0]));
         }
       },
       notifyGroup: async (groupId, content) => {
@@ -1228,13 +1279,19 @@ async function start(
         // 归属信息只读缓存：通讯录权限不是必须的，页面绝不等这两个调用（见 agent-origin.ts）。
         const runner = runnerFor(agentId);
         const origin = status.authorized && runner ? origins.read(agentId, runner) : {};
+        if (runner) void scheduleCapabilityProbe(agentId, runner);
         return {
           authorized: status.authorized,
           ...(status.botId ? { botId: status.botId } : {}),
           ...origin,
+          ...(capabilitySnapshots.get(agentId) ? { capabilities: capabilitySnapshots.get(agentId) } : {}),
           ...(connectionHealth.get(agentId) ? { connection: connectionHealth.get(agentId) } : {}),
           ...(status.authorized ? {} : { hint: authorizeHint(agentId, config.agents[agentId]?.configDir) }),
         };
+      },
+      probeCapabilities: async (agentId) => {
+        const runner = runnerFor(agentId);
+        return runner ? scheduleCapabilityProbe(agentId, runner, true) : undefined;
       },
       connectBot: connectAuthorizedAgent,
       authorizeBot: (agentId, authorization) => {
@@ -1243,6 +1300,8 @@ async function start(
         return authorizeBotFromAdmin(agentId, agent.configDir, authorization);
       },
       snapshot: () => state.snapshot(),
+      clearLogs: () => state.clearLogs(),
+      version: VERSION,
       checkUpdate: () => findUpdate(VERSION),
       resetSession: (groupId, agentId) => {
         const agent = config.agents[agentId];
@@ -1335,6 +1394,7 @@ async function start(
         let workflowCheck: Promise<void> | undefined;
         let updateTimer: NodeJS.Timeout;
         let workflowTimer: NodeJS.Timeout;
+        let capabilityTimer: NodeJS.Timeout;
         const desktopPort = (process as NodeJS.Process & { parentPort?: DesktopParentPort }).parentPort;
         const stop = (cancel: boolean) => {
           if (stopping) return;
@@ -1342,6 +1402,7 @@ async function start(
           desktopPort?.off("message", onParentMessage);
           clearInterval(updateTimer);
           clearInterval(workflowTimer);
+          clearInterval(capabilityTimer);
           for (const connection of connections.values()) connection.disconnect();
           void admin.close();
           void Promise.all([...hosts.map(({ app }) => app.shutdown(cancel)), recovery, updateCheck, workflowCheck]).finally(done);
@@ -1365,6 +1426,10 @@ async function start(
         };
         workflowTimer = setInterval(runWorkflows, WORKFLOW_INTERVAL_MS);
         workflowTimer.unref();
+        capabilityTimer = setInterval(() => {
+          for (const host of hosts) void scheduleCapabilityProbe(host.agentId, host.runner, true);
+        }, CAPABILITY_PROBE_TTL_MS);
+        capabilityTimer.unref();
         runWorkflows();
         const onParentMessage = (event: { data: unknown }) => {
           const message = event.data as { type?: unknown; cancel?: unknown } | undefined;

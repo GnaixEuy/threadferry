@@ -102,6 +102,22 @@ test("resetting a session only clears the requested agent's session for that gro
   assert.equal(await state.session("shared-group", back), undefined);
 });
 
+test("clearing logs preserves task deduplication", async () => {
+  const state = new ThreadFerryState();
+  await state.enqueue(message);
+  await state.markRunning(message.msgId);
+  await state.finish(message.msgId, "failed", { errorId: "TF-1234ABCD", phase: "runtime" });
+  await state.recordActivity({ agent: "default", type: "action.read", outcome: "failure" });
+
+  assert.equal(await state.clearLogs(), 2);
+  const snapshot = await state.snapshot();
+  assert.equal(snapshot.turns[0]?.status, "failed");
+  assert.equal(snapshot.turns[0]?.errorId, undefined);
+  assert.deepEqual(snapshot.activities, []);
+  assert.equal(await state.enqueue(message), false);
+  assert.equal(await state.clearLogs(), 0);
+});
+
 test("reminders survive restart, retry failures and reschedule recurring work", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "threadferry-reminder-test-"));
   t.after(() => rm(root, { recursive: true, force: true }));

@@ -163,6 +163,7 @@ h3,h4,p{margin:0 0 10px}
 
 .toolbar{display:flex;justify-content:space-between;align-items:end;gap:16px;margin:0 0 16px}
 .toolbar p{margin:6px 0 0}
+.toolbar-actions{display:flex;align-items:center;gap:8px}.toolbar-actions form{margin:0}
 
 .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(145px,1fr));gap:0;background:var(--surface);border:1px solid var(--line);border-radius:var(--radius);overflow:hidden}
 .stat{display:block;min-width:0;background:transparent;border:0;border-right:1px solid var(--line);padding:15px 17px;text-decoration:none;color:inherit;transition:background-color .14s}
@@ -399,10 +400,16 @@ document.addEventListener("DOMContentLoaded", function () {
     });
   });
   setupDialogs();
+  setupCapabilityPolling();
   setupOnboardingTour();
   each("[data-auth-form]", setupAuthMode);
   each("[data-picker]", attachPicker);
 });
+
+function setupCapabilityPolling() {
+  if (!document.querySelector("[data-capability-pending]")) return;
+  window.setTimeout(function () { window.location.reload(); }, 2000);
+}
 
 function setupOnboardingTour() {
   if (!document.querySelector("[data-onboarding]")) return;

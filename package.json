@@ -1,6 +1,6 @@
 {
   "name": "threadferry",
-  "version": "0.32.3",
+  "version": "0.32.7",
   "description": "Ferry enterprise chat context to native local AI agents with isolated identities and controlled WeCom actions.",
   "author": "GnaixEuy",
   "homepage": "https://github.com/GnaixEuy/threadferry",
