@@ -257,6 +257,7 @@ function mergeHistory(remote: GroupMessage[], local: GroupMessage[], maxMessages
 /** 企业微信远端历史 + 本机收到过的 Agent 隔离历史。远端私聊为空时，本机历史仍可跨重启回读。 */
 export class WecomHistory {
   private readonly local: LocalWecomHistory;
+  private readonly notices = new Map<string, string>();
 
   constructor(agentId: string, private readonly runner: CommandRunner = runCommand, localRoot = defaultLocalHistoryRoot(agentId)) {
     this.local = new LocalWecomHistory(localRoot);
@@ -266,12 +267,20 @@ export class WecomHistory {
     return this.local.remember(chatType, chatId, message);
   }
 
+  notice(chatType: HistoryChatType, chatId: string): string | undefined {
+    return this.notices.get(`${chatType}:${chatId}`);
+  }
+
   async list(chatId: string, options: HistoryQuery): Promise<GroupMessage[]> {
     let remote: GroupMessage[] = [];
+    const noticeKey = `${options.chatType}:${chatId}`;
     try {
       remote = await fetchWecomHistory(chatId, options, this.runner);
-    } catch (error) {
-      if (options.chatType === "group") throw error;
+      this.notices.delete(noticeKey);
+    } catch {
+      this.notices.set(noticeKey, options.chatType === "group"
+        ? "当前企业未开放完整群消息读取。只能使用当前 @ 消息和本机此前实际处理过的消息；如果请求依赖此前普通群聊，必须明确说明无法读取，不能猜测。其他任务继续正常处理。"
+        : "企业微信远端私聊历史暂不可用，已回退到本机保存的授权历史；如果请求依赖本机未保存的旧消息，必须明确说明无法读取。");
     }
     try {
       const local = await this.local.list(options.chatType, chatId, options);

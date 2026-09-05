@@ -32,6 +32,13 @@ authorized members can invoke the bot by mentioning it in configured groups.
 - Recover sessions, queued work, and undelivered replies after restart.
 - Keep WeCom connections reconnecting and show each agent's connection and last-callback status in the local console.
 
+ThreadFerry probes contacts, full chat history, and recent-session access during pairing and shows the result.
+If the company explicitly denies one of those capabilities, the bot automatically enters compatibility mode:
+the current message, local workspace, and runtime automation keep working, while only the restricted feature
+is disabled with a precise explanation. Calendar, meeting, mail, document, and other business permissions are
+detected on first use. Inconclusive checks remain in a detecting state and are retried in the background; restored
+permissions automatically switch the bot back to full mode.
+
 ## Architecture
 
 <p align="center">
@@ -96,7 +103,7 @@ After that, open the ThreadFerry desktop app. It starts configured agents automa
 or notification-area icon opens the admin console, restarts or stops the service, reveals the log, and
 quits cleanly. Closing the admin window only returns it to the tray.
 The lower-left console utilities include trace logs and Preferences. Trace logs locate sanitized records by
-error ID, agent, action, or resource and can be hidden in Preferences. Preferences also controls the theme,
+error ID, agent, action, or resource, and can prefill the current results in a GitHub Issue. The entry can be hidden in Preferences. Preferences also controls the theme,
 launch at login, automatic service startup, opening the console after startup, and the optional macOS Dock
 entry. On first open, the console shows a state-driven getting-started checklist and a three-step interface
 tour. The checklist collapses after bot authorization and the first Owner direct message; group setup remains

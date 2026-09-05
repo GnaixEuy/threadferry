@@ -66,6 +66,7 @@ test("localhost admin manages agents, groups, and users with CSRF protection", a
   let failNextAuth = false;
   const directoryAgents: string[] = [];
   let updateChecks = 0;
+  let logsCleared = false;
   const admin = await startAdminServer(config, {
     updateConfig: async (change) => { await change(config); },
     listGroups: async (agentId) => agentId === "default"
@@ -74,6 +75,9 @@ test("localhost admin manages agents, groups, and users with CSRF protection", a
     botStatus: async (agentId) => agentId === "default"
       ? { authorized: true, botId: "aib-default", botName: "默认助手", ownerName: "苏粤翔", org: "月相工作室", connection: { state: "connected", changedAt: now, lastEventAt: now } }
       : { authorized: false, hint: `请执行 threadferry agent login ${agentId}` },
+    probeCapabilities: async () => ({
+      mode: "full", contact: "available", groupHistory: "available", recentSessions: "available", checkedAt: now,
+    }),
     connectBot: async (agentId) => { connectCalls.push(agentId); return true; },
     authorizeBot: async (agentId, authorization) => {
       if (failNextAuth) {
@@ -93,7 +97,8 @@ test("localhost admin manages agents, groups, and users with CSRF protection", a
     snapshot: async () => ({
       turns: [
         { id: digest("msg-1"), group: digest("group"), status: "running", receivedAt: now, updatedAt: now },
-        { id: digest("msg-2"), group: digest("group"), status: "failed", receivedAt: now, updatedAt: now, errorId: "TF-12345678", failurePhase: "runtime" },
+        { id: digest("msg-2"), group: digest("group"), status: "failed", receivedAt: now, updatedAt: now,
+          ...(logsCleared ? {} : { errorId: "TF-12345678", failurePhase: "runtime" as const }) },
       ],
       sessions: [
         { group: digest("group"), workspace: digest(workspace), sessionId: "session-1", updatedAt: now },
@@ -103,8 +108,10 @@ test("localhost admin manages agents, groups, and users with CSRF protection", a
       outbox: [],
       reminders: [{ id: "R-123456789ABC", agent: "default", chatId: "owner", chatType: "single", createdBy: "owner", instruction: "检查待办", nextRunAt: now, status: "scheduled", failures: 0, createdAt: now, updatedAt: now }],
       workItems: [{ id: "W-123456789ABC", title: "核对季度复盘", description: "读取复盘", createdBy: "owner", createdAgent: "default", assignedAgent: "reviewer", reviewerAgent: "default", sourceChatId: "owner", sourceChatType: "single", status: "queued", createdAt: now, updatedAt: now }],
-      activities: [{ id: "A-123456789ABC", agent: "default", type: "action.read", outcome: "success", resource: "doc:doc-1", at: now }],
+      activities: logsCleared ? [] : [{ id: "A-123456789ABC", agent: "default", type: "action.read", outcome: "success", resource: "doc:doc-1", at: now }],
     }),
+    clearLogs: async () => { logsCleared = true; return 2; },
+    version: "0.32.7",
     checkUpdate: async () => { updateChecks += 1; return { version: "9.9.9" }; },
     resetSession: async (groupId, agentId) => { resetCalls.push(`${groupId}:${agentId}`); return true; },
     removeGroup: async (groupId, agentId) => {
@@ -217,12 +224,32 @@ test("localhost admin manages agents, groups, and users with CSRF protection", a
   assert.match(logs, /TF-12345678/);
   assert.match(logs, /A-123456789ABC/);
   assert.match(logs, /不展示消息正文/);
+  assert.match(logs, /action="\/logs\/clear"[\s\S]*清理日志/);
+  assert.match(logs, /data-confirm="确定清理失败诊断记录和 Activity/);
+  const issueHref = logs.match(/href="([^"]+)" target="_blank" rel="noreferrer">上报问题/)?.[1];
+  assert.ok(issueHref);
+  const issue = new URL(issueHref.replaceAll("&amp;", "&"));
+  assert.equal(issue.origin + issue.pathname, "https://github.com/GnaixEuy/threadferry/issues/new");
+  assert.match(issue.searchParams.get("title") ?? "", /问题反馈/);
+  assert.match(issue.searchParams.get("body") ?? "", /ThreadFerry: 0\.32\.7[\s\S]*TF-12345678[\s\S]*A-123456789ABC/);
+  assert.doesNotMatch(issue.searchParams.get("body") ?? "", /super-secret|消息正文/);
   const filteredLogs = await (await fetch(`${admin.url}/logs?q=TF-12345678`)).text();
   assert.match(filteredLogs, /TF-12345678/);
   assert.doesNotMatch(filteredLogs, /A-123456789ABC/);
   const successfulLogs = await (await fetch(`${admin.url}/logs?outcome=success`)).text();
   assert.doesNotMatch(successfulLogs, /TF-12345678/);
   assert.match(successfulLogs, /A-123456789ABC/);
+  const logCsrf = logs.match(/action="\/logs\/clear"[\s\S]*?name="csrf" value="([a-f0-9]{64})"/)?.[1];
+  assert.ok(logCsrf);
+  const clearedLogs = await fetch(`${admin.url}/logs/clear`, {
+    method: "POST", redirect: "manual", headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({ csrf: logCsrf }),
+  });
+  assert.match(clearedLogs.headers.get("location") ?? "", /^\/logs\?ok=/);
+  const emptyLogs = await (await fetch(new URL(clearedLogs.headers.get("location")!, admin.url))).text();
+  assert.doesNotMatch(emptyLogs, /TF-12345678|A-123456789ABC/);
+  assert.match(emptyLogs, /没有匹配的失败记录/);
+  assert.match(emptyLogs, /没有匹配的 Activity/);
 
   const settings = await (await fetch(`${admin.url}/settings`)).text();
   assert.match(settings, /偏好设置/);
@@ -348,7 +375,7 @@ test("localhost admin manages agents, groups, and users with CSRF protection", a
     secret: "super-secret",
   });
   assert.equal(added.status, 303);
-  assert.match(added.headers.get("location") ?? "", /^\/agents\?ok=/);
+  assert.equal(new URL(added.headers.get("location") ?? "", admin.url).searchParams.get("capability"), "reviewer");
   assert.doesNotMatch(added.headers.get("location") ?? "", /super-secret|aib-reviewer/);
   // 新增 Agent 的机器人还没授权，Owner 先继承主 Agent 的；该 Agent 授权后启动时会提示更正。
   assert.deepEqual(config.agents.reviewer, { runtime: "pi", workspace, model: "provider/model", configDir, ownerUser: "owner" });
@@ -375,13 +402,18 @@ test("localhost admin manages agents, groups, and users with CSRF protection", a
   const repeatedAuth = await post("/agents/auth", { agentId: "default", authMode: "qr" });
   const repeatedAuthLocation = new URL(repeatedAuth.headers.get("location") ?? "", admin.url);
   assert.match(repeatedAuthLocation.searchParams.get("ok") ?? "", /已授权，正在建立连接/);
+  assert.equal(repeatedAuthLocation.searchParams.get("capability"), "default");
+  const capabilityResult = await (await fetch(repeatedAuthLocation)).text();
+  assert.match(capabilityResult, /已进入完整模式/);
+  assert.match(capabilityResult, /通讯录、完整群上下文和最近会话均可用/);
+  assert.doesNotMatch(capabilityResult, /data-capability-pending/);
   assert.deepEqual(authCalls, [{ agentId: "reviewer", mode: "manual", botId: "aib-reviewer", secret: "super-secret" }]);
   assert.ok(connectCalls.includes("default"));
   assert.ok(connectCalls.includes("reviewer"));
 
   const qr = await post("/agents/auth", { agentId: "reviewer", authMode: "qr" });
   assert.equal(qr.status, 303);
-  assert.match(qr.headers.get("location") ?? "", /^\/agents\?ok=/);
+  assert.equal(new URL(qr.headers.get("location") ?? "", admin.url).searchParams.get("capability"), "reviewer");
   assert.deepEqual(authCalls.at(-1), { agentId: "reviewer", mode: "qr" });
 
   failNextAuth = true;
@@ -620,4 +652,50 @@ test("group discovery reports failures and explains an empty list instead of cla
   assert.match(emptyPage, /还没发现任何群/);
   assert.match(emptyPage, /最近 7 天/);
   assert.match(emptyPage, /@它一次/);
+});
+
+test("admin refreshes compatibility mode and disables directory-only controls", async (t) => {
+  const config: ThreadFerryConfig = {
+    version: 6,
+    ownerUser: "owner",
+    agents: { default: { runtime: "codex", workspace: "/tmp", ownerUser: "owner" } },
+    groups: { group: { agents: { default: { allowUsers: ["owner"] } }, context: { lookbackHours: 6, maxMessages: 80 } } },
+    security: { requireMention: true, readOnly: true },
+  };
+  let capabilitiesRestored = false;
+  let probes = 0;
+  const admin = await startAdminServer(config, {
+    updateConfig: async (change) => { await change(config); },
+    listGroups: async () => [{ id: "group", name: "月相工作室", hasBotSession: true }],
+    searchUsers: async () => { throw new Error("no authorization"); },
+    botStatus: async () => ({
+      authorized: true,
+      capabilities: {
+        mode: "compatible", contact: "unavailable", groupHistory: "unavailable", recentSessions: "available", checkedAt: new Date().toISOString(),
+      },
+    }),
+    probeCapabilities: async () => {
+      probes += 1;
+      return capabilitiesRestored
+        ? { mode: "full", contact: "available", groupHistory: "available", recentSessions: "available", checkedAt: new Date().toISOString() }
+        : { mode: "compatible", contact: "unavailable", groupHistory: "unavailable", recentSessions: "available", checkedAt: new Date().toISOString() };
+    },
+  }, 0);
+  t.after(() => admin.close());
+
+  const agents = await (await fetch(`${admin.url}/agents`)).text();
+  assert.match(agents, /兼容模式/);
+  assert.match(agents, /通讯录、完整群上下文不可用.*普通 Agent 对话不受影响/);
+  assert.match(agents, /href="\/agents\?capability=default">刷新机器人状态<\/a>/);
+  const result = await (await fetch(`${admin.url}/agents?capability=default`)).text();
+  assert.match(result, /已进入兼容模式/);
+  assert.match(result, /权限恢复后会在后台自动切回完整模式/);
+  capabilitiesRestored = true;
+  const refreshed = await (await fetch(`${admin.url}/agents?capability=default`)).text();
+  assert.equal(probes, 2);
+  assert.match(refreshed, /已进入完整模式/);
+  assert.match(refreshed, /通讯录、完整群上下文和最近会话均可用/);
+  const group = await (await fetch(`${admin.url}/groups/detail?id=group`)).text();
+  assert.match(group, /通讯录未授权.*邀请码.*全员可用/);
+  assert.doesNotMatch(group, /＋ 添加可使用用户/);
 });

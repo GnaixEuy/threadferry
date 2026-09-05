@@ -24,6 +24,8 @@ interface PendingAction {
 
 export interface AppDependencies {
   history: (chatId: string, options: HistoryQuery) => Promise<GroupMessage[]>;
+  /** Host 生成的可信降级说明；只描述当前会话实际缺失的上下文能力。 */
+  historyNotice?: (chatType: HistoryChatType, chatId: string) => string | undefined;
   rememberHistory?: (chatType: HistoryChatType, chatId: string, message: IncomingDirectMessage | IncomingMention) => Promise<void>;
   runtime: (request: RuntimeRequest) => Promise<RuntimeResult>;
   updateAllowUsers?: (groupId: string, users: string[]) => Promise<void>;
@@ -93,8 +95,11 @@ function failureReason(error: unknown): string | undefined {
   return single.length > 200 ? `${single.slice(0, 200)}…` : single;
 }
 
-function ownerOnly(action: string, senderId: string): string {
-  return `只有机器人创建者（ThreadFerry Owner）可以${action}。\n\n你的 userid：\`${senderId}\`\n如果你更换了企业或重建了机器人，回调 userid 会变化，需要在运行 ThreadFerry 的机器上重新确认 Owner：重启 \`threadferry start\` 按提示更新，或执行 \`threadferry setup\`。`;
+function ownerOnly(action: string, senderId: string, directoryUnavailable = false): string {
+  const compatibility = directoryUnavailable
+    ? "\n\n当前企业未开放通讯录，ThreadFerry 无法自动映射两种用户身份。普通 Agent 能力仍可使用，但需要先在运行 ThreadFerry 的机器上执行 `threadferry setup`，通过一次性私聊配对重新确认 Owner。"
+    : "";
+  return `只有机器人创建者（ThreadFerry Owner）可以${action}。\n\n你的 userid：\`${senderId}\`${compatibility}\n如果你更换了企业或重建了机器人，需要在运行 ThreadFerry 的机器上重新确认 Owner：重启 \`threadferry start\` 按提示更新，或执行 \`threadferry setup\`。`;
 }
 
 function limitUtf8(input: string, maxBytes = 12_000): string {
@@ -178,6 +183,7 @@ export function createApp(config: AgentView, dependencies: AppDependencies, stat
   // 这正是我们想要的——没人确认过的写操作不该跨重启存活。
   const pendingActions = new Map<string, PendingAction>();
   const callbackDirectoryIds = new Map<string, string>();
+  let directoryLookupUnavailable = false;
   let accessTail = Promise.resolve();
   let shuttingDown = false;
 
@@ -494,7 +500,14 @@ export function createApp(config: AgentView, dependencies: AppDependencies, stat
     const cached = callbackDirectoryIds.get(callbackId);
     if (cached) return cached;
     if (!dependencies.searchUsers) return undefined;
-    const users = await dependencies.searchUsers([callbackId]);
+    let users: DirectoryUser[];
+    try {
+      users = await dependencies.searchUsers([callbackId]);
+      directoryLookupUnavailable = false;
+    } catch {
+      directoryLookupUnavailable = true;
+      return undefined;
+    }
     const matches = users.filter((user) => user.matchedKeywords?.includes(callbackId));
     const user = matches.length === 1 ? matches[0] : undefined;
     if (user) callbackDirectoryIds.set(callbackId, user.id);
@@ -589,7 +602,7 @@ export function createApp(config: AgentView, dependencies: AppDependencies, stat
     if (!(await state.claimCommand(message.msgId, `direct:${message.senderId}`, selfAgent()))) return "duplicate";
     const command = managementCommand(message.text);
     if (!command) {
-      if (!(await isOwner(message.senderId))) return respond(reply, ownerOnly("私聊 Agent", await authoritativeId(message.senderId)));
+      if (!(await isOwner(message.senderId))) return respond(reply, ownerOnly("私聊 Agent", await authoritativeId(message.senderId), directoryLookupUnavailable));
       if (robotRemovalRequest(message.text)) {
         const activeGroups = Object.entries(config.groups).filter(([, group]) => !group.removed);
         const target = activeGroups.length === 1 ? ` ${activeGroups[0]![0]}` : " <群名或ID>";
@@ -606,7 +619,7 @@ export function createApp(config: AgentView, dependencies: AppDependencies, stat
     }
     if (command.name === "whoami") return respond(reply, `你的 ThreadFerry userid：\`${await authoritativeId(message.senderId)}\``);
     if (command.name === "join") return join(message.senderId, command.arguments[0], reply);
-    if (!(await isOwner(message.senderId))) return respond(reply, ownerOnly("在私聊中管理群权限", await authoritativeId(message.senderId)));
+    if (!(await isOwner(message.senderId))) return respond(reply, ownerOnly("在私聊中管理群权限", await authoritativeId(message.senderId), directoryLookupUnavailable));
     if (command.name === "help") {
       const [selfId, self] = Object.entries(config.agents)[0] ?? [];
       const selfLine = selfId ? `你正在和 Agent \`${selfId}\` 对话，Workspace 是 ${self!.workspace}。\n\n` : "";
@@ -805,7 +818,7 @@ export function createApp(config: AgentView, dependencies: AppDependencies, stat
     const group = config.groups[message.groupId];
     if (!group || group.enabled === false) return "unauthorized_group";
     if (!(await state.claimCommand(message.msgId, message.groupId, selfAgent()))) return "duplicate";
-    if (!(await isOwner(message.senderId))) return respond(reply, ownerOnly("移除群机器人", await authoritativeId(message.senderId)));
+    if (!(await isOwner(message.senderId))) return respond(reply, ownerOnly("移除群机器人", await authoritativeId(message.senderId), directoryLookupUnavailable));
     return respond(reply, `可以移除这台机器人在 ThreadFerry 中的群绑定。为避免误操作，请私聊当前机器人发送 \`threadferry unbind ${message.groupId}\` 确认。\n\n企业微信当前没有机器人主动退群接口；如需从群成员中移除机器人，请由群管理员在企业微信中操作。`);
   }
 
@@ -845,7 +858,7 @@ export function createApp(config: AgentView, dependencies: AppDependencies, stat
         result = await runRuntimeWithActions({
           agentId,
           ...agent,
-          prompt: buildContext(history, message, DIRECT_CONTEXT, "direct"),
+          prompt: buildContext(history, message, DIRECT_CONTEXT, "direct", dependencies.historyNotice?.("single", message.senderId)),
           ...(resources.length ? { resources } : {}),
           ...(sessionId ? { sessionId } : {}),
           signal: controller.signal,
@@ -926,7 +939,7 @@ export function createApp(config: AgentView, dependencies: AppDependencies, stat
       historyResources = history.flatMap((item) => item.resources ?? []);
       await dependencies.rememberHistory?.("group", message.groupId, message);
       const fingerprint = historyFingerprint(history, message);
-      const prompt = buildContext(history, message, context);
+      const prompt = buildContext(history, message, context, "group", dependencies.historyNotice?.("group", message.groupId));
       const agent = config.agents[agentId];
       if (!agent) throw new Error("群绑定的 Agent 不存在");
       const scopeKey = sessionScope(agentId, agent);

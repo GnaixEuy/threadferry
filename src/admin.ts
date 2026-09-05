@@ -5,6 +5,7 @@ import type { AddressInfo } from "node:net";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join } from "node:path";
 import { CLIENT_SCRIPT, STYLESHEET } from "./admin-assets.js";
+import type { WecomCapabilitySnapshot } from "./channels/wecom.js";
 import { addAgent, ensureGroupAccess, resolveWorkspace } from "./config.js";
 import { resolveDirectoryUser } from "./directory.js";
 import { sessionScope, type StateSnapshot } from "./state.js";
@@ -28,6 +29,7 @@ export interface AgentBotStatus {
   /** Owner 的顶层部门。企业微信不提供「机器人属于哪个企业」的查询，这是最接近的可得信息。 */
   org?: string;
   connection?: AgentConnectionHealth;
+  capabilities?: WecomCapabilitySnapshot;
 }
 
 export interface AdminDependencies {
@@ -47,11 +49,17 @@ export interface AdminDependencies {
   /** 按姓名添加成功时把映射记下来，之后就能显示名字。 */
   rememberUser?: (userId: string, name: string) => void;
   botStatus?: (agentId: string) => Promise<AgentBotStatus>;
+  /** 配对完成时立即探测；运行期间由 Host 定期重试并自动恢复完整模式。 */
+  probeCapabilities?: (agentId: string) => Promise<WecomCapabilitySnapshot | undefined>;
   /** 已有凭据时把 Agent 接入当前 Host；重复调用必须安全。 */
   connectBot?: (agentId: string) => Promise<boolean>;
   /** 凭据只交给该 Agent 的 wecom-cli 加密存储，不写入 ThreadFerry 配置或日志。 */
   authorizeBot?: (agentId: string, authorization: BotAuthorization) => Promise<void>;
   snapshot?: () => Promise<StateSnapshot>;
+  /** 清理日志追踪数据，不删除任务状态、Session、队列、提醒或配置。 */
+  clearLogs?: () => Promise<number>;
+  /** 只用于问题报告中的本机运行版本。 */
+  version?: string;
   checkUpdate?: () => Promise<{ version: string } | undefined>;
   /** 按「群 + Agent」重置：同一个群里每台机器人各有自己的 Session。 */
   resetSession?: (groupId: string, agentId: string) => Promise<boolean>;
@@ -296,7 +304,7 @@ async function searchDirectoryUsers(
   try {
     users = await dependencies.searchUsers(agentId, [query]);
   } catch {
-    return { users: [], note: "通讯录查询失败；可以直接填 id:<userid>。" };
+    return { users: [], note: "当前企业未开放通讯录搜索；ThreadFerry 已使用兼容模式，可改用邀请码或开启全员可用。" };
   }
   return {
     users: users.slice(0, MAX_USER_RESULTS),
@@ -385,6 +393,44 @@ const DISCOVERY_HINT = "企业微信只提供最近 7 天有消息的群；把�
 
 function errorBar(message: string): string {
   return `<div class="notice error">${html(message)}</div>`;
+}
+
+function capabilityLine(snapshot: WecomCapabilitySnapshot | undefined): string {
+  if (!snapshot) return `<p class="muted">企业能力正在后台探测；基础对话不等待探测结果。</p>`;
+  const unavailable = [
+    snapshot.contact === "unavailable" ? "通讯录" : undefined,
+    snapshot.groupHistory === "unavailable" ? "完整群上下文" : undefined,
+    snapshot.recentSessions === "unavailable" ? "最近会话" : undefined,
+  ].filter(Boolean);
+  const unknown = [snapshot.contact, snapshot.groupHistory, snapshot.recentSessions].filter((state) => state === "unknown").length;
+  const details = unavailable.length
+    ? `${unavailable.join("、")}不可用；对应功能会给出提示，普通 Agent 对话不受影响。`
+    : unknown > 0 ? "部分企业能力暂时无法确认；正在后台重试。" : "通讯录、完整群上下文和最近会话均可用。";
+  const label = snapshot.mode === "full" ? "完整模式" : snapshot.mode === "compatible" ? "兼容模式" : "检测中";
+  return `<p>运行模式 <span class="badge ${snapshot.mode === "full" ? "ok" : snapshot.mode === "compatible" ? "warning" : ""}">${label}</span> <small class="muted">${html(details)}</small></p>`;
+}
+
+function capabilityResultDialog(agentId: string, authorized: boolean, snapshot: WecomCapabilitySnapshot | undefined): string {
+  const pending = !authorized || !snapshot || snapshot.mode === "detecting";
+  const unavailable = snapshot ? [
+    snapshot.contact === "unavailable" ? "通讯录" : undefined,
+    snapshot.groupHistory === "unavailable" ? "完整群上下文" : undefined,
+    snapshot.recentSessions === "unavailable" ? "最近会话" : undefined,
+  ].filter(Boolean) : [];
+  const title = !authorized ? "等待机器人授权"
+    : snapshot?.mode === "full" ? "已进入完整模式"
+      : snapshot?.mode === "compatible" ? "已进入兼容模式" : "正在检测企业能力";
+  const description = !authorized
+    ? "请在企业微信完成授权。本页面会自动检测授权结果。"
+    : snapshot?.mode === "full"
+      ? "通讯录、完整群上下文和最近会话均可用。"
+      : snapshot?.mode === "compatible"
+        ? `${unavailable.join("、")}不可用；普通 Agent 对话仍可使用。权限恢复后会在后台自动切回完整模式。`
+        : "尚未检测到明确的权限缺失，ThreadFerry 会继续探测，不会提前进入兼容模式。";
+  return `<dialog class="modal" aria-labelledby="capability-result-title" open${pending ? " data-capability-pending" : ""}>
+    <div class="modal-body"><h3 id="capability-result-title">${html(title)}</h3><p class="lede">机器人 ${html(agentId)}</p><p>${html(description)}</p>
+      <div class="modal-actions"><a class="button" href="/agents">知道了</a></div></div>
+  </dialog>`;
 }
 
 // 查询失败必须说出来：静默返回空列表会把「查不到」显示成「已经查完了」。
@@ -476,7 +522,7 @@ function settingsPage(config: ThreadFerryConfig, url: URL, token: string): strin
   </div>`);
 }
 
-async function logsPage(config: ThreadFerryConfig, dependencies: AdminDependencies, url: URL): Promise<string> {
+async function logsPage(config: ThreadFerryConfig, dependencies: AdminDependencies, token: string, url: URL): Promise<string> {
   const snapshot = await fetchSnapshot(dependencies);
   const query = (url.searchParams.get("q")?.trim() ?? "").slice(0, 128);
   const requestedOutcome = url.searchParams.get("outcome")?.trim() ?? "";
@@ -486,12 +532,26 @@ async function logsPage(config: ThreadFerryConfig, dependencies: AdminDependenci
     || values.some((value) => value?.toLocaleLowerCase().includes(needle));
   const failures = (snapshot?.turns ?? [])
     .filter((turn) => (!outcome || outcome === "failure")
-      && turn.status === "failed" && matches(turn.errorId, turn.failurePhase, turn.updatedAt))
+      && turn.status === "failed" && (turn.errorId !== undefined || turn.failurePhase !== undefined)
+      && matches(turn.errorId, turn.failurePhase, turn.updatedAt))
     .slice(-100).reverse();
   const activities = (snapshot?.activities ?? [])
     .filter((item) => (!outcome || item.outcome === outcome)
       && matches(item.id, item.agent, item.type, item.outcome, item.resource, item.at))
     .slice(-200).reverse();
+  const reportLines = [
+    ...failures.slice(0, 10).map((turn) => JSON.stringify({ kind: "failure", errorId: turn.errorId, phase: turn.failurePhase, at: turn.updatedAt })),
+    ...activities.slice(0, 10).map((item) => JSON.stringify({ kind: "activity", id: item.id, agent: item.agent, type: item.type, outcome: item.outcome, resource: item.resource, at: item.at })),
+  ].join("\n").replaceAll("`", "'");
+  // ponytail: query string只带最近记录；需要更长日志时再改为用户主动上传附件。
+  const reportLogs = reportLines.slice(0, 6_000) || "暂无匹配的脱敏日志";
+  const issue = new URL("https://github.com/GnaixEuy/threadferry/issues/new");
+  issue.searchParams.set("title", "[问题反馈] ThreadFerry 运行异常");
+  issue.searchParams.set("body", [
+    "## 问题描述", "", "请描述遇到的问题。", "", "## 复现步骤", "", "1. ", "", "## 预期结果", "", "请描述预期行为。", "",
+    "## 运行环境", "", `- ThreadFerry: ${dependencies.version ?? "未知"}`, `- Platform: ${process.platform} ${process.arch}`, `- Node: ${process.version}`, "",
+    "## 脱敏日志", "", "<!-- 以下内容由 ThreadFerry 自动附带，提交前可以检查或删除。 -->", "```json", reportLogs, "```",
+  ].join("\n"));
   const filters = `<form class="trace-filter" method="get" action="/logs">
     <input name="q" value="${html(query)}" maxlength="128" placeholder="错误编号、Agent、动作或资源" aria-label="搜索日志追踪">
     <select name="outcome" aria-label="结果"><option value=""${outcome ? "" : " selected"}>全部结果</option><option value="success"${outcome === "success" ? " selected" : ""}>成功</option><option value="failure"${outcome === "failure" ? " selected" : ""}>失败</option><option value="info"${outcome === "info" ? " selected" : ""}>信息</option></select>
@@ -503,7 +563,10 @@ async function logsPage(config: ThreadFerryConfig, dependencies: AdminDependenci
   const activityList = activities.length
     ? `<div class="list-panel trace-list">${activities.map((item) => `<div class="trace-row"><span><code>${html(item.id)}</code><small>${html(item.at)}</small></span><span><b>${html(item.type)}</b><small>Agent ${html(item.agent)}${item.resource ? ` · ${html(item.resource)}` : ""}</small></span><span class="badge ${item.outcome === "success" ? "ok" : item.outcome === "failure" ? "warning" : ""}">${statusLabel(item.outcome)}</span></div>`).join("")}</div>`
     : `<p class="sub">没有匹配的 Activity。</p>`;
-  return shell("logs", config, url, `<div class="toolbar"><p class="sub">按错误编号、Agent、动作或资源定位最近记录；这里只展示脱敏状态，不展示消息正文。</p></div>
+  return shell("logs", config, url, `<div class="toolbar"><p class="sub">按错误编号、Agent、动作或资源定位最近记录；这里只展示脱敏状态，不展示消息正文。</p>
+      <div class="toolbar-actions"><a class="button ghost" href="${html(issue)}" target="_blank" rel="noreferrer">上报问题 ↗</a>
+      ${dependencies.clearLogs ? `<form method="post" action="/logs/clear" data-confirm="确定清理失败诊断记录和 Activity 吗？任务状态、Session、待补发、提醒和配置都会保留。">${field(token)}<button class="danger" type="submit">清理日志</button></form>` : ""}</div></div>
+    <p class="sub">上报问题会在 GitHub Issue 中预填当前筛选后的脱敏日志，提交前可以检查和修改。</p>
     ${filters}${snapshot ? "" : `<div class="notice error">运行状态暂不可用，请稍后重试。</div>`}
     <h2>失败记录</h2>${failureList}<h2>Activity</h2>${activityList}`);
 }
@@ -601,7 +664,7 @@ async function overviewPage(config: ThreadFerryConfig, dependencies: AdminDepend
   const counts = new Map<string, number>();
   for (const turn of snapshot?.turns ?? []) counts.set(turn.status, (counts.get(turn.status) ?? 0) + 1);
   const active = (counts.get("queued") ?? 0) + (counts.get("running") ?? 0);
-  const lastFailure = snapshot?.turns.slice().reverse().find((turn) => turn.status === "failed");
+  const lastFailure = snapshot?.turns.slice().reverse().find((turn) => turn.status === "failed" && turn.errorId !== undefined);
   const reminders = (snapshot?.reminders ?? []).filter((item) => item.status === "scheduled" || item.status === "running");
   const workItems = (snapshot?.workItems ?? []).filter((item) => item.status !== "completed" && item.status !== "failed");
   const activities = (snapshot?.activities ?? []).slice(-20).reverse();
@@ -797,7 +860,7 @@ function addUserDialog(
             <div class="picker" data-picker-root>
               <input id="${html(dialogId)}-user" name="user" data-picker="users" data-agent-id="${html(agentId)}" placeholder="点这里搜索姓名或别名" maxlength="512" required autofocus>
             </div>
-            <p class="hint">点输入框搜通讯录，也可以直接填 <code>id:userid</code>。 <span class="picked" data-picker-note="user"></span></p>
+            <p class="hint">点输入框搜索姓名或别名。 <span class="picked" data-picker-note="user"></span></p>
           </div>
         </div>
         <div class="modal-actions"><a class="button ghost" href="${html(groupAnchor(groupId))}" data-close-dialog>取消</a><button>添加</button></div>
@@ -832,6 +895,18 @@ async function agentsPage(config: ThreadFerryConfig, dependencies: AdminDependen
   const browseLink = `/agents/browse?${carryParams(url, { ...(prefill.workspace ? { path: prefill.workspace } : {}), new: "1" })}`;
   // 每个 Agent 一个机器人：授权状态与 Owner 都是 Agent 自己的属性，必须显示出来。
   const botStatuses = await fetchBotStatuses(config, dependencies);
+  const capabilityAgent = url.searchParams.get("capability")?.trim();
+  if (capabilityAgent && config.agents[capabilityAgent]) {
+    const status = botStatuses.get(capabilityAgent);
+    if (status?.authorized && dependencies.probeCapabilities) {
+      try {
+        const capabilities = await dependencies.probeCapabilities(capabilityAgent);
+        if (capabilities) botStatuses.set(capabilityAgent, { ...status, capabilities });
+      } catch {
+        // 探测异常不是权限缺失；弹窗保持“检测中”，由页面和后台继续重试。
+      }
+    }
+  }
   const openAuth = url.searchParams.get("auth")?.trim();
   const openWorkspace = url.searchParams.get("editWorkspace")?.trim();
   const openRemove = url.searchParams.get("remove")?.trim();
@@ -869,6 +944,7 @@ async function agentsPage(config: ThreadFerryConfig, dependencies: AdminDependen
       <p>${html(agent.model ?? "默认模型")}</p><code>${html(agent.workspace)}</code>
       ${botLine}
       ${connectionLine}
+      ${bot?.authorized ? capabilityLine(bot.capabilities) : ""}
       <p>Owner ${identity(bot?.ownerName ?? "未获取姓名", agent.ownerUser, "Owner ID")}</p>
       <h4>接入群</h4>
       ${bound.length
@@ -876,7 +952,9 @@ async function agentsPage(config: ThreadFerryConfig, dependencies: AdminDependen
         : `<p class="muted">未被任何群使用</p>`}
       <div class="actions">
         <a class="button ghost" href="/agents?editWorkspace=${encodeURIComponent(id)}" data-dialog="${workspaceDialogId}">修改工作区</a>
-        ${bot?.authorized ? "" : `<a class="button ghost" href="/agents?auth=${encodeURIComponent(id)}" data-dialog="${dialogId}">授权机器人</a>`}
+        ${bot?.authorized
+          ? `<a class="button ghost" href="/agents?capability=${encodeURIComponent(id)}">刷新机器人状态</a>`
+          : `<a class="button ghost" href="/agents?auth=${encodeURIComponent(id)}" data-dialog="${dialogId}">授权机器人</a>`}
         <a class="button danger" href="/agents?remove=${encodeURIComponent(id)}" data-dialog="${removeDialogId}">删除机器人</a>
       </div>
     </article>`;
@@ -895,6 +973,9 @@ async function agentsPage(config: ThreadFerryConfig, dependencies: AdminDependen
     ${authDialogs.join("")}
     ${workspaceDialogs.join("")}
     ${removeDialogs.join("")}
+    ${capabilityAgent && config.agents[capabilityAgent]
+      ? capabilityResultDialog(capabilityAgent, botStatuses.get(capabilityAgent)?.authorized === true, botStatuses.get(capabilityAgent)?.capabilities)
+      : ""}
     ${addAgentDialog(token, prefill, browseLink, open, open ? error : undefined)}`, { errorInDialog });
 }
 
@@ -935,6 +1016,7 @@ function agentSection(
   canReset: boolean,
   canRemove: boolean,
   confirmed: boolean,
+  contactState: WecomCapabilitySnapshot["contact"] | undefined,
 ): string {
   const enabled = access.enabled !== false;
   const removed = access.removed === true;
@@ -968,7 +1050,9 @@ function agentSection(
         <div class="agent-access"><span class="badge${access.allowAll ? " ok" : ""}">${access.allowAll ? "全员可用" : "仅授权成员"}</span>${access.allowAll ? `<p class="muted">群内所有成员都可以 @ 这台机器人；以下名单在关闭后生效。</p>` : ""}</div>
         <ul class="member-list">${users}</ul>
         <div class="agent-actions">
-          <a class="button ghost" href="${html(groupUserAnchor(groupId, agentId))}" data-dialog="${html(dialogId)}">＋ 添加可使用用户</a>
+          ${contactState === "unavailable"
+            ? `<span class="muted">通讯录未授权，按姓名添加成员不可用；可使用邀请码或开启全员可用。</span>`
+            : `<a class="button ghost" href="${html(groupUserAnchor(groupId, agentId))}" data-dialog="${html(dialogId)}">＋ 添加可使用用户</a>`}
           ${canReset ? `<form method="post" action="/groups/session/reset">${hidden}<button class="ghost">重置 Session</button></form>` : ""}
           ${canRemove ? `<form class="danger-action" method="post" action="/groups/remove" data-confirm="确定移除 ${html(agentId)} 在这个群的 ThreadFerry 绑定吗？授权和 Session 会被清理。"><input type="hidden" name="csrf" value="${html(token)}"><input type="hidden" name="groupId" value="${html(groupId)}"><input type="hidden" name="agentId" value="${html(agentId)}"><button class="danger">移除机器人</button></form>` : ""}
         </div>
@@ -1004,7 +1088,10 @@ async function groupsPage(config: ThreadFerryConfig, dependencies: AdminDependen
 async function groupDetailPage(config: ThreadFerryConfig, dependencies: AdminDependencies, token: string, url: URL): Promise<string> {
   const id = url.searchParams.get("id")?.trim() ?? "";
   if (!GROUP_ID.test(id)) return shell("groups", config, url, `<p><a class="back-link" href="/groups">← 返回群聊列表</a></p>${errorBar("群 ID 无效")}`);
-  const { sessions, visibleTo, confirmedBy, failures } = await fetchSessions(config, dependencies);
+  const [{ sessions, visibleTo, confirmedBy, failures }, botStatuses] = await Promise.all([
+    fetchSessions(config, dependencies),
+    fetchBotStatuses(config, dependencies),
+  ]);
   const session = sessions.find((item) => item.id === id);
   const group = config.groups[id];
   if (!session && !group) return shell("groups", config, url, `<p><a class="back-link" href="/groups">← 返回群聊列表</a></p>${errorBar("群聊不存在或当前不可见")}`);
@@ -1023,9 +1110,10 @@ async function groupDetailPage(config: ThreadFerryConfig, dependencies: AdminDep
       const dialogId = `add-user-${index}`;
       const openHere = openDialog === `${agentId}\n${id}`;
       if (openHere && error !== undefined) openedInDialog = true;
-      dialogs.push(addUserDialog(token, dialogId, id, agentId, label, openHere, openHere ? error : undefined));
+      const contactState = botStatuses.get(agentId)?.capabilities?.contact;
+      if (contactState !== "unavailable") dialogs.push(addUserDialog(token, dialogId, id, agentId, label, openHere, openHere ? error : undefined));
       return agentSection(token, id, agentId, access, config.agents[agentId]?.ownerUser,
-        config.agents[agentId]?.runtime, dialogId, dependencies.userName, Boolean(dependencies.resetSession), Boolean(dependencies.removeGroup), confirmed.has(agentId));
+        config.agents[agentId]?.runtime, dialogId, dependencies.userName, Boolean(dependencies.resetSession), Boolean(dependencies.removeGroup), confirmed.has(agentId), contactState);
     }).join("");
     const spare = [...visible].filter((agentId) => config.agents[agentId] && !group.agents[agentId]);
     body = `<article class="card group-detail"><p class="muted group-intro">群里 @ 哪台机器人，就由它用自己的 Workspace 回答；名单、开关和 Session 各自独立。</p>${sections}
@@ -1060,7 +1148,7 @@ export async function startAdminServer(
         if (url.pathname === "/agents/browse") return send(response, 200, await browsePage(config, url));
         if (url.pathname === "/groups") return send(response, 200, await groupsPage(config, dependencies, url));
         if (url.pathname === "/groups/detail") return send(response, 200, await groupDetailPage(config, dependencies, token, url));
-        if (url.pathname === "/logs") return send(response, 200, await logsPage(config, dependencies, url));
+        if (url.pathname === "/logs") return send(response, 200, await logsPage(config, dependencies, token, url));
         if (url.pathname === "/settings") return send(response, 200, settingsPage(config, url, token));
         return send(response, 404, "Not found");
       } catch {
@@ -1081,7 +1169,12 @@ export async function startAdminServer(
     let errorTarget: string | undefined;
     let message = "配置已更新并立即生效";
     try {
-      if (url.pathname === "/settings/update") {
+      if (url.pathname === "/logs/clear") {
+        target = "/logs";
+        if (!dependencies.clearLogs) throw new Error("当前启动方式不支持清理日志");
+        const removed = await dependencies.clearLogs();
+        message = removed > 0 ? `已清理 ${removed} 条日志` : "没有可清理的日志";
+      } else if (url.pathname === "/settings/update") {
         target = "/settings";
         if (!dependencies.checkUpdate) throw new Error("当前启动方式不支持检查更新");
         const release = await dependencies.checkUpdate();
@@ -1119,14 +1212,15 @@ export async function startAdminServer(
           errorTarget = `/agents?auth=${encodeURIComponent(agentId)}`;
           if (!dependencies.authorizeBot) throw new Error("当前启动方式不支持机器人授权");
           await dependencies.authorizeBot(agentId, authorization);
+          target = `/agents?capability=${encodeURIComponent(agentId)}`;
           message = authorization.mode === "qr"
             ? `机器人 ${agentId} 已添加，扫码授权页已打开；完成后刷新本页即可自动连接`
             : `机器人 ${agentId} 已添加并授权，正在建立连接`;
           if (authorization.mode === "manual") await dependencies.connectBot?.(agentId);
         }
       } else if (url.pathname === "/agents/auth") {
-        target = "/agents";
         const agentId = required(input, "agentId");
+        target = `/agents?capability=${encodeURIComponent(agentId)}`;
         if (!config.agents[agentId]) throw new Error("机器人不存在");
         const authorization = botAuthorization(input);
         if (!authorization) throw new Error("请选择机器人授权方式");
